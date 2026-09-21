@@ -29,8 +29,8 @@ use futures::TryStreamExt;
 use futures::stream::BoxStream;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::inspect::{
-    EntriesTable, FilesTable, ManifestsTable, MetadataTableType, PartitionsTable,
-    PositionDeletesTable,
+    EntriesTable, FilesTable, HistoryTable, ManifestsTable, MetadataTableType, PartitionsTable,
+    PositionDeletesTable, SnapshotsTable,
 };
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result};
@@ -132,7 +132,10 @@ impl IcebergMetadataTableProvider {
         let table_name = self.r#type.as_str().to_owned();
         let stream = match self.r#type {
             MetadataTableType::Snapshots => match snapshot_id {
-                Some(_) => Err(snapshot_scope_refused(&table_name)),
+                Some(id) => match SnapshotsTable::try_at_snapshot(&self.table, id) {
+                    Ok(scoped) => scoped.scan().await,
+                    Err(err) => Err(err),
+                },
                 None => metadata_table.snapshots().scan().await,
             },
             MetadataTableType::Manifests => match snapshot_id {
@@ -184,7 +187,10 @@ impl IcebergMetadataTableProvider {
                 None => metadata_table.all_entries().scan().await,
             },
             MetadataTableType::History => match snapshot_id {
-                Some(_) => Err(snapshot_scope_refused(&table_name)),
+                Some(id) => match HistoryTable::try_at_snapshot(&self.table, id) {
+                    Ok(scoped) => scoped.scan().await,
+                    Err(err) => Err(err),
+                },
                 None => metadata_table.history().scan().await,
             },
             MetadataTableType::Refs => match snapshot_id {
@@ -237,7 +243,7 @@ mod tests {
 
     // Every `MetadataTableType` variant; kept exhaustive alongside the `try_new` match so a new
     // metadata table cannot silently skip the schema-resolution guard.
-    const ALL_METADATA_TABLE_TYPES: [MetadataTableType; 15] = [
+    const ALL_METADATA_TABLE_TYPES: [MetadataTableType; 16] = [
         MetadataTableType::Snapshots,
         MetadataTableType::Manifests,
         MetadataTableType::Files,
@@ -253,6 +259,7 @@ mod tests {
         MetadataTableType::MetadataLogEntries,
         MetadataTableType::Partitions,
         MetadataTableType::AllManifests,
+        MetadataTableType::PositionDeletes,
     ];
 
     async fn test_table() -> Table {
@@ -415,9 +422,7 @@ mod tests {
         );
     }
 
-    const SNAPSHOT_UNSCOPED_TYPES: [MetadataTableType; 9] = [
-        MetadataTableType::Snapshots,
-        MetadataTableType::History,
+    const SNAPSHOT_UNSCOPED_TYPES: [MetadataTableType; 7] = [
         MetadataTableType::Refs,
         MetadataTableType::MetadataLogEntries,
         MetadataTableType::AllFiles,
@@ -427,7 +432,7 @@ mod tests {
         MetadataTableType::AllManifests,
     ];
 
-    const SNAPSHOT_SCOPED_TYPES: [MetadataTableType; 7] = [
+    const SNAPSHOT_SCOPED_TYPES: [MetadataTableType; 9] = [
         MetadataTableType::Files,
         MetadataTableType::DataFiles,
         MetadataTableType::DeleteFiles,
@@ -435,6 +440,8 @@ mod tests {
         MetadataTableType::Manifests,
         MetadataTableType::Partitions,
         MetadataTableType::PositionDeletes,
+        MetadataTableType::Snapshots,
+        MetadataTableType::History,
     ];
 
     const UNKNOWN_SNAPSHOT_ID: i64 = 999_999_999_999;
@@ -561,7 +568,7 @@ mod tests {
             );
             refused += 1;
         }
-        assert_eq!(refused, 9);
+        assert_eq!(refused, 7);
     }
 
     #[tokio::test]
@@ -592,7 +599,7 @@ mod tests {
             );
             failed += 1;
         }
-        assert_eq!(failed, 7);
+        assert_eq!(failed, 9);
     }
 
     #[tokio::test]
@@ -610,7 +617,7 @@ mod tests {
             assert_eq!(actual, expected, "Some(current) must match None for {name}");
             matched += 1;
         }
-        assert_eq!(matched, 7);
+        assert_eq!(matched, 9);
     }
 
     #[tokio::test]
@@ -678,5 +685,45 @@ mod tests {
             refused += 1;
         }
         assert_eq!(refused, 5);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_scope_some_serves_snapshots_and_history() {
+        let table = test_table().await;
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot_id()
+            .expect("fixture has a current snapshot");
+        for r#type in [MetadataTableType::Snapshots, MetadataTableType::History] {
+            let name = r#type.as_str().to_owned();
+            let expected = provider_scan_outcome(&table, r#type.clone(), None).await;
+            let actual = provider_scan_outcome(&table, r#type, Some(snapshot_id)).await;
+            match &actual {
+                Ok(_) => {}
+                Err(message) => assert!(
+                    !message.contains("snapshot scope not yet served"),
+                    "Some must serve rows for {name}, got refusal: {message}"
+                ),
+            }
+            assert_eq!(actual, expected, "Some(current) must match None for {name}");
+        }
+    }
+
+    #[test]
+    fn test_snapshot_scope_consts_partition_all_types() {
+        let unscoped: std::collections::HashSet<String> = SNAPSHOT_UNSCOPED_TYPES
+            .into_iter()
+            .map(|r#type| r#type.as_str().to_owned())
+            .collect();
+        let scoped: std::collections::HashSet<String> = SNAPSHOT_SCOPED_TYPES
+            .into_iter()
+            .map(|r#type| r#type.as_str().to_owned())
+            .collect();
+        let all: std::collections::HashSet<String> = MetadataTableType::all_types()
+            .map(|r#type| r#type.as_str().to_owned())
+            .collect();
+        assert_eq!(unscoped.len() + scoped.len(), all.len());
+        let union: std::collections::HashSet<String> = unscoped.union(&scoped).cloned().collect();
+        assert_eq!(union, all);
     }
 }
