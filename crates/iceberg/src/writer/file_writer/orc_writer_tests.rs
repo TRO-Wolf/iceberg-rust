@@ -499,10 +499,24 @@ async fn test_orc_writer_round_trips_list_map_and_struct_through_orc_rust() {
     let batches: Vec<RecordBatch> = reader
         .collect::<std::result::Result<Vec<_>, _>>()
         .expect("decode every nested batch");
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 3, "all three nested rows must come back");
+    let decoded = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+        .expect("concatenate the oracle batches");
+    assert_eq!(
+        decoded.num_rows(),
+        3,
+        "all three nested rows must come back"
+    );
 
-    let decoded = &batches[0];
+    let id = decoded
+        .column_by_name("id")
+        .expect("the id column")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("an int array");
+    assert_eq!(id.value(0), 1);
+    assert_eq!(id.value(1), 2);
+    assert_eq!(id.value(2), 3);
+
     let list = decoded
         .column_by_name("c_arr")
         .expect("the list column")
@@ -532,8 +546,10 @@ async fn test_orc_writer_round_trips_list_map_and_struct_through_orc_rust() {
         .downcast_ref::<MapArray>()
         .expect("a map array");
     assert!(!map.is_null(0));
+    assert!(!map.is_null(1), "the second map row is empty, not null");
     assert!(map.is_null(2), "the third map row is null");
     assert_eq!(map.value_length(0), 1);
+    assert_eq!(map.value_length(1), 0);
     let entries = map.value(0);
     let entries = entries
         .as_any()
@@ -559,6 +575,10 @@ async fn test_orc_writer_round_trips_list_map_and_struct_through_orc_rust() {
         .downcast_ref::<StructArray>()
         .expect("a struct array");
     assert!(!nested.is_null(0));
+    assert!(
+        !nested.is_null(1),
+        "the second struct row is valid with null children"
+    );
     assert!(nested.is_null(2), "the third struct row is null");
     let x = nested
         .column(0)
@@ -618,8 +638,19 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
 
     let bytes = read_back_bytes(&file_io, &path).await;
     let decoded = read_orc_data_bytes(bytes, &schema, 1024).expect("read the multi-stripe file");
-    let rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 9);
+    let expected = arrow_select::concat::concat_batches(&batch.schema(), &batches)
+        .expect("concatenate the written batches");
+    let read = arrow_select::concat::concat_batches(&batch.schema(), &decoded)
+        .expect("concatenate the decoded batches");
+    assert_eq!(read.num_rows(), 9);
+    for (index, field) in batch.schema().fields().iter().enumerate() {
+        assert_eq!(
+            read.column(index).as_ref(),
+            expected.column(index).as_ref(),
+            "column '{}' must round trip across stripes",
+            field.name()
+        );
+    }
 }
 
 #[tokio::test]
@@ -646,8 +677,17 @@ async fn test_uncompressed_orc_round_trips_too() {
     .await;
     let bytes = read_back_bytes(&file_io, &path).await;
     let decoded = read_orc_data_bytes(bytes, &schema, 1024).expect("read the uncompressed file");
-    let rows: usize = decoded.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 3);
+    let read = arrow_select::concat::concat_batches(&written.schema(), &decoded)
+        .expect("concatenate the decoded batches");
+    assert_eq!(read.num_rows(), 3);
+    for (index, field) in written.schema().fields().iter().enumerate() {
+        assert_eq!(
+            read.column(index).as_ref(),
+            written.column(index).as_ref(),
+            "column '{}' must round trip uncompressed",
+            field.name()
+        );
+    }
 }
 
 #[tokio::test]
