@@ -961,4 +961,22 @@ mod tests {
             metrics_bounds_pair(DataFileFormat::Parquet, "any-parquet").await;
         assert_none_drops_int_bounds(&default_file, &none_file);
     }
+
+    #[tokio::test]
+    async fn any_writer_delegates_per_format() {
+        let (_temp, file_io, location_gen) = make_temp();
+        let schema = Arc::new(schema_simple());
+        let batch = simple_batch(&schema);
+        for format in [
+            DataFileFormat::Parquet,
+            DataFileFormat::Avro,
+            DataFileFormat::Orc,
+        ] {
+            let builder = for_format_default(format, schema.clone());
+            let exposed = builder
+                .iceberg_schema()
+                .expect("the builder must expose a schema");
+            assert!(Arc::ptr_eq(exposed, &schema));
+        }
+    }
 }
