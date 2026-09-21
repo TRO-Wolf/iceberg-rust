@@ -31,11 +31,12 @@ fn renumbered_batch(schema: &Schema) -> RecordBatch {
         crate::arrow::schema_to_arrow_schema(schema).expect("iceberg schema to arrow schema"),
     );
     let long = "a".repeat(40);
+    let max = "z".repeat(40);
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int32Array::from(vec![Some(1), Some(2), None])),
         Arc::new(StringArray::from(vec![
             Some(long.as_str()),
-            Some("short"),
+            Some(max.as_str()),
             None,
         ])),
     ];
@@ -109,9 +110,13 @@ async fn test_the_data_file_carries_the_full_java_metric_set() {
             Some(&1),
             "field {field_id} has exactly one null row"
         );
+        let size = match data_file.column_sizes().get(&field_id) {
+            Some(size) => *size,
+            None => panic!("field {field_id} must carry a column size"),
+        };
         assert!(
-            data_file.column_sizes().contains_key(&field_id),
-            "field {field_id} must carry a column size"
+            size > data_file.record_count(),
+            "field {field_id} size {size} must be a stripe byte count, not the row count"
         );
     }
 
@@ -167,6 +172,11 @@ async fn test_the_data_file_carries_the_full_java_metric_set() {
         data_file.upper_bounds().get(&5).map(Datum::literal),
         Some(&crate::spec::PrimitiveLiteral::Double(4.5f64.into())),
         "NaN must not poison the double upper bound"
+    );
+    assert_eq!(
+        data_file.upper_bounds().get(&6).map(Datum::literal),
+        Some(&crate::spec::PrimitiveLiteral::String("hello".to_string())),
+        "a short upper bound passes through untruncated"
     );
     assert_eq!(
         data_file.split_offsets(),
@@ -243,7 +253,22 @@ async fn test_the_data_file_keys_column_sizes_by_field_id() {
             Some(&3),
             "field {field_id} must carry a value count"
         );
+        assert_ne!(
+            data_file.column_sizes().get(&field_id),
+            data_file.value_counts().get(&field_id),
+            "field {field_id} size must differ from its value count"
+        );
     }
+    assert_eq!(
+        data_file.column_sizes().get(&100),
+        Some(&11),
+        "field 100 size must be the stripe stream byte count, not the row count"
+    );
+    assert_eq!(
+        data_file.column_sizes().get(&101),
+        Some(&22),
+        "field 101 size must be the stripe stream byte count, not the row count"
+    );
     for orc_index in [1i32, 2] {
         assert!(
             !data_file.column_sizes().contains_key(&orc_index),
@@ -311,22 +336,32 @@ async fn test_the_data_file_truncates_string_bounds_to_sixteen() {
         .build()
         .expect("build the data file");
 
+    let min = "a".repeat(40);
+    let max = "z".repeat(40);
     let lower = data_file
         .lower_bounds()
         .get(&101)
         .expect("a string lower bound");
     match lower.literal() {
         crate::spec::PrimitiveLiteral::String(value) => assert_eq!(
-            value.len(),
-            16,
-            "the default metrics mode truncates string bounds to 16"
+            value.as_str(),
+            &min[..16],
+            "the default metrics mode truncates the lower bound to the first 16 characters"
         ),
         other => panic!("expected a string bound, got {other:?}"),
     }
+    let expected_upper = crate::spec::MetricsMode::Truncate(16)
+        .truncate_upper_bound(&Datum::string(max.clone()))
+        .expect("a forty-character max has a valid truncated upper bound");
     assert_eq!(
-        data_file.upper_bounds().get(&101).map(Datum::literal),
-        Some(&crate::spec::PrimitiveLiteral::String("short".to_string())),
-        "the short upper bound passes through untruncated"
+        data_file.upper_bounds().get(&101),
+        Some(&expected_upper),
+        "the default metrics mode truncates the upper bound up"
+    );
+    assert_ne!(
+        expected_upper.literal(),
+        &crate::spec::PrimitiveLiteral::String(max),
+        "the fixture max must actually exceed the truncation length"
     );
 }
 
@@ -358,4 +393,16 @@ async fn test_the_data_file_counts_a_required_child_under_a_null_parent_as_null(
         Some(&1),
         "Java ORC reports 0 nulls here because required children have no PRESENT stream; this collector follows Java Parquet where a null parent makes the child null"
     );
+    for field_id in [20i32, 21] {
+        assert!(
+            data_file.column_sizes().contains_key(&field_id),
+            "nested field {field_id} must carry a column size"
+        );
+    }
+    for orc_index in [0i32, 1, 2] {
+        assert!(
+            !data_file.column_sizes().contains_key(&orc_index),
+            "ORC index {orc_index} must not appear as a field id key"
+        );
+    }
 }
