@@ -252,23 +252,32 @@ Round 1 (for the record):
 - `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/qb-fork2 origin/main` —
   `comment-ban hits=0`
 
-## SLICE F-STAGE-ONLY-2 — thread stage_only from IcebergTableProvider to every DML commit (2026-09-21)
+## SLICE F-STAGE-ONLY-2 — thread stage_only and snapshot_properties from IcebergTableProvider to every DML commit (2026-09-21)
 
 Branch `feat/f-stage-only-2` off fork main
 `3f5a9289cffecd82c9ed2ea53187d9b6eb8f3a6d` (the squashed F-STAGE-ONLY-1
-commit). Model: muse-spark-1.3-contributor. `IcebergTableProvider` had
+commit); it now also contains fork main
+`97f9b8a32226e03e21bec053ce39f3ec9cb10771` through merge
+`0c2386b0d90aa7205722eccbc1b4e2f14ed0a227`, which changes one slice file
+(`table/mod.rs`) only inside `metadata_table()` (the F-META-COLS
+`snapshot_id` parameter) and leaves the seam below byte-identical.
+Model: muse-spark-1.3-contributor. Round 1: `IcebergTableProvider` had
 `with_commit_branch` but no staged-commit knob, so a DataFusion INSERT always
-moved the table ref and RePark could not do write-audit-publish. This slice
+moved the table ref and RePark could not do write-audit-publish. Round 1
 adds the exact analogue `with_stage_only(bool)`, threads it through
 `IcebergCommitExec` the way `commit_branch` is threaded, and applies the
-public no-arg `.stage_only()` to the Append and Overwrite actions.
+public no-arg `.stage_only()` to the Append and Overwrite actions. Round 2
+adds the second seam `with_snapshot_properties(HashMap<String, String>)`
+on the same path: caller snapshot properties merge into the exec-stamped
+map on both arms. Round 3 pins `refreshed()` carry-through for all four
+provider knobs.
 
 ### Seam
 
 Provider (`table/mod.rs`): `stage_only: bool` field beside `commit_branch`,
 default false in `try_new`, clone-through in `refreshed`, `with_stage_only`
-builder beside `with_commit_branch`, hand-on in `insert_into`. The builder
-carries no doc comment (owner comment ban; the `with_output_spec_id`
+builder beside `with_commit_branch`, hand-on in `insert_into`. Both
+builders carry no doc comment (owner comment ban; the `with_output_spec_id`
 precedent; this crate has no `missing_docs` deny). Exec (`commit.rs`): field,
 default false, `pub(crate) with_stage_only`, hand-on in `with_new_children`,
 local copy in `execute`, conditional `.stage_only()` in the
@@ -281,18 +290,40 @@ a positional constructor argument, so handing them `stage_only` would mean
 editing `delete.rs` / `update.rs`, which the brief's file list forbids. That
 is observed out-of-scope, not a silent drop.
 
+Round 2 adds the second seam `with_snapshot_properties` beside
+`with_stage_only`: provider field `snapshot_properties:
+HashMap<String, String>`, default empty map in `try_new` and in
+`loaded.rs::from_planning_load`, clone-through in `refreshed()` (now
+pinned, round 3), hand-on through `insert_into` into
+`IcebergCommitExec`, and through `with_new_children`. In BOTH the
+`InsertOp::Append` and `InsertOp::Overwrite` arms the caller map is
+MERGED INTO the exec-built map (never replaces it): the exec first
+stamps `{OPERATION_ID_PROP: uuid}`, then inserts every caller entry
+except `OPERATION_ID_PROP`, so the exec-stamped operation id WINS over a
+caller-supplied one. `InsertOp::Replace` errors `NotImplemented`, and
+`delete_from` / `update` stay unthreaded as in round 1.
+
+Round 3 pins `refreshed()`: it carries `commit_branch`, `stage_only`,
+`snapshot_properties` and `output_spec_id` from `self`, and drops
+`planning_table` so scans on the fresh instance load current state
+instead of reusing the planning snapshot.
+
 ### Files
 
-Final line counts: `table/mod.rs` 346, `table/loaded.rs` 61, `commit.rs` 460,
-`commit_tests.rs` 907, `commit_stage_only_tests.rs` 194 (new),
-`tests/stage_only.rs` 340 (new), `tests/map.md` 106. The unit pins live in
-their own `#[path]`-wired module sharing `pub(crate)` fixtures from
-`commit_tests.rs` (the F-STAGE-ONLY-1 pattern): that file sits at 907 of its
-1000-line ceiling and the four pins do not fit inside it.
+Final line counts (`wc -l` at the class-A commit):
+`table/mod.rs` 357, `table/loaded.rs` 63, `table/tests.rs` 955 (round 3
+adds the two `refreshed` pins in place, under the 1000-line ceiling),
+`commit.rs` 484, `commit_tests.rs` 946,
+`commit_stage_only_tests.rs` 197, `commit_snapshot_properties_tests.rs`
+330 (new in round 2), `tests/stage_only.rs` 610, `tests/map.md` 106.
+The unit pins live in their own `#[path]`-wired modules sharing
+`pub(crate)` fixtures from `commit_tests.rs` (the F-STAGE-ONLY-1
+pattern): that file sits at 946 of its 1000-line ceiling and neither pin
+set fits inside it.
 
 ### Pins
 
-Unit (`commit_stage_only_tests.rs`):
+Round-1 unit (`commit_stage_only_tests.rs`, 4 pins):
 
 - `test_provider_stage_only_defaults_false_and_threads` — default provider
   plans an exec with `stage_only == false`; `with_stage_only(true)` plans
@@ -301,7 +332,7 @@ Unit (`commit_stage_only_tests.rs`):
 - `test_overwrite_stage_only_adds_snapshot_without_moving_current`
 - `test_stage_only_with_commit_branch_leaves_branch_unmoved`
 
-End to end (`tests/stage_only.rs`, SQL through `SessionContext`):
+Round-1 end to end (`tests/stage_only.rs`, 6 pins, SQL through `SessionContext`):
 
 - `insert_stage_only_adds_snapshot_without_moving_main` (staged op/parent
   pinned, main scan still `[1]`)
@@ -310,6 +341,36 @@ End to end (`tests/stage_only.rs`, SQL through `SessionContext`):
 - `insert_without_stage_only_advances_main` (near miss)
 - `insert_overwrite_without_stage_only_advances_main` (near miss)
 - `commit_branch_without_stage_only_still_targets_branch` (near miss)
+
+Round-2 unit (`commit_snapshot_properties_tests.rs`, 7 pins):
+
+- `test_provider_snapshot_properties_default_empty_and_threads` —
+  default provider plans an exec with an empty map; the builder value
+  threads through (downcast through `insert_into`)
+- `test_default_commit_stamps_operation_id_without_caller_keys` —
+  an empty caller map still stamps a non-empty `OPERATION_ID_PROP`
+- `test_append_merges_caller_snapshot_properties`
+- `test_overwrite_merges_caller_snapshot_properties`
+- `test_append_caller_operation_id_does_not_win`
+- `test_overwrite_caller_operation_id_does_not_win`
+- `test_stage_only_snapshot_properties_land_on_staged_snapshot`
+  (Append + `stage_only`: caller `wap.id` lands on the staged
+  snapshot, main unmoved)
+
+Round-2 end to end (`tests/stage_only.rs`, 4 pins):
+
+- `insert_with_snapshot_properties_stamps_current_summary`
+- `insert_overwrite_with_snapshot_properties_stamps_current_summary`
+- `snapshot_properties_caller_operation_id_does_not_win` (Append path)
+- `stage_only_with_snapshot_properties_stamps_staged_snapshot`
+
+Round-3 unit (`table/tests.rs`, 2 pins):
+
+- `test_refreshed_carries_commit_knobs_and_drops_planning_table` —
+  all four knobs survive `refreshed()`, `planning_table` drops, the
+  original instance is unchanged
+- `test_refreshed_of_default_provider_carries_defaults` — a plain
+  provider refreshes to `None` / `false` / empty / `None`
 
 ### Mutation arithmetic (one knob at a time, restored and re-greened after each)
 
@@ -324,22 +385,62 @@ End to end (`tests/stage_only.rs`, SQL through `SessionContext`):
    out of 2.
 3. Restored: unit 4/4 and end-to-end 6/6 green again.
 
+Round 2 (measured in round 3 against the round-2 threading — round 2
+recorded no counts of its own; unit population
+`physical_plan::commit::snapshot_properties`, 7 tests; end-to-end
+`--test stage_only`, 10 tests):
+
+4. Append arm `if key != OPERATION_ID_PROP` → `if false` (the caller
+   map never merges): unit 3 red out of 7 (exactly the three
+   Append-path pins: `test_append_merges_caller_snapshot_properties`,
+   `test_append_caller_operation_id_does_not_win`,
+   `test_stage_only_snapshot_properties_land_on_staged_snapshot`);
+   end-to-end 3 red out of 10 (exactly the three Append-path pins:
+   `insert_with_snapshot_properties_stamps_current_summary`,
+   `snapshot_properties_caller_operation_id_does_not_win`,
+   `stage_only_with_snapshot_properties_stamps_staged_snapshot`).
+5. Overwrite arm, same flip: unit 2 red out of 7 (exactly the two
+   Overwrite pins); end-to-end 1 red out of 10 (exactly
+   `insert_overwrite_with_snapshot_properties_stamps_current_summary`).
+6. Append arm `if key != OPERATION_ID_PROP` → `if true` (a caller
+   operation id wins): unit 1 red out of 7 (exactly
+   `test_append_caller_operation_id_does_not_win`); end-to-end 1 red
+   out of 10 (exactly
+   `snapshot_properties_caller_operation_id_does_not_win`).
+7. Overwrite arm, same flip: unit 1 red out of 7 (exactly
+   `test_overwrite_caller_operation_id_does_not_win`); end-to-end 0
+   red out of 10 — the end-to-end precedence pin covers the Append
+   path only, so per-arm precedence precision comes from the unit run.
+8. Restored: unit 7/7 and end-to-end 10/10 green again.
+
+Round 3, class A (population `table::tests::test_refreshed`, 2 tests;
+the defaults pin stayed green in all four):
+
+9. `refreshed()` `stage_only: self.stage_only` → `false`: 1 red out
+   of 2 (`test_refreshed_carries_commit_knobs_and_drops_planning_table`).
+10. `refreshed()` `snapshot_properties` clone → `HashMap::new()`: 1
+    red out of 2 (same pin).
+11. `refreshed()` `commit_branch` clone → `None`: 1 red out of 2
+    (same pin).
+12. `refreshed()` `output_spec_id` → `None`: 1 red out of 2 (same pin).
+13. Restored: 2/2 green again (`git diff` shows only the test additions).
+
 ### Gates
 
 Measured at
-`ca9e7e47f0fab21e4768cb9886ee5f757d32a1c4` (the docs commit after it adds
+`c0d7af35bd98976c6dfd518362aba3a132bc1689` (the docs commit after it adds
 only prose):
 
-- `cargo test -p iceberg-datafusion` — exit 0; lib 381 passed, 0 failed;
-  every test binary 0 failed
-- `cargo test -p iceberg --lib` — exit 0; 4414 passed, 0 failed, 9 ignored
-- `cargo clippy --all-targets -- -D warnings` — exit 0
+- `CARGO_BUILD_JOBS=6 cargo test -q -p iceberg-datafusion` — exit 0;
+  lib 399 passed, 0 failed, 1 ignored; every test binary 0 failed
+- `CARGO_BUILD_JOBS=6 cargo clippy -p iceberg-datafusion --all-targets --
+  -D warnings` — exit 0
 - `cargo fmt --all -- --check` — exit 0
-- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/xf-wap origin/main HEAD`
-  — `comment-ban hits=0`, exit 0
 - `typos .` — exit 0
-- `python3 scripts/check_rust_file_size.py` — 639 files clean (90 legacy
-  ceilings)
+- `python3 scripts/check_rust_file_size.py` — 646 files clean (90 legacy
+  ceilings), exit 0
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/xf-wap origin/main
+  HEAD` — `comment-ban hits=0`, exit 0
 
 ### Commits
 
@@ -349,3 +450,16 @@ only prose):
   for provider default, both arms, branch composition
 - `ca9e7e47f0fab21e4768cb9886ee5f757d32a1c4` test: F-STAGE-ONLY-2 end-to-end
   stage_only pins plus tests map row
+- `1ab175724cd1f957cf62b7c167dacd7758bbf413` docs: F-STAGE-ONLY-2 ledger
+  slice and plan
+- `81c8e86f38f9369c9ced51dc4a9dfa16a87a8b35` feat: F-STAGE-ONLY-2b thread
+  snapshot_properties from provider to commit arms
+- `8a57a60843ee2d48d4e1e896e5b8252ff4ee16ba` test: F-STAGE-ONLY-2b unit pins
+  for snapshot_properties default, both arms, precedence, stage_only
+  composition
+- `bb4ef734c7dcd519af90ee6be74a38be9ab263ed` test: F-STAGE-ONLY-2b end-to-end
+  snapshot_properties pins plus tests map row
+- `0c2386b0d90aa7205722eccbc1b4e2f14ed0a227` Merge remote-tracking branch
+  'origin/main' into feat/f-stage-only-2
+- `c0d7af35bd98976c6dfd518362aba3a132bc1689` test: F-STAGE-ONLY-2c pin
+  refreshed() carry-through of all four commit knobs

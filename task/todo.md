@@ -25,15 +25,19 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
-## ACTIVE (2026-09-21): F-STAGE-ONLY-2 — thread stage_only from IcebergTableProvider to every DML commit
+## ACTIVE (2026-09-21): F-STAGE-ONLY-2 — thread stage_only and snapshot_properties from IcebergTableProvider to every DML commit
 
 Ledger: SLICE F-STAGE-ONLY-2 section in
 [`f-stage-only-1-ledger.md`](f-stage-only-1-ledger.md). Branch
 `feat/f-stage-only-2` off fork `main`
 (`3f5a9289cffecd82c9ed2ea53187d9b6eb8f3a6d`, the squashed F-STAGE-ONLY-1
-commit). `with_stage_only(bool)` on the provider, threaded through
-`IcebergCommitExec` like `commit_branch`, applied to the Append and Overwrite
-actions; `delete_from` / `update` deliberately unthreaded (see ledger).
+commit); it now contains fork main
+`97f9b8a32226e03e21bec053ce39f3ec9cb10771` through merge
+`0c2386b0d90aa7205722eccbc1b4e2f14ed0a227`. `with_stage_only(bool)` and
+`with_snapshot_properties(HashMap<String, String>)` on the provider,
+threaded through `IcebergCommitExec` like `commit_branch`, applied to the
+Append and Overwrite actions; `InsertOp::Replace`, `delete_from` /
+`update` deliberately unthreaded (see ledger).
 
 - [x] SLICE 1 — thread `stage_only` (provider field/default/builder/hand-on,
       exec field/default/builder/hand-on/local copy, both action arms).
@@ -47,6 +51,34 @@ actions; `delete_from` / `update` deliberately unthreaded (see ledger).
       restored green
 - [x] SLICE 5 — gates (datafusion suite + core lib + clippy + fmt +
       comment-ban + typos + file-size, all exit 0), ledger slice, this plan
+- [x] SLICE 6 — round 2: thread `snapshot_properties` (provider
+      field/default/builder/hand-on, exec field/default/builder/hand-on,
+      merge into the exec-stamped map on both arms with
+      `OPERATION_ID_PROP` precedence for the exec stamp).
+      `81c8e86f38f9369c9ced51dc4a9dfa16a87a8b35`
+- [x] SLICE 7 — round-2 unit pins
+      (`commit_snapshot_properties_tests.rs`, 7 pins: default, both arms,
+      both precedence arms, stage_only composition).
+      `8a57a60843ee2d48d4e1e896e5b8252ff4ee16ba`
+- [x] SLICE 8 — round-2 end-to-end pins (`tests/stage_only.rs`, 4 pins)
+      + tests map row. `bb4ef734c7dcd519af90ee6be74a38be9ab263ed`
+- [x] SLICE 9 — round-2 per-arm mutation self-check (merge-drop per arm:
+      append 3 red/7 unit + 3 red/10 end-to-end, overwrite 2 red/7 unit +
+      1 red/10 end-to-end; precedence-flip per arm: append 1 red/7 unit +
+      1 red/10 end-to-end, overwrite 1 red/7 unit + 0 red/10 end-to-end;
+      counts measured in round 3, see ledger), restored green
+- [x] SLICE 10 — round-2 gates (the six-gate run in SLICE 11 covers the
+      round-2 code, all exit 0) + merge of fork main
+      `97f9b8a32226e03e21bec053ce39f3ec9cb10771` (one slice file,
+      `table/mod.rs`, changed only inside `metadata_table()`).
+      `0c2386b0d90aa7205722eccbc1b4e2f14ed0a227`
+- [x] SLICE 11 — round 3 class A: `refreshed()` carry-through pins
+      (`table/tests.rs`, 2 pins) + four-knob mutation self-check (each
+      knob 1 red/2 on the carry pin; defaults pin green), restored
+      green, + the six gates at the class-A commit, all exit 0.
+      `c0d7af35bd98976c6dfd518362aba3a132bc1689`
+- [x] SLICE 12 — round 3 class B: ledger slice + this plan brought to
+      round 2 and class A (prose only; this entry)
 
 
 ## ACTIVE (2026-09-20): F-STAGE-ONLY-1 — staged (WAP) commits on every write action + the publish primitive
