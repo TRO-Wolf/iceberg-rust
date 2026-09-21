@@ -710,6 +710,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn avro_java_alias_zstd_stable_across_writers() {
+        for _ in 0..25 {
+            let (codec, rows) = avro_codec_name_and_rows_for_property("zstd").await;
+            assert_eq!(codec, "zstandard");
+            assert_eq!(rows, 3);
+        }
+    }
+
+    #[tokio::test]
     async fn avro_java_alias_uncompressed_writes_null() {
         let (codec, rows) = avro_codec_name_and_rows_for_property("uncompressed").await;
         assert_eq!(codec, "null");
