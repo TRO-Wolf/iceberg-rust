@@ -86,16 +86,135 @@ fn test_schema_accessor_charge_counts_actual_arc_and_box_nodes() {
     let variant = schema_with_field(required_field(1, "value", Type::Variant));
     let arc_charge = arc_allocation_charge::<StructAccessor>();
     let box_charge = shallow_charge::<StructAccessor>();
+    let struct_payload = sequence_charge::<Arc<NestedField>>(1);
 
     assert_eq!(schema_accessor_charge(&flat), arc_charge);
-    assert_eq!(schema_accessor_charge(&nested), arc_charge + box_charge);
+    assert_eq!(
+        schema_accessor_charge(&nested),
+        2 * arc_charge + box_charge + struct_payload
+    );
     assert_eq!(
         schema_accessor_charge(&doubly_nested),
-        arc_charge + 2 * box_charge
+        3 * arc_charge + 3 * box_charge + 3 * struct_payload
     );
-    assert_eq!(schema_accessor_charge(&list), 0);
-    assert_eq!(schema_accessor_charge(&map), 0);
-    assert_eq!(schema_accessor_charge(&variant), 0);
+    assert_eq!(schema_accessor_charge(&list), arc_charge);
+    assert_eq!(schema_accessor_charge(&map), arc_charge);
+    assert_eq!(schema_accessor_charge(&variant), arc_charge);
+}
+
+#[test]
+fn test_schema_accessor_charge_matches_the_accessor_map_schema_builds() {
+    for schema in [
+        schema_with_field(required_field(
+            1,
+            "value",
+            Type::Primitive(PrimitiveType::String),
+        )),
+        nested_payload_schema(NestedWrapper::Struct, "doc"),
+        nested_payload_schema(NestedWrapper::List, "doc"),
+        nested_payload_schema(NestedWrapper::Map, "doc"),
+        Schema::builder()
+            .with_fields([
+                required_field(1, "id", Type::Primitive(PrimitiveType::Long)),
+                Arc::new(NestedField::optional(
+                    2,
+                    "st",
+                    Type::Struct(StructType::new(vec![
+                        Arc::new(NestedField::optional(
+                            3,
+                            "a",
+                            Type::Primitive(PrimitiveType::String),
+                        )),
+                        Arc::new(NestedField::optional(
+                            4,
+                            "inner",
+                            Type::Struct(StructType::new(vec![Arc::new(NestedField::optional(
+                                5,
+                                "ys",
+                                Type::List(ListType::new(required_field(
+                                    6,
+                                    "element",
+                                    Type::Primitive(PrimitiveType::Int),
+                                ))),
+                            ))])),
+                        )),
+                    ])),
+                )),
+                Arc::new(NestedField::optional(
+                    7,
+                    "mp",
+                    Type::Map(MapType::new(
+                        required_field(8, "key", Type::Primitive(PrimitiveType::String)),
+                        Arc::new(NestedField::optional(
+                            9,
+                            "value",
+                            Type::Primitive(PrimitiveType::Int),
+                        )),
+                    )),
+                )),
+            ])
+            .build()
+            .unwrap(),
+    ] {
+        let mut expected = 0u64;
+        for accessor in schema.accessor_entries() {
+            expected += arc_allocation_charge::<StructAccessor>()
+                + accessor_type_payload_charge(accessor.r#type());
+            let mut wrapped = accessor.inner();
+            while let Some(node) = wrapped {
+                expected += shallow_charge::<StructAccessor>()
+                    + accessor_type_payload_charge(node.r#type());
+                wrapped = node.inner();
+            }
+        }
+        assert!(expected > 0);
+        assert_eq!(schema_accessor_charge(&schema), expected);
+    }
+}
+
+#[test]
+fn test_schema_accessor_charge_grows_with_every_accessor_map_entry() {
+    let one_field = schema_with_field(required_field(
+        1,
+        "outer",
+        Type::Struct(StructType::new(vec![required_field(
+            2,
+            "a",
+            Type::Primitive(PrimitiveType::String),
+        )])),
+    ));
+    let two_fields = schema_with_field(required_field(
+        1,
+        "outer",
+        Type::Struct(StructType::new(vec![
+            required_field(2, "a", Type::Primitive(PrimitiveType::String)),
+            required_field(3, "b", Type::Primitive(PrimitiveType::String)),
+        ])),
+    ));
+    let with_list = Schema::builder()
+        .with_fields([
+            required_field(1, "value", Type::Primitive(PrimitiveType::String)),
+            required_field(
+                2,
+                "xs",
+                Type::List(ListType::new(required_field(
+                    3,
+                    "element",
+                    Type::Primitive(PrimitiveType::Int),
+                ))),
+            ),
+        ])
+        .build()
+        .unwrap();
+    let without_list = schema_with_field(required_field(
+        1,
+        "value",
+        Type::Primitive(PrimitiveType::String),
+    ));
+
+    assert!(schema_accessor_charge(&two_fields) > schema_accessor_charge(&one_field));
+    assert!(schema_accessor_charge(&with_list) > schema_accessor_charge(&without_list));
+    assert_eq!(with_list.accessor_entries().count(), 2);
 }
 
 #[test]

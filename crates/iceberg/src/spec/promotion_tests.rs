@@ -165,19 +165,19 @@ fn strict_metrics_decide_an_int_bounded_file_under_long_predicates() {
 fn partition_accessor_reads_pre_promotion_literals_under_the_promoted_type() {
     let tuple = Struct::from_iter([Some(Literal::int(7)), Some(Literal::float(1.5))]);
     assert_eq!(
-        StructAccessor::new(0, PrimitiveType::Long)
+        StructAccessor::new(0, PrimitiveType::Long, true)
             .get(&tuple)
             .expect("an int literal reads under long"),
         Some(Datum::long(7))
     );
     assert_eq!(
-        StructAccessor::new(1, PrimitiveType::Double)
+        StructAccessor::new(1, PrimitiveType::Double, true)
             .get(&tuple)
             .expect("a float literal reads under double"),
         Some(Datum::double(1.5))
     );
     assert!(
-        StructAccessor::new(0, PrimitiveType::String)
+        StructAccessor::new(0, PrimitiveType::String, true)
             .get(&tuple)
             .is_err()
     );

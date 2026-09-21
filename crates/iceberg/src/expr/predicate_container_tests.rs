@@ -1,0 +1,225 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::sync::Arc;
+
+use super::predicate::tests::test_bound_predicate_serialize_diserialize;
+use super::visitors::bound_predicate_visitor::visit;
+use super::visitors::expression_evaluator::ExpressionEvaluatorVisitor;
+use crate::ErrorKind;
+use crate::expr::{Bind, BoundPredicate, Reference};
+use crate::spec::{
+    Datum, ListType, Literal, MapType, NestedField, PrimitiveType, Schema, SchemaRef, Struct,
+    StructType, Type,
+};
+
+fn table_schema_with_containers() -> SchemaRef {
+    Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(
+                    2,
+                    "xs",
+                    Type::List(ListType::new(
+                        NestedField::optional(3, "element", Type::Primitive(PrimitiveType::Int))
+                            .into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "mp",
+                    Type::Map(MapType::new(
+                        NestedField::required(5, "key", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                        NestedField::optional(6, "value", Type::Primitive(PrimitiveType::Int))
+                            .into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    7,
+                    "person",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(8, "name", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                        NestedField::required(9, "age", Type::Primitive(PrimitiveType::Int)).into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn test_bind_is_null_on_container_columns() {
+    let schema = table_schema_with_containers();
+
+    for (column, expected) in [
+        ("xs", "xs IS NULL"),
+        ("mp", "mp IS NULL"),
+        ("person", "person IS NULL"),
+    ] {
+        let bound = Reference::new(column)
+            .is_null()
+            .bind(schema.clone(), true)
+            .unwrap_or_else(|e| panic!("`{column} IS NULL` must bind: {e}"));
+        assert_eq!(&format!("{bound}"), expected);
+        test_bound_predicate_serialize_diserialize(bound);
+
+        let bound_not = Reference::new(column)
+            .is_not_null()
+            .bind(schema.clone(), true)
+            .unwrap_or_else(|e| panic!("`{column} IS NOT NULL` must bind: {e}"));
+        assert_eq!(format!("{bound_not}"), format!("{column} IS NOT NULL"));
+        test_bound_predicate_serialize_diserialize(bound_not);
+    }
+}
+
+#[test]
+fn test_bind_comparison_on_container_column_fails_at_bind() {
+    let schema = table_schema_with_containers();
+
+    for (column, datum) in [
+        ("xs", Datum::int(1)),
+        ("mp", Datum::int(1)),
+        ("person", Datum::int(1)),
+    ] {
+        let error = Reference::new(column)
+            .equal_to(datum)
+            .bind(schema.clone(), true)
+            .expect_err(&format!("`{column} = <literal>` must fail to bind"));
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("Can't convert"),
+            "`{column} = <literal>` must fail in literal conversion, got: {}",
+            error.message()
+        );
+    }
+}
+
+#[test]
+fn test_bind_is_null_on_element_key_and_value_paths_fails_at_accessor_lookup() {
+    let schema = table_schema_with_containers();
+
+    for column in ["xs.element", "mp.key", "mp.value"] {
+        let error = Reference::new(column)
+            .is_null()
+            .bind(schema.clone(), true)
+            .expect_err(&format!("`{column} IS NULL` must fail to bind"));
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error.message().contains("Accessor for Field"),
+            "`{column} IS NULL` must fail at the accessor lookup, got: {}",
+            error.message()
+        );
+    }
+}
+
+#[test]
+fn test_bind_is_null_required_leaf_under_optional_parent_does_not_fold() {
+    let schema = table_schema_with_containers();
+    let bound = Reference::new("person.age")
+        .is_null()
+        .bind(schema, true)
+        .expect("`person.age IS NULL` must bind");
+    assert_eq!(&format!("{bound}"), "person.age IS NULL");
+}
+
+#[test]
+fn test_bind_is_not_null_required_leaf_under_optional_parent_does_not_fold() {
+    let schema = table_schema_with_containers();
+    let bound = Reference::new("person.age")
+        .is_not_null()
+        .bind(schema, true)
+        .expect("`person.age IS NOT NULL` must bind");
+    assert_eq!(&format!("{bound}"), "person.age IS NOT NULL");
+}
+
+#[test]
+fn test_optional_primitive_bound_predicate_json_omits_default_is_optional() {
+    let schema = table_schema_with_containers();
+    let bound = Reference::new("person.name")
+        .is_null()
+        .bind(schema, true)
+        .expect("`person.name IS NULL` must bind");
+    let json = serde_json::to_string(&bound).expect("serialize the bound predicate");
+    assert_eq!(
+        json,
+        r#"{"Unary":{"op":"IsNull","term":{"column_name":"person.name","field":{"id":8,"name":"name","required":false,"type":"string"},"accessor":{"position":3,"type":"string","inner":{"position":0,"type":"string","inner":null}}}}}"#
+    );
+    let decoded: BoundPredicate =
+        serde_json::from_str(&json).expect("the payload must deserialize");
+    assert_eq!(decoded, bound);
+}
+
+#[test]
+fn test_required_primitive_bound_predicate_json_carries_explicit_is_optional() {
+    let schema = table_schema_with_containers();
+    let bound = Reference::new("id")
+        .greater_than(Datum::long(1))
+        .bind(schema, true)
+        .expect("`id > 1` must bind");
+    let json = serde_json::to_string(&bound).expect("serialize the bound predicate");
+    assert_eq!(json.matches("\"is_optional\":false").count(), 1);
+}
+
+#[test]
+fn test_partition_evaluator_answers_container_null_tests_through_presence() {
+    let schema = table_schema_with_containers();
+    let is_null = Reference::new("xs")
+        .is_null()
+        .bind(schema.clone(), true)
+        .expect("`xs IS NULL` must bind");
+    let is_not_null = Reference::new("xs")
+        .is_not_null()
+        .bind(schema, true)
+        .expect("`xs IS NOT NULL` must bind");
+
+    let present_list = Struct::from_iter([
+        Some(Literal::long(1)),
+        Some(Literal::List(vec![Some(Literal::int(1))])),
+        None,
+        None,
+    ]);
+    let null_list = Struct::from_iter([Some(Literal::long(2)), None, None, None]);
+
+    let mut present_visitor = ExpressionEvaluatorVisitor::new(&present_list);
+    assert!(
+        !visit(&mut present_visitor, &is_null).expect("a present list must evaluate"),
+        "a present list is not null"
+    );
+    let mut present_visitor = ExpressionEvaluatorVisitor::new(&present_list);
+    assert!(
+        visit(&mut present_visitor, &is_not_null).expect("a present list must evaluate"),
+        "a present list is not-null"
+    );
+    let mut null_visitor = ExpressionEvaluatorVisitor::new(&null_list);
+    assert!(
+        visit(&mut null_visitor, &is_null).expect("a null list must evaluate"),
+        "a null list is null"
+    );
+    let mut null_visitor = ExpressionEvaluatorVisitor::new(&null_list);
+    assert!(
+        !visit(&mut null_visitor, &is_not_null).expect("a null list must evaluate"),
+        "a null list is not not-null"
+    );
+}

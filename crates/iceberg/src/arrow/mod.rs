@@ -48,6 +48,7 @@ pub(crate) mod record_batch_predicate;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;
 pub(crate) mod record_batch_transformer;
+pub(crate) mod row_filter_plan;
 mod value;
 
 pub use reader::*;
@@ -70,6 +71,10 @@ mod page_prune_tests;
 mod page_prune_tests_2;
 /// Record batch partition splitter for partitioned tables
 pub mod record_batch_partition_splitter;
+#[cfg(test)]
+mod record_batch_predicate_container_tests;
+#[cfg(test)]
+mod row_filter_nested_tests;
 #[cfg(test)]
 mod spark_fixture_tests;
 pub use record_batch_partition_splitter::*;

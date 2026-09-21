@@ -866,7 +866,7 @@ mod test {
                 "nested",
                 Type::Struct(StructType::new(Vec::new())),
             )),
-            Arc::new(StructAccessor::new(0, PrimitiveType::Int)),
+            Arc::new(StructAccessor::new(0, PrimitiveType::Int, true)),
         );
         let filter = BoundPredicate::Binary(BinaryExpression::new(
             PredicateOperator::LessThan,
@@ -904,7 +904,7 @@ mod test {
                     "partition",
                     Type::Primitive(PrimitiveType::Int),
                 )),
-                Arc::new(StructAccessor::new(position, PrimitiveType::Int)),
+                Arc::new(StructAccessor::new(position, PrimitiveType::Int, true)),
             ),
         ))
     }

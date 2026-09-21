@@ -57,13 +57,15 @@ use std::collections::HashMap;
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Datum as ArrowDatum, Float32Array, Float64Array, RecordBatch,
+    StructArray,
 };
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType, Field};
 use arrow_string::like::starts_with;
 use fnv::FnvHashSet;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use crate::arrow::null_propagation::array_with_parent_validity;
 use crate::arrow::{get_arrow_datum, try_cast_literal};
 use crate::expr::visitors::bound_predicate_visitor::{BoundPredicateVisitor, visit};
 use crate::expr::{BoundPredicate, BoundReference};
@@ -82,39 +84,79 @@ pub(crate) fn evaluate_predicate_to_mask(
     visit(&mut evaluator, predicate)
 }
 
+fn column_at_path(batch: &RecordBatch, path: &[usize]) -> Result<ArrayRef> {
+    let mut column = batch.column(path[0]).clone();
+    for &child_idx in &path[1..] {
+        let struct_array = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Predicate path descends through a column that is not a struct",
+                )
+                .with_context("child_type", format!("{:?}", column.data_type()))
+            })?;
+        column = array_with_parent_validity(
+            struct_array.column(child_idx),
+            struct_array.logical_nulls().as_ref(),
+        )?;
+    }
+    Ok(column)
+}
+
+fn collect_field_paths(
+    field: &Field,
+    idx: usize,
+    path: &mut Vec<usize>,
+    map: &mut HashMap<i32, Vec<usize>>,
+) {
+    path.push(idx);
+    if let Some(id) = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id_str| id_str.parse::<i32>().ok())
+    {
+        map.insert(id, path.clone());
+    }
+    if let DataType::Struct(children) = field.data_type() {
+        for (child_idx, child) in children.iter().enumerate() {
+            collect_field_paths(child, child_idx, path, map);
+        }
+    }
+    path.pop();
+}
+
 /// A [`BoundPredicateVisitor`] that evaluates the predicate against ONE [`RecordBatch`] to a
 /// [`BooleanArray`], mapping each [`BoundReference`] to a column by its field-id
 /// (`PARQUET_FIELD_ID_META_KEY`) metadata. Mirrors the read path's `PredicateConverter` arrow
 /// kernels, but resolves columns by field id (the batch is already schema-evolved) rather than by
 /// a parquet projection-mask leaf index.
 pub(crate) struct RecordBatchPredicateEvaluator<'a> {
-    /// field id -> column index in the batch.
-    field_id_to_col: HashMap<i32, usize>,
+    field_id_to_path: HashMap<i32, Vec<usize>>,
     batch: &'a RecordBatch,
 }
 
 impl<'a> RecordBatchPredicateEvaluator<'a> {
     pub(crate) fn new(batch: &'a RecordBatch) -> Result<Self> {
-        let mut field_id_to_col = HashMap::new();
+        let mut field_id_to_path = HashMap::new();
+        let mut path = Vec::new();
         for (idx, field) in batch.schema().fields().iter().enumerate() {
-            if let Some(id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)
-                && let Ok(id) = id_str.parse::<i32>()
-            {
-                field_id_to_col.insert(id, idx);
-            }
+            collect_field_paths(field, idx, &mut path, &mut field_id_to_path);
         }
         Ok(Self {
-            field_id_to_col,
+            field_id_to_path,
             batch,
         })
     }
 
     /// The batch column for a reference, by field id (None when the column is absent — schema
     /// evolution).
-    fn column_for(&self, reference: &BoundReference) -> Option<ArrayRef> {
-        self.field_id_to_col
+    fn column_for(&self, reference: &BoundReference) -> Result<Option<ArrayRef>> {
+        self.field_id_to_path
             .get(&reference.field().id)
-            .map(|idx| self.batch.column(*idx).clone())
+            .map(|path| column_at_path(self.batch, path))
+            .transpose()
     }
 
     fn all_true(&self) -> Result<BooleanArray> {
@@ -136,7 +178,7 @@ impl<'a> RecordBatchPredicateEvaluator<'a> {
         null_verdict: bool,
         kernel: impl Fn(&ArrayRef, &dyn ArrowDatum) -> std::result::Result<BooleanArray, ArrowError>,
     ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => {
                 let lit = get_arrow_datum(literal)?;
                 let cast = try_cast_literal(&lit, col.data_type()).map_err(arrow_err)?;
@@ -246,7 +288,7 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
     }
 
     fn is_null(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => is_null(&col).map_err(arrow_err),
             None => self.all_true(),
         }
@@ -257,14 +299,14 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
         reference: &BoundReference,
         _p: &BoundPredicate,
     ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => is_not_null(&col).map_err(arrow_err),
             None => self.all_false(),
         }
     }
 
     fn is_nan(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => Ok(is_nan_row_mask(&col)),
             // A missing column is a NULL column: Java `NaNUtil.isNaN(null)` == false.
             None => self.all_false(),
@@ -272,7 +314,7 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
     }
 
     fn not_nan(&mut self, reference: &BoundReference, _p: &BoundPredicate) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => Ok(not_nan_row_mask(&col)),
             // A missing column is a NULL column: `!NaNUtil.isNaN(null)` == true.
             None => self.all_true(),
@@ -366,7 +408,7 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
         literals: &FnvHashSet<Datum>,
         _p: &BoundPredicate,
     ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => {
                 let mut acc = BooleanArray::from(vec![false; col.len()]);
                 for literal in literals {
@@ -389,7 +431,7 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
         literals: &FnvHashSet<Datum>,
         _p: &BoundPredicate,
     ) -> Result<BooleanArray> {
-        match self.column_for(reference) {
+        match self.column_for(reference)? {
             Some(col) => {
                 let mut acc = BooleanArray::from(vec![true; col.len()]);
                 for literal in literals {
@@ -407,7 +449,7 @@ impl BoundPredicateVisitor for RecordBatchPredicateEvaluator<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -459,7 +501,7 @@ mod tests {
     /// the Java parity invariant: `NaNUtil.isNaN` returns a boolean, never a 3VL NULL, so a
     /// validity-propagating mask (which would make `RowFilter`/`coerce_nulls_to_false` DROP null
     /// cells under `not_nan`) is itself a divergence.
-    fn two_valued(mask: &BooleanArray) -> Vec<bool> {
+    pub(crate) fn two_valued(mask: &BooleanArray) -> Vec<bool> {
         assert_eq!(
             mask.null_count(),
             0,

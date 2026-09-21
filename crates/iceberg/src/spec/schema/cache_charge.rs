@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Arc;
+
 use super::Schema;
+use crate::expr::accessor::StructAccessor;
 
 impl Schema {
     pub(crate) fn alias_entries(&self) -> impl ExactSizeIterator<Item = (&String, &i32)> {
@@ -41,8 +44,8 @@ impl Schema {
         )
     }
 
-    pub(crate) fn accessor_count(&self) -> usize {
-        self.field_id_to_accessor.len()
+    pub(crate) fn accessor_entries(&self) -> impl Iterator<Item = &Arc<StructAccessor>> {
+        self.field_id_to_accessor.values()
     }
 
     pub(crate) fn identifier_storage_capacity(&self) -> usize {

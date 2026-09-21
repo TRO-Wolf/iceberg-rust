@@ -547,12 +547,12 @@ impl Predicate {
 
                 match &bound_expr.op {
                     &PredicateOperator::IsNull => {
-                        if bound_expr.term.field().required {
+                        if !bound_expr.term.accessor().is_optional() {
                             return Ok(BoundPredicate::AlwaysFalse);
                         }
                     }
                     &PredicateOperator::NotNull => {
-                        if bound_expr.term.field().required {
+                        if !bound_expr.term.accessor().is_optional() {
                             return Ok(BoundPredicate::AlwaysTrue);
                         }
                     }
@@ -1177,7 +1177,7 @@ impl Display for BoundPredicate {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::ops::Not;
     use std::sync::Arc;
 
@@ -1391,7 +1391,7 @@ mod tests {
         )
     }
 
-    fn test_bound_predicate_serialize_diserialize(bound_predicate: BoundPredicate) {
+    pub(crate) fn test_bound_predicate_serialize_diserialize(bound_predicate: BoundPredicate) {
         let serialized = serde_json::to_string(&bound_predicate).unwrap();
         let deserialized: BoundPredicate = serde_json::from_str(&serialized).unwrap();
         assert_eq!(bound_predicate, deserialized);

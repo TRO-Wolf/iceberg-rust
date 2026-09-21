@@ -19,23 +19,37 @@ use std::sync::Arc;
 
 use serde_derive::{Deserialize, Serialize};
 
-use crate::spec::{Datum, Literal, PrimitiveType, Struct};
+use crate::spec::{Datum, Literal, Struct, Type};
 use crate::{Error, ErrorKind, Result};
+
+fn default_is_optional() -> bool {
+    true
+}
+
+fn is_default_optional(optional: &bool) -> bool {
+    *optional == default_is_optional()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct StructAccessor {
     position: usize,
-    r#type: PrimitiveType,
+    r#type: Type,
+    #[serde(
+        default = "default_is_optional",
+        skip_serializing_if = "is_default_optional"
+    )]
+    is_optional: bool,
     inner: Option<Box<StructAccessor>>,
 }
 
 pub(crate) type StructAccessorRef = Arc<StructAccessor>;
 
 impl StructAccessor {
-    pub(crate) fn new(position: usize, r#type: PrimitiveType) -> Self {
+    pub(crate) fn new(position: usize, r#type: impl Into<Type>, is_optional: bool) -> Self {
         StructAccessor {
             position,
-            r#type,
+            r#type: r#type.into(),
+            is_optional,
             inner: None,
         }
     }
@@ -43,7 +57,8 @@ impl StructAccessor {
     pub(crate) fn wrap(position: usize, inner: Box<StructAccessor>) -> Self {
         StructAccessor {
             position,
-            r#type: inner.r#type().clone(),
+            r#type: inner.r#type.clone(),
+            is_optional: inner.is_optional,
             inner: Some(inner),
         }
     }
@@ -52,12 +67,43 @@ impl StructAccessor {
         self.position
     }
 
-    pub(crate) fn r#type(&self) -> &PrimitiveType {
+    pub(crate) fn r#type(&self) -> &Type {
         &self.r#type
+    }
+
+    pub(crate) fn is_optional(&self) -> bool {
+        self.is_optional
     }
 
     pub(crate) fn is_nested(&self) -> bool {
         self.inner.is_some()
+    }
+
+    pub(crate) fn inner(&self) -> Option<&StructAccessor> {
+        self.inner.as_deref()
+    }
+
+    pub(crate) fn is_present<'a>(&'a self, container: &'a Struct) -> Result<bool> {
+        let value = container.fields().get(self.position).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Cannot access field at position {} from struct with {} fields",
+                    self.position,
+                    container.fields().len()
+                ),
+            )
+        })?;
+
+        match (value, &self.inner) {
+            (None, _) => Ok(false),
+            (Some(_), None) => Ok(true),
+            (Some(Literal::Struct(wrapped)), Some(inner)) => inner.is_present(wrapped),
+            (Some(_), Some(_)) => Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Nested accessor should only be wrapping a Struct",
+            )),
+        }
     }
 
     pub(crate) fn get<'a>(&'a self, container: &'a Struct) -> Result<Option<Datum>> {
@@ -73,23 +119,25 @@ impl StructAccessor {
         })?;
 
         match &self.inner {
-            None => match value {
-                None => Ok(None),
+            None => match (value, self.r#type.as_primitive_type()) {
+                (None, _) => Ok(None),
                 // PrimitiveLiteral records the physical representation, not a separate semantic
                 // type tag. Compatibility therefore intentionally accepts representation-sharing
                 // families such as int/date, long/time/timestamps, and binary/fixed.
-                Some(Literal::Primitive(literal)) if self.r#type().compatible(literal) => {
-                    Ok(Some(Datum::new(self.r#type().clone(), literal.clone())))
+                (Some(Literal::Primitive(literal)), Some(prim_type))
+                    if prim_type.compatible(literal) =>
+                {
+                    Ok(Some(Datum::new(prim_type.clone(), literal.clone())))
                 }
-                Some(Literal::Primitive(literal))
-                    if self.r#type().compatible(&literal.promote_to(self.r#type())) =>
+                (Some(Literal::Primitive(literal)), Some(prim_type))
+                    if prim_type.compatible(&literal.promote_to(prim_type)) =>
                 {
                     Ok(Some(Datum::new(
-                        self.r#type().clone(),
-                        literal.promote_to(self.r#type()),
+                        prim_type.clone(),
+                        literal.promote_to(prim_type),
                     )))
                 }
-                Some(Literal::Primitive(literal)) => Err(Error::new(
+                (Some(Literal::Primitive(literal)), Some(_)) => Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
                         "Literal {literal:?} at position {} is not compatible with accessor type {}",
@@ -97,9 +145,17 @@ impl StructAccessor {
                         self.r#type()
                     ),
                 )),
-                Some(_) => Err(Error::new(
+                (Some(_), Some(_)) => Err(Error::new(
                     ErrorKind::DataInvalid,
                     "Expected Literal to be Primitive",
+                )),
+                (Some(_), None) => Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot materialize a {} value at position {} as a primitive Datum",
+                        self.r#type(),
+                        self.position
+                    ),
                 )),
             },
             Some(inner) => match value {
@@ -118,13 +174,19 @@ impl StructAccessor {
 mod tests {
     use crate::ErrorKind;
     use crate::expr::accessor::StructAccessor;
-    use crate::spec::{Datum, Literal, PrimitiveType, Struct};
+    use crate::spec::{
+        Datum, ListType, Literal, Map, MapType, NestedField, PrimitiveType, Struct, StructType,
+        Type,
+    };
 
     #[test]
     fn test_single_level_accessor() {
-        let accessor = StructAccessor::new(1, PrimitiveType::Boolean);
+        let accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
 
-        assert_eq!(accessor.r#type(), &PrimitiveType::Boolean);
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         assert_eq!(accessor.position(), 1);
 
         let test_struct =
@@ -135,9 +197,12 @@ mod tests {
 
     #[test]
     fn test_single_level_accessor_null() {
-        let accessor = StructAccessor::new(1, PrimitiveType::Boolean);
+        let accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
 
-        assert_eq!(accessor.r#type(), &PrimitiveType::Boolean);
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         assert_eq!(accessor.position(), 1);
 
         let test_struct = Struct::from_iter(vec![Some(Literal::bool(false)), None]);
@@ -147,10 +212,13 @@ mod tests {
 
     #[test]
     fn test_nested_accessor() {
-        let nested_accessor = StructAccessor::new(1, PrimitiveType::Boolean);
+        let nested_accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
         let accessor = StructAccessor::wrap(2, Box::new(nested_accessor));
 
-        assert_eq!(accessor.r#type(), &PrimitiveType::Boolean);
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         //assert_eq!(accessor.position(), 1);
 
         let nested_test_struct =
@@ -167,10 +235,13 @@ mod tests {
 
     #[test]
     fn test_nested_accessor_null() {
-        let nested_accessor = StructAccessor::new(0, PrimitiveType::Boolean);
+        let nested_accessor = StructAccessor::new(0, PrimitiveType::Boolean, true);
         let accessor = StructAccessor::wrap(2, Box::new(nested_accessor));
 
-        assert_eq!(accessor.r#type(), &PrimitiveType::Boolean);
+        assert_eq!(
+            accessor.r#type().as_primitive_type(),
+            Some(&PrimitiveType::Boolean)
+        );
         //assert_eq!(accessor.position(), 1);
 
         let nested_test_struct = Struct::from_iter(vec![None, Some(Literal::bool(true))]);
@@ -186,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_single_level_accessor_rejects_short_struct() {
-        let accessor = StructAccessor::new(1, PrimitiveType::Boolean);
+        let accessor = StructAccessor::new(1, PrimitiveType::Boolean, true);
         let test_struct = Struct::from_iter([Some(Literal::bool(false))]);
 
         let error = accessor
@@ -202,8 +273,10 @@ mod tests {
 
     #[test]
     fn test_nested_accessor_rejects_short_inner_struct() {
-        let accessor =
-            StructAccessor::wrap(0, Box::new(StructAccessor::new(0, PrimitiveType::Boolean)));
+        let accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)),
+        );
         let test_struct = Struct::from_iter([Some(Literal::Struct(Struct::empty()))]);
 
         let error = accessor
@@ -230,7 +303,7 @@ mod tests {
         ];
 
         for (position, test_struct, field_count) in cases {
-            let error = StructAccessor::new(position, PrimitiveType::Boolean)
+            let error = StructAccessor::new(position, PrimitiveType::Boolean, true)
                 .get(&test_struct)
                 .expect_err("an out-of-bounds position must return a typed error");
 
@@ -246,14 +319,16 @@ mod tests {
 
     #[test]
     fn test_accessor_rejects_primitive_type_mismatch_at_outer_and_nested_leaves() {
-        let outer_error = StructAccessor::new(0, PrimitiveType::Boolean)
+        let outer_error = StructAccessor::new(0, PrimitiveType::Boolean, true)
             .get(&Struct::from_iter([Some(Literal::int(7))]))
             .expect_err("an outer leaf with the wrong primitive kind must fail");
         assert_eq!(outer_error.kind(), ErrorKind::DataInvalid);
         assert!(outer_error.message().contains("accessor type boolean"));
 
-        let nested_accessor =
-            StructAccessor::wrap(0, Box::new(StructAccessor::new(0, PrimitiveType::Boolean)));
+        let nested_accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)),
+        );
         let nested_error = nested_accessor
             .get(&Struct::from_iter([Some(Literal::Struct(
                 Struct::from_iter([Some(Literal::int(7))]),
@@ -287,7 +362,7 @@ mod tests {
         ];
 
         for (accessor_type, literal) in cases {
-            let value = StructAccessor::new(0, accessor_type.clone())
+            let value = StructAccessor::new(0, accessor_type.clone(), true)
                 .get(&Struct::from_iter([Some(literal)]))
                 .expect("a representation-compatible primitive must be accepted")
                 .expect("the present primitive must produce a datum");
@@ -314,7 +389,7 @@ mod tests {
         ];
 
         for (accessor_type, literal) in cases {
-            let error = StructAccessor::new(0, accessor_type.clone())
+            let error = StructAccessor::new(0, accessor_type.clone(), true)
                 .get(&Struct::from_iter([Some(literal)]))
                 .expect_err("a representation-incompatible primitive must fail");
 
@@ -328,14 +403,105 @@ mod tests {
     }
 
     #[test]
+    fn test_is_present_treats_empty_containers_and_all_null_struct_as_present() {
+        let list_accessor = StructAccessor::new(
+            0,
+            Type::List(ListType::new(
+                NestedField::list_element(1, Type::Primitive(PrimitiveType::Int), false).into(),
+            )),
+            true,
+        );
+        let empty_list = Struct::from_iter([Some(Literal::List(vec![]))]);
+        assert!(
+            list_accessor
+                .is_present(&empty_list)
+                .expect("an empty list must answer"),
+            "an empty list is present"
+        );
+        let null_list = Struct::from_iter([None]);
+        assert!(
+            !list_accessor
+                .is_present(&null_list)
+                .expect("a null list must answer"),
+            "a null list is absent"
+        );
+
+        let map_accessor = StructAccessor::new(
+            0,
+            Type::Map(MapType::new(
+                NestedField::map_key_element(2, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::map_value_element(3, Type::Primitive(PrimitiveType::Int), false)
+                    .into(),
+            )),
+            true,
+        );
+        let empty_map = Struct::from_iter([Some(Literal::Map(Map::new()))]);
+        assert!(
+            map_accessor
+                .is_present(&empty_map)
+                .expect("an empty map must answer"),
+            "an empty map is present"
+        );
+
+        let struct_accessor = StructAccessor::new(
+            0,
+            Type::Struct(StructType::new(vec![
+                NestedField::optional(4, "a", Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::optional(5, "b", Type::Primitive(PrimitiveType::Int)).into(),
+            ])),
+            true,
+        );
+        let all_null_struct =
+            Struct::from_iter([Some(Literal::Struct(Struct::from_iter([None, None])))]);
+        assert!(
+            struct_accessor
+                .is_present(&all_null_struct)
+                .expect("an all-null struct must answer"),
+            "a struct whose fields are all null is present"
+        );
+    }
+
+    #[test]
+    fn test_is_present_propagates_null_parent_and_rejects_wrong_shape() {
+        let nested_accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::String, true)),
+        );
+
+        let null_parent = Struct::from_iter([None]);
+        assert!(
+            !nested_accessor
+                .is_present(&null_parent)
+                .expect("a null parent must answer"),
+            "a null parent is absent"
+        );
+
+        let wrong_shape = Struct::from_iter([Some(Literal::int(1))]);
+        let error = nested_accessor
+            .is_present(&wrong_shape)
+            .expect_err("a non-struct literal under a nested accessor must fail");
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+
+        let live_parent = Struct::from_iter([Some(Literal::Struct(Struct::from_iter([None])))]);
+        assert!(
+            !nested_accessor
+                .is_present(&live_parent)
+                .expect("a null nested leaf must answer"),
+            "a null nested leaf is absent"
+        );
+    }
+
+    #[test]
     fn test_accessor_distinguishes_nested_null_parent_from_present_wrong_shape() {
-        let primitive_leaf_error = StructAccessor::new(0, PrimitiveType::Boolean)
+        let primitive_leaf_error = StructAccessor::new(0, PrimitiveType::Boolean, true)
             .get(&Struct::from_iter([Some(Literal::Struct(Struct::empty()))]))
             .expect_err("a leaf accessor must reject a struct literal");
         assert_eq!(primitive_leaf_error.kind(), ErrorKind::DataInvalid);
 
-        let nested_accessor =
-            StructAccessor::wrap(0, Box::new(StructAccessor::new(0, PrimitiveType::Boolean)));
+        let nested_accessor = StructAccessor::wrap(
+            0,
+            Box::new(StructAccessor::new(0, PrimitiveType::Boolean, true)),
+        );
         let nested_shape_error = nested_accessor
             .get(&Struct::from_iter([Some(Literal::bool(true))]))
             .expect_err("a nested accessor must reject a primitive outer literal");
@@ -349,7 +515,7 @@ mod tests {
         );
 
         assert_eq!(
-            StructAccessor::new(0, PrimitiveType::Boolean)
+            StructAccessor::new(0, PrimitiveType::Boolean, true)
                 .get(&Struct::from_iter([None]))
                 .expect("a null leaf is valid"),
             None

@@ -97,10 +97,7 @@ impl BoundPredicateVisitor for ExpressionEvaluatorVisitor<'_> {
     }
 
     fn is_null(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {
-        match reference.accessor().get(self.partition)? {
-            Some(_) => Ok(false),
-            None => Ok(true),
-        }
+        Ok(!reference.accessor().is_present(self.partition)?)
     }
 
     fn not_null(
@@ -108,10 +105,7 @@ impl BoundPredicateVisitor for ExpressionEvaluatorVisitor<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<bool> {
-        match reference.accessor().get(self.partition)? {
-            Some(_) => Ok(true),
-            None => Ok(false),
-        }
+        reference.accessor().is_present(self.partition)
     }
 
     fn is_nan(&mut self, reference: &BoundReference, _predicate: &BoundPredicate) -> Result<bool> {

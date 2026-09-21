@@ -27,6 +27,8 @@ mod incremental;
 pub use batch::*;
 pub use incremental::*;
 #[cfg(test)]
+mod container_null_tests;
+#[cfg(test)]
 mod evo_scan_tests;
 mod metrics_collector;
 mod partition_work;
@@ -1152,14 +1154,14 @@ pub mod tests {
         StringArray,
     };
     use futures::{TryStreamExt, stream};
-    use minijinja::value::Value;
-    use minijinja::{AutoEscape, Environment, context};
+    use minijinja::context;
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use super::partitioning_fixtures::render_template;
     use crate::TableIdent;
     use crate::arrow::ArrowReaderBuilder;
     use crate::expr::{Bind, BoundPredicate, Predicate, Reference};
@@ -1174,12 +1176,6 @@ pub mod tests {
         TableMetadata, TableProperties, Transform, Type, UnboundPartitionField,
     };
     use crate::table::Table;
-
-    fn render_template(template: &str, ctx: Value) -> String {
-        let mut env = Environment::new();
-        env.set_auto_escape_callback(|_| AutoEscape::None);
-        env.render_str(template, ctx).unwrap()
-    }
 
     /// Decodes a scan-output column to a flat [`Int64Array`], expanding the run-end-encoded
     /// constant array the reader produces for an identity-partitioned column. A plain
@@ -1979,7 +1975,7 @@ pub mod tests {
             manifest_list_write.close().await.unwrap();
         }
 
-        fn next_manifest_file(&self) -> OutputFile {
+        pub fn next_manifest_file(&self) -> OutputFile {
             self.table
                 .file_io()
                 .new_output(format!(
