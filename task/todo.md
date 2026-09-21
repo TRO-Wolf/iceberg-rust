@@ -78,7 +78,16 @@ Append and Overwrite actions; `InsertOp::Replace`, `delete_from` /
       green, + the six gates at the class-A commit, all exit 0.
       `c0d7af35bd98976c6dfd518362aba3a132bc1689`
 - [x] SLICE 12 — round 3 class B: ledger slice + this plan brought to
-      round 2 and class A (prose only; this entry)
+      round 2 and class A (prose only; this entry).
+      `b579c4eb473554464e240ab5289f36eaa514048b`
+- [x] SLICE 13 — round 4 class A: `from_planning_load` default pin
+      (`table/tests.rs`, 1 pin) + four-knob mutation self-check (each
+      knob reds the new pin: stage_only 35 red/401,
+      snapshot_properties 1 red/401, commit_branch 20 red/401,
+      output_spec_id 1 red/401; restored green, `loaded.rs` diff
+      empty) + the six gates at the class-A commit, all exit 0;
+      class B: ledger slice + this plan.
+      `a22ee54cd9a5fc62d6906d090ec503ce610204e3`
 
 
 ## ACTIVE (2026-09-20): F-STAGE-ONLY-1 — staged (WAP) commits on every write action + the publish primitive

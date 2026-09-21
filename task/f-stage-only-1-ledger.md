@@ -270,7 +270,8 @@ public no-arg `.stage_only()` to the Append and Overwrite actions. Round 2
 adds the second seam `with_snapshot_properties(HashMap<String, String>)`
 on the same path: caller snapshot properties merge into the exec-stamped
 map on both arms. Round 3 pins `refreshed()` carry-through for all four
-provider knobs.
+provider knobs. Round 4 pins `from_planning_load` defaults for all four
+commit knobs.
 
 ### Seam
 
@@ -308,11 +309,20 @@ Round 3 pins `refreshed()`: it carries `commit_branch`, `stage_only`,
 `planning_table` so scans on the fresh instance load current state
 instead of reusing the planning snapshot.
 
+Round 4 pins the third constructor, `from_planning_load`, with no
+production line changes: it already carried the same four defaults
+(`commit_branch: None`, `stage_only: false`, an empty
+`snapshot_properties`, `output_spec_id: None`) with `planning_table:
+Some`, and the new pin asserts exactly that with no builder calls in
+between.
+
 ### Files
 
-Final line counts (`wc -l` at the class-A commit):
-`table/mod.rs` 357, `table/loaded.rs` 63, `table/tests.rs` 955 (round 3
-adds the two `refreshed` pins in place, under the 1000-line ceiling),
+Final line counts (`wc -l` at the round-4 class-A commit
+`a22ee54cd9a5fc62d6906d090ec503ce610204e3`):
+`table/mod.rs` 357, `table/loaded.rs` 63, `table/tests.rs` 971 (round 3
+added the two `refreshed` pins and round 4 the `from_planning_load` pin
+in place, under the 1000-line ceiling),
 `commit.rs` 484, `commit_tests.rs` 946,
 `commit_stage_only_tests.rs` 197, `commit_snapshot_properties_tests.rs`
 330 (new in round 2), `tests/stage_only.rs` 610, `tests/map.md` 106.
@@ -372,6 +382,12 @@ Round-3 unit (`table/tests.rs`, 2 pins):
 - `test_refreshed_of_default_provider_carries_defaults` — a plain
   provider refreshes to `None` / `false` / empty / `None`
 
+Round-4 unit (`table/tests.rs`, 1 pin):
+
+- `test_from_planning_load_defaults_commit_knobs` —
+  `from_planning_load` with no builder calls yields `None` / `false` /
+  empty / `None`, and keeps `planning_table`
+
 ### Mutation arithmetic (one knob at a time, restored and re-greened after each)
 
 1. Append arm `if stage_only` → `if !stage_only`: unit
@@ -425,6 +441,25 @@ the defaults pin stayed green in all four):
 12. `refreshed()` `output_spec_id` → `None`: 1 red out of 2 (same pin).
 13. Restored: 2/2 green again (`git diff` shows only the test additions).
 
+Round 4, class A (population the lib target, 401 tests;
+`from_planning_load` is also the `IcebergSchemaProvider::table`
+constructor, so the `stage_only` and `commit_branch` flips red
+collateral tests that resolve providers through it too):
+
+14. `from_planning_load` `stage_only: false` → `true`: 35 red out
+    of 401, including the new pin (at its `!stage_only` assertion).
+15. `from_planning_load` `snapshot_properties` empty → `{k: v}`: 1
+    red out of 401 (exactly the new pin, at its `is_empty`
+    assertion).
+16. `from_planning_load` `commit_branch: None` → `Some("b")`: 20
+    red out of 401, including the new pin (at its `commit_branch`
+    assertion).
+17. `from_planning_load` `output_spec_id: None` → `Some(0)`: 1 red
+    out of 401 (exactly the new pin, at its `output_spec_id`
+    assertion).
+18. Restored: 400 passed, 0 failed, 1 ignored (`git diff` on
+    `loaded.rs` empty).
+
 ### Gates
 
 Measured at
@@ -442,7 +477,27 @@ only prose):
 - `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/xf-wap origin/main
   HEAD` — `comment-ban hits=0`, exit 0
 
+Round 4 measured at
+`a22ee54cd9a5fc62d6906d090ec503ce610204e3` (the docs commit after it
+adds only prose):
+
+- `CARGO_BUILD_JOBS=6 cargo test -q -p iceberg-datafusion --lib` —
+  exit 0; 400 passed, 0 failed, 1 ignored
+- `CARGO_BUILD_JOBS=6 cargo test -q -p iceberg-datafusion --test
+  stage_only` — exit 0; 10 passed, 0 failed
+- `CARGO_BUILD_JOBS=6 cargo clippy -p iceberg-datafusion --all-targets
+  -- -D warnings` — exit 0
+- `cargo fmt --all -- --check` — exit 0
+- `typos .` — exit 0
+- `python3 scripts/check_rust_file_size.py` — 646 files clean (90 legacy
+  ceilings), exit 0
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/xf-wap origin/main
+  HEAD` — `comment-ban hits=0`, exit 0
+
 ### Commits
+
+A docs commit that writes a slice cannot cite its own sha, so each docs
+commit is named by the following slice instead.
 
 - `4f7a05fc727623efd55603f2a00ff10f4b1cca72` feat: F-STAGE-ONLY-2 thread
   stage_only from provider to commit arms
@@ -463,3 +518,7 @@ only prose):
   'origin/main' into feat/f-stage-only-2
 - `c0d7af35bd98976c6dfd518362aba3a132bc1689` test: F-STAGE-ONLY-2c pin
   refreshed() carry-through of all four commit knobs
+- `b579c4eb473554464e240ab5289f36eaa514048b` docs: F-STAGE-ONLY-2
+  round-3 ledger and plan to round 2 plus refreshed() pins
+- `a22ee54cd9a5fc62d6906d090ec503ce610204e3` test: F-STAGE-ONLY-2d pin
+  from_planning_load defaults for all four commit knobs
