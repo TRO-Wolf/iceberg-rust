@@ -163,6 +163,7 @@ impl AddFiles {
         let action = transaction
             .merge_append()
             .with_check_duplicate(self.check_duplicate_files)
+            .with_trust_partition_metrics(false)
             .add_data_files(data_files);
         let transaction = action.apply(transaction)?;
         let committed = transaction.commit(catalog).await?;
