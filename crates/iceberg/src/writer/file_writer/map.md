@@ -43,6 +43,7 @@ a format is chosen only by which concrete builder is instantiated.
 | `orc_writer/encode.rs` | the ORC stream primitives: base-128 varints, byte RLE, boolean RLE, integer RLE **v1**, and the ORC compression-chunk framing (NONE and ZLIB = raw DEFLATE) |
 | `orc_writer/column.rs` | the per-column stream builders. One recursive walk over the `Literal` row fills each column's PRESENT / DATA / LENGTH / SECONDARY buffers; a child only receives a value for the rows where its parent is present, which is ORC's nesting rule |
 | `orc_writer/footer_write.rs` | the hand-rolled protobuf writer for `StripeFooter`, `Footer` and `PostScript` — the mirror image of `../../arrow/orc_reader/footer.rs`, which hand-parses them. `orc-rust` keeps its `writer` and `encoding` modules private and stamps `attributes: vec![]` on every type, so neither its writer nor its encoders can produce an Iceberg ORC file |
+| `orc_writer/null_repair.rs` | forces list/map `Literal` slots to null wherever the Arrow column is null, recursing into structs; `schema_has_container` gates the repair |
 | `orc_writer_tests.rs`, `orc_writer_layout_tests.rs`, `orc_writer/*_tests.rs` | the `#[cfg(test)]` cells for the ORC writer |
 | `rolling_writer.rs` | size-based rolling over any `FileWriterBuilder` |
 | `location_generator.rs` | file naming and placement; the extension comes from `DataFileFormat`'s `Display` |
