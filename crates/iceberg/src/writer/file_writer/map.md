@@ -38,7 +38,7 @@ a format is chosen only by which concrete builder is instantiated.
 | `parquet_footer_tests.rs`, `parquet_writer_unsupported_tests.rs` | the `#[cfg(test)]` cells of the two above |
 | `avro_writer.rs` | Avro OCF data files. Metrics are **row count + file size only** — Java `AvroMetrics.fromWriter` returns `Metrics(rowCount, null, null, null, null)`, and Spark's manifests confirm it (every `readable_metrics` field is NULL on an Avro data file). Adding column metrics here would be a divergence, not an improvement |
 | `avro_reject.rs` | the shared variant / unknown refusal the Avro writer applies at `build()` |
-| `orc_writer.rs` | ORC data files: `OrcWriterBuilder` / `OrcWriter`. Buffers each batch as Iceberg `Literal` rows (the same path `avro_writer.rs` uses), encodes them into ORC stripes, then writes the footer itself so every type carries Java's `iceberg.id` / `iceberg.required` attributes. The `DataFileBuilder` carries record count + file size only |
+| `orc_writer.rs` | ORC data files: `OrcWriterBuilder` / `OrcWriter`. Buffers each batch as Iceberg `Literal` rows (the same path `avro_writer.rs` uses), encodes them into ORC stripes, then writes the footer itself so every non-root type carries Java's `iceberg.id` / `iceberg.required` attributes (the root carries field names only, like Java). The `DataFileBuilder` carries record count + file size + split offsets, no column metrics |
 | `orc_writer/orc_type.rs` | Iceberg schema → the pre-order ORC type list, with Java `ORCSchemaUtil`'s attributes (`iceberg.id`, `iceberg.required`, `iceberg.long-type`, `iceberg.binary-type`, `iceberg.length`, `iceberg.timestamp-unit`). `variant` and `unknown` are refused here by name |
 | `orc_writer/encode.rs` | the ORC stream primitives: base-128 varints, byte RLE, boolean RLE, integer RLE **v1**, and the ORC compression-chunk framing (NONE and ZLIB = raw DEFLATE) |
 | `orc_writer/column.rs` | the per-column stream builders. One recursive walk over the `Literal` row fills each column's PRESENT / DATA / LENGTH / SECONDARY buffers; a child only receives a value for the rows where its parent is present, which is ORC's nesting rule |
@@ -80,7 +80,7 @@ identical; only the byte layout differs. Clause C-002 of the ledger records the 
 | I want to... | go to |
 |---|---|
 | Add a physical format | implement `FileWriterBuilder` / `FileWriter` |
-| Change what statistics a data file carries | `parquet_writer.rs` (parquet); ORC and Avro carry row count + file size only |
+| Change what statistics a data file carries | `parquet_writer.rs` (parquet); Avro carries row count + file size only, ORC adds split offsets; neither carries column metrics |
 | Change an ORC byte encoding | `orc_writer/encode.rs`, then re-run the round-trip tests — they decode with `orc-rust`, not with this crate's encoder |
 | Understand how a nested ORC column is laid out | `orc_writer/column.rs` — the present/length/child recursion |
 | Read an ORC file | `../../arrow/orc_reader.rs` (and its `footer.rs` for the field-id map) |
