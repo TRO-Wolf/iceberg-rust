@@ -259,6 +259,28 @@ mod tests {
             .expect("read the written file")
     }
 
+    fn ocf_codec_name(bytes: &[u8]) -> String {
+        let key = b"avro.codec";
+        let start = bytes
+            .windows(key.len())
+            .position(|window| window == key)
+            .expect("the OCF header must carry an avro.codec key");
+        let mut rest = &bytes[start + key.len()..];
+        let mut shift = 0u32;
+        let mut raw = 0u64;
+        loop {
+            let byte = *rest.first().expect("the codec value must be length-prefixed");
+            rest = &rest[1..];
+            raw |= u64::from(byte & 0x7f) << shift;
+            shift += 7;
+            if (byte & 0x80) == 0 {
+                break;
+            }
+        }
+        let len = (raw >> 1) as usize ^ 0usize.wrapping_sub((raw & 1) as usize);
+        String::from_utf8(rest[..len].to_vec()).expect("the codec name must be utf-8")
+    }
+
     fn for_format_default(format: DataFileFormat, schema: SchemaRef) -> AnyFileWriterBuilder {
         AnyFileWriterBuilder::for_format(
             format,
@@ -325,10 +347,21 @@ mod tests {
         assert_eq!(data_file.record_count(), 3);
         assert!(data_file.file_size_in_bytes() > 0);
         let bytes = read_back_bytes(&file_io, &path).await;
+        assert_eq!(ocf_codec_name(&bytes), "null");
+        let dump = String::from_utf8_lossy(&bytes);
         assert!(
-            !String::from_utf8_lossy(&bytes).contains("deflate"),
+            !dump.contains("deflate"),
             "the default arm must not emit a deflate header"
         );
+        assert!(
+            !dump.contains("zstandard"),
+            "the default arm must not emit a zstandard header"
+        );
+        let rows = AvroReader::new(&bytes[..])
+            .expect("open the OCF")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("decode the OCF rows");
+        assert_eq!(rows.len(), 3);
     }
 
     #[tokio::test]
