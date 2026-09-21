@@ -31,29 +31,23 @@ use crate::spec::{DataFileBuilder, DataFileFormat, MetricsConfig, SchemaRef};
 use crate::writer::CurrentFileStatus;
 use crate::{Error, ErrorKind, Result};
 
-/// Format-selecting file writer builder.
+#[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub enum AnyFileWriterBuilder {
-    /// Parquet writer.
     Parquet(Box<ParquetWriterBuilder>),
-    /// Avro writer.
     Avro(AvroWriterBuilder),
-    /// ORC writer.
     Orc(OrcWriterBuilder),
 }
 
-/// Format-selected file writer.
+#[allow(missing_docs)]
 pub enum AnyFileWriter {
-    /// Parquet writer.
     Parquet(Box<ParquetWriter>),
-    /// Avro writer.
     Avro(Box<AvroWriter>),
-    /// ORC writer.
     Orc(Box<OrcWriter>),
 }
 
 impl AnyFileWriterBuilder {
-    /// Build the writer builder for the given data file format.
+    #[allow(missing_docs)]
     pub fn for_format(
         format: DataFileFormat,
         schema: SchemaRef,
