@@ -42,8 +42,9 @@ write's snapshot producer adds a snapshot with `wap.id` and moves no ref;
 - [x] SLICE 2 — `staged_snapshot_for_wap_id(&TableMetadata, &str) -> Result<SnapshotRef>`:
       Java `PublishChangesProcedure` lookup (unknown → "Cannot apply unknown WAP ID
       '<id>'", >1 → "Cannot apply non-unique WAP ID. Found multiple snapshots with WAP
-      ID '<id>'") + the already-published check (Java `DuplicateWAPCommitException`
-      message via `is_wap_id_published`); pins found / unknown / non-unique / duplicate.
+      ID '<id>'"); a unique already-published match returns `Ok` (ruling Q-26d-2) and
+      the duplicate check lives in `CherryPickAction::validate_wap_publish`; pins found /
+      unknown / non-unique / already-published-returns-Ok.
       `33d85af32`
 - [x] SLICE 3 — `PublishChangesAction` + `Transaction::publish_changes(wap_id)` =
       lookup + `CherryPickAction` delegation; pins: FF publish moves main keeping
@@ -51,11 +52,13 @@ write's snapshot producer adds a snapshot with `wap.id` and moves no ref;
       the staged data, unknown id error, double-publish error, V3 first-row-id
       reassigned at publish (Java `MergingSnapshotProducer` suppress + fresh range).
       `ed9c7a15b`
-- [x] SLICE 4 — mutations: stage flag ignored in merge_append → 1 red / 14
-      (merge_append pin); duplicate check bypassed in the lookup → 1 red / 14
+- [x] SLICE 4 — mutations (round 1, 14 pins then): stage flag ignored in merge_append →
+      1 red / 14 (merge_append pin); duplicate check bypassed in the lookup → 1 red / 14
       (already-published pin; `publish_changes_twice` stayed green — cherry-pick's
-      own `validate_wap_publish` catches it, Java's shape too). Restored → 14/14.
-- [ ] SLICE 5 — gates (`cargo fmt --all`, `cargo clippy -p iceberg --all-targets --
+      own `validate_wap_publish` catches it, Java's shape too). Restored → 14/14 then;
+      the suite is now 29 pins (12 in `stage_only_tests.rs` + 17 in
+      `stage_only_publish_tests.rs`), all green.
+- [x] SLICE 5 — gates (`cargo fmt --all`, `cargo clippy -p iceberg --all-targets --
       -D warnings`, filtered tests, `bash scripts/check_rust_file_size.sh`,
       comment-ban), ledger complete, `map.md` updated
 
