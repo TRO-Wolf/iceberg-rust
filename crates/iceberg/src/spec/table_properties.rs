@@ -254,6 +254,15 @@ impl TableProperties {
     /// Property key for the parquet data-file compression level.
     pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str = "write.parquet.compression-level";
 
+    #[allow(missing_docs)]
+    pub const PROPERTY_ORC_COMPRESSION_CODEC: &str = "write.orc.compression-codec";
+    #[allow(missing_docs)]
+    pub const PROPERTY_ORC_COMPRESSION_CODEC_DEFAULT: &str = "zlib";
+    #[allow(missing_docs)]
+    pub const PROPERTY_ORC_STRIPE_SIZE_BYTES: &str = "write.orc.stripe-size-bytes";
+    #[allow(missing_docs)]
+    pub const PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT: u64 = 67_108_864;
+
     pub(crate) fn persisted_properties(
         mut properties: HashMap<String, String>,
     ) -> HashMap<String, String> {

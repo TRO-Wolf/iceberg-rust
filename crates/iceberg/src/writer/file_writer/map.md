@@ -38,13 +38,14 @@ a format is chosen only by which concrete builder is instantiated.
 | `parquet_footer_tests.rs`, `parquet_writer_unsupported_tests.rs` | the `#[cfg(test)]` cells of the two above |
 | `avro_writer.rs` | Avro OCF data files. Metrics are **row count + file size only** — Java `AvroMetrics.fromWriter` returns `Metrics(rowCount, null, null, null, null)`, and Spark's manifests confirm it (every `readable_metrics` field is NULL on an Avro data file). Adding column metrics here would be a divergence, not an improvement |
 | `avro_reject.rs` | the shared variant / unknown refusal the Avro writer applies at `build()` |
-| `orc_writer.rs` | ORC data files: `OrcWriterBuilder` / `OrcWriter`. Buffers each batch as Iceberg `Literal` rows (the same path `avro_writer.rs` uses), encodes them into ORC stripes, then writes the footer itself so every non-root type carries Java's `iceberg.id` / `iceberg.required` attributes (the root carries field names only, like Java). The `DataFileBuilder` carries record count + file size + split offsets, no column metrics |
+| `orc_writer.rs` | ORC data files: `OrcWriterBuilder` / `OrcWriter`. Buffers each batch as Iceberg `Literal` rows (the same path `avro_writer.rs` uses), encodes them into ORC stripes, then writes the footer itself so every non-root type carries Java's `iceberg.id` / `iceberg.required` attributes (the root carries field names only, like Java). The `DataFileBuilder` carries record count + file size + split offsets plus the full Java column-metric set (column sizes, value/null/nan counts, lower/upper bounds) under `MetricsConfig`, mirroring the parquet writer |
 | `orc_writer/orc_type.rs` | Iceberg schema → the pre-order ORC type list, with Java `ORCSchemaUtil`'s attributes (`iceberg.id`, `iceberg.required`, `iceberg.long-type`, `iceberg.binary-type`, `iceberg.length`, `iceberg.timestamp-unit`). `variant` and `unknown` are refused here by name |
 | `orc_writer/encode.rs` | the ORC stream primitives: base-128 varints, byte RLE, boolean RLE, integer RLE **v1**, and the ORC compression-chunk framing (NONE and ZLIB = raw DEFLATE) |
 | `orc_writer/column.rs` | the per-column stream builders. One recursive walk over the `Literal` row fills each column's PRESENT / DATA / LENGTH / SECONDARY buffers; a child only receives a value for the rows where its parent is present, which is ORC's nesting rule |
 | `orc_writer/footer_write.rs` | the hand-rolled protobuf writer for `StripeFooter`, `Footer` and `PostScript` — the mirror image of `../../arrow/orc_reader/footer.rs`, which hand-parses them. `orc-rust` keeps its `writer` and `encoding` modules private and stamps `attributes: vec![]` on every type, so neither its writer nor its encoders can produce an Iceberg ORC file |
 | `orc_writer/null_repair.rs` | forces list/map `Literal` slots to null wherever the Arrow column is null, recursing into structs; `schema_has_container` gates the repair |
-| `orc_writer_tests.rs`, `orc_writer_layout_tests.rs`, `orc_writer/*_tests.rs` | the `#[cfg(test)]` cells for the ORC writer |
+| `orc_writer/metrics.rs` | the ORC manifest statistics, accumulated from the `Literal` rows and keyed by Iceberg field id, under `MetricsConfig`. Uses the same `MetricsMode::truncate_lower_bound` / `truncate_upper_bound` the parquet writer uses |
+| `orc_writer_tests.rs`, `orc_writer_layout_tests.rs`, `orc_writer_metrics_tests.rs`, `orc_writer/*_tests.rs` | the `#[cfg(test)]` cells for the ORC writer |
 | `rolling_writer.rs` | size-based rolling over any `FileWriterBuilder` |
 | `location_generator.rs` | file naming and placement; the extension comes from `DataFileFormat`'s `Display` |
 
@@ -81,7 +82,7 @@ identical; only the byte layout differs. Clause C-002 of the ledger records the 
 | I want to... | go to |
 |---|---|
 | Add a physical format | implement `FileWriterBuilder` / `FileWriter` |
-| Change what statistics a data file carries | `parquet_writer.rs` (parquet); Avro carries row count + file size only, ORC adds split offsets; neither carries column metrics |
+| Change what statistics a data file carries | `parquet_writer.rs` (parquet); Avro carries row count + file size only, ORC adds split offsets plus the full Java column-metric set |
 | Change an ORC byte encoding | `orc_writer/encode.rs`, then re-run the round-trip tests — they decode with `orc-rust`, not with this crate's encoder |
 | Understand how a nested ORC column is laid out | `orc_writer/column.rs` — the present/length/child recursion |
 | Read an ORC file | `../../arrow/orc_reader.rs` (and its `footer.rs` for the field-id map) |
@@ -89,7 +90,7 @@ identical; only the byte layout differs. Clause C-002 of the ledger records the 
 ## Pointers
 
 - **Up:** [crates/iceberg/src/writer/](../map.md) · **Related:** `../../arrow/orc_reader/`
-  (the read half of the ORC footer contract),
+  (the read half of the ORC footer contract), `../../spec/metrics_config.rs` (the metrics policy),
   [../../transaction/map.md](../../transaction/map.md) (commits what this produces)
 
 ## Debug

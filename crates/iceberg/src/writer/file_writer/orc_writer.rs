@@ -24,13 +24,17 @@ use bytes::Bytes;
 use super::{FileWriter, FileWriterBuilder};
 use crate::arrow::arrow_struct_to_literal;
 use crate::io::OutputFile;
-use crate::spec::{DataContentType, DataFileBuilder, DataFileFormat, SchemaRef, Struct};
+use crate::spec::{
+    DataContentType, DataFileBuilder, DataFileFormat, MetricsConfig, SchemaRef, Struct,
+    TableProperties,
+};
 use crate::writer::CurrentFileStatus;
 use crate::{Error, ErrorKind, Result};
 
 mod column;
 mod encode;
 mod footer_write;
+mod metrics;
 mod null_repair;
 mod orc_type;
 
@@ -40,18 +44,15 @@ use footer_write::{
     ORC_MAGIC, ORC_WRITER_TIMEZONE, StripeRecord, encode_footer, encode_postscript,
     encode_stripe_footer,
 };
+use metrics::OrcMetricsCollector;
 use null_repair::{repair_container_nulls, schema_has_container};
 use orc_type::{OrcSchema, build_orc_schema};
-
-const PROPERTY_ORC_COMPRESSION_CODEC: &str = "write.orc.compression-codec";
-const PROPERTY_ORC_COMPRESSION_CODEC_DEFAULT: &str = "zlib";
-const PROPERTY_ORC_STRIPE_SIZE_BYTES: &str = "write.orc.stripe-size-bytes";
-const PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT: u64 = 67_108_864;
 
 #[allow(missing_docs)]
 #[derive(Clone, Debug)]
 pub struct OrcWriterBuilder {
     schema: SchemaRef,
+    metrics_config: Arc<MetricsConfig>,
     compression: OrcCompression,
     stripe_size: usize,
     compression_block_size: usize,
@@ -62,8 +63,9 @@ impl OrcWriterBuilder {
     pub fn new(schema: SchemaRef) -> Self {
         OrcWriterBuilder {
             schema,
+            metrics_config: Arc::new(MetricsConfig::default()),
             compression: OrcCompression::Zlib,
-            stripe_size: PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT as usize,
+            stripe_size: TableProperties::PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT as usize,
             compression_block_size: DEFAULT_COMPRESSION_BLOCK_SIZE,
         }
     }
@@ -75,17 +77,17 @@ impl OrcWriterBuilder {
         properties: &HashMap<String, String>,
     ) -> Result<Self> {
         let codec_raw = properties
-            .get(PROPERTY_ORC_COMPRESSION_CODEC)
+            .get(TableProperties::PROPERTY_ORC_COMPRESSION_CODEC)
             .map(String::as_str)
-            .unwrap_or(PROPERTY_ORC_COMPRESSION_CODEC_DEFAULT);
-        let stripe_size = match properties.get(PROPERTY_ORC_STRIPE_SIZE_BYTES) {
-            None => PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT,
+            .unwrap_or(TableProperties::PROPERTY_ORC_COMPRESSION_CODEC_DEFAULT);
+        let stripe_size = match properties.get(TableProperties::PROPERTY_ORC_STRIPE_SIZE_BYTES) {
+            None => TableProperties::PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT,
             Some(raw) => raw.trim().parse::<u64>().map_err(|error| {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
                         "Invalid value for {}: {raw}",
-                        PROPERTY_ORC_STRIPE_SIZE_BYTES
+                        TableProperties::PROPERTY_ORC_STRIPE_SIZE_BYTES
                     ),
                 )
                 .with_source(error)
@@ -93,10 +95,17 @@ impl OrcWriterBuilder {
         };
         Ok(OrcWriterBuilder {
             schema,
+            metrics_config: Arc::new(MetricsConfig::default()),
             compression: OrcCompression::from_codec_name(codec_raw.trim())?,
             stripe_size: stripe_size.max(1) as usize,
             compression_block_size: DEFAULT_COMPRESSION_BLOCK_SIZE,
         })
+    }
+
+    #[allow(missing_docs)]
+    pub fn with_metrics_config(mut self, metrics_config: impl Into<Arc<MetricsConfig>>) -> Self {
+        self.metrics_config = metrics_config.into();
+        self
     }
 }
 
@@ -111,6 +120,7 @@ impl FileWriterBuilder for OrcWriterBuilder {
         let orc_schema = build_orc_schema(&self.schema)?;
         Ok(OrcWriter {
             stripe: StripeEncoder::new(&orc_schema),
+            metrics: OrcMetricsCollector::new(&self.schema, &self.metrics_config),
             schema: self.schema.clone(),
             orc_schema,
             output_file,
@@ -134,6 +144,7 @@ pub struct OrcWriter {
     stripe_size: usize,
     compression_block_size: usize,
     stripe: StripeEncoder,
+    metrics: OrcMetricsCollector,
     body: Vec<u8>,
     stripes: Vec<StripeRecord>,
     total_rows: u64,
@@ -150,6 +161,15 @@ impl OrcWriter {
             self.compression,
             self.compression_block_size,
         )?;
+
+        let mut sizes_by_orc_index: HashMap<usize, u64> = HashMap::new();
+        for stream in &finished.streams {
+            *sizes_by_orc_index
+                .entry(stream.column as usize)
+                .or_insert(0) += stream.length;
+        }
+        self.metrics
+            .observe_stripe_column_sizes(&self.orc_schema, &sizes_by_orc_index);
 
         let stripe_footer = encode_stripe_footer(
             &finished.streams,
@@ -235,6 +255,7 @@ impl FileWriter for OrcWriter {
         }
         for row in &rows {
             self.stripe.append_row(&self.orc_schema, row.as_ref())?;
+            self.metrics.observe_row(&self.schema, row.as_ref());
         }
         self.total_rows += rows.len() as u64;
         if self.stripe.estimated_size() >= self.stripe_size {
@@ -256,7 +277,11 @@ impl FileWriter for OrcWriter {
         let file_size_in_bytes = bytes.len() as u64;
         let record_count = self.total_rows;
 
-        let OrcWriter { output_file, .. } = self;
+        let OrcWriter {
+            output_file,
+            metrics,
+            ..
+        } = self;
 
         output_file
             .write(Bytes::from(bytes))
@@ -266,6 +291,7 @@ impl FileWriter for OrcWriter {
                     .with_source(error)
             })?;
 
+        let column_metrics = metrics.build();
         let mut builder = DataFileBuilder::default();
         builder
             .content(DataContentType::Data)
@@ -274,6 +300,12 @@ impl FileWriter for OrcWriter {
             .partition(Struct::empty())
             .record_count(record_count)
             .file_size_in_bytes(file_size_in_bytes)
+            .column_sizes(column_metrics.column_sizes)
+            .value_counts(column_metrics.value_counts)
+            .null_value_counts(column_metrics.null_value_counts)
+            .nan_value_counts(column_metrics.nan_value_counts)
+            .lower_bounds(column_metrics.lower_bounds)
+            .upper_bounds(column_metrics.upper_bounds)
             .split_offsets(Some(split_offsets));
         Ok(vec![builder])
     }
@@ -297,4 +329,5 @@ impl CurrentFileStatus for OrcWriter {
 mod tests {
     include!("orc_writer_tests.rs");
     include!("orc_writer_layout_tests.rs");
+    include!("orc_writer_metrics_tests.rs");
 }

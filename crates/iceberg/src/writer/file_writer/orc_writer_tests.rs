@@ -32,7 +32,9 @@ use super::*;
 use crate::arrow::orc_reader::read_orc_data_bytes;
 use crate::arrow::UTC_TIME_ZONE;
 use crate::io::FileIO;
-use crate::spec::{ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type};
+use crate::spec::{
+    Datum, ListType, MapType, NestedField, PrimitiveType, Schema, StructType, Type,
+};
 use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
 };
@@ -293,7 +295,7 @@ async fn test_the_written_footer_carries_the_iceberg_id_attributes_the_reader_re
     let builder = OrcWriterBuilder::new_from_properties(
         schema.clone(),
         &HashMap::from([(
-            PROPERTY_ORC_COMPRESSION_CODEC.to_string(),
+            TableProperties::PROPERTY_ORC_COMPRESSION_CODEC.to_string(),
             "none".to_string(),
         )]),
     )
@@ -724,15 +726,6 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
         split_offsets, footer_offsets,
         "split offsets must match the footer stripe offsets"
     );
-    assert!(
-        data_file.column_sizes().is_empty()
-            && data_file.value_counts().is_empty()
-            && data_file.null_value_counts().is_empty()
-            && data_file.nan_value_counts().is_empty()
-            && data_file.lower_bounds().is_empty()
-            && data_file.upper_bounds().is_empty(),
-        "an ORC data file must carry no column metrics"
-    );
     assert_eq!(
         layout.footer_start
             + layout.postscript_footer_length
@@ -792,7 +785,7 @@ async fn test_uncompressed_orc_round_trips_too() {
     let builder = OrcWriterBuilder::new_from_properties(
         schema.clone(),
         &HashMap::from([(
-            PROPERTY_ORC_COMPRESSION_CODEC.to_string(),
+            TableProperties::PROPERTY_ORC_COMPRESSION_CODEC.to_string(),
             "none".to_string(),
         )]),
     )
@@ -840,7 +833,7 @@ async fn test_the_default_codec_is_java_s_zlib() {
     assert_eq!(builder.compression, encode::OrcCompression::Zlib);
     assert_eq!(
         builder.stripe_size,
-        PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT as usize
+        TableProperties::PROPERTY_ORC_STRIPE_SIZE_BYTES_DEFAULT as usize
     );
 }
 
@@ -849,7 +842,7 @@ async fn test_an_unsupported_codec_is_a_typed_error_naming_it() {
     let error = OrcWriterBuilder::new_from_properties(
         Arc::new(schema_all_primitives()),
         &HashMap::from([(
-            PROPERTY_ORC_COMPRESSION_CODEC.to_string(),
+            TableProperties::PROPERTY_ORC_COMPRESSION_CODEC.to_string(),
             "lzo".to_string(),
         )]),
     )
