@@ -25,6 +25,30 @@ The current plan for in-flight work. The operating manuals
 **before** any non-trivial change and kept current as work proceeds.
 
 
+## ACTIVE (2026-09-21): F-STAGE-ONLY-2 — thread stage_only from IcebergTableProvider to every DML commit
+
+Ledger: SLICE F-STAGE-ONLY-2 section in
+[`f-stage-only-1-ledger.md`](f-stage-only-1-ledger.md). Branch
+`feat/f-stage-only-2` off fork `main`
+(`3f5a9289cffecd82c9ed2ea53187d9b6eb8f3a6d`, the squashed F-STAGE-ONLY-1
+commit). `with_stage_only(bool)` on the provider, threaded through
+`IcebergCommitExec` like `commit_branch`, applied to the Append and Overwrite
+actions; `delete_from` / `update` deliberately unthreaded (see ledger).
+
+- [x] SLICE 1 — thread `stage_only` (provider field/default/builder/hand-on,
+      exec field/default/builder/hand-on/local copy, both action arms).
+      `4f7a05fc727623efd55603f2a00ff10f4b1cca72`
+- [x] SLICE 2 — unit pins (`commit_stage_only_tests.rs`, 4 pins) + fixture
+      sharing. `a831ccd6e95a2d7ee467cce465ea3c733df85c00`
+- [x] SLICE 3 — end-to-end pins (`tests/stage_only.rs`, 6 pins) + tests map
+      row. `ca9e7e47f0fab21e4768cb9886ee5f757d32a1c4`
+- [x] SLICE 4 — flip self-check per arm (append: 2 red/4 unit, 6 red/6
+      end-to-end; overwrite: 1 red/4 unit, 2 red/2 overwrite-filtered),
+      restored green
+- [x] SLICE 5 — gates (datafusion suite + core lib + clippy + fmt +
+      comment-ban + typos + file-size, all exit 0), ledger slice, this plan
+
+
 ## ACTIVE (2026-09-20): F-STAGE-ONLY-1 — staged (WAP) commits on every write action + the publish primitive
 
 Ledger: [`f-stage-only-1-ledger.md`](f-stage-only-1-ledger.md). Branch

@@ -251,3 +251,101 @@ Round 1 (for the record):
   (1937 → 1936) after blank-line reclamation
 - `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/qb-fork2 origin/main` —
   `comment-ban hits=0`
+
+## SLICE F-STAGE-ONLY-2 — thread stage_only from IcebergTableProvider to every DML commit (2026-09-21)
+
+Branch `feat/f-stage-only-2` off fork main
+`3f5a9289cffecd82c9ed2ea53187d9b6eb8f3a6d` (the squashed F-STAGE-ONLY-1
+commit). Model: muse-spark-1.3-contributor. `IcebergTableProvider` had
+`with_commit_branch` but no staged-commit knob, so a DataFusion INSERT always
+moved the table ref and RePark could not do write-audit-publish. This slice
+adds the exact analogue `with_stage_only(bool)`, threads it through
+`IcebergCommitExec` the way `commit_branch` is threaded, and applies the
+public no-arg `.stage_only()` to the Append and Overwrite actions.
+
+### Seam
+
+Provider (`table/mod.rs`): `stage_only: bool` field beside `commit_branch`,
+default false in `try_new`, clone-through in `refreshed`, `with_stage_only`
+builder beside `with_commit_branch`, hand-on in `insert_into`. The builder
+carries no doc comment (owner comment ban; the `with_output_spec_id`
+precedent; this crate has no `missing_docs` deny). Exec (`commit.rs`): field,
+default false, `pub(crate) with_stage_only`, hand-on in `with_new_children`,
+local copy in `execute`, conditional `.stage_only()` in the
+`InsertOp::Append` and `InsertOp::Overwrite` arms. `InsertOp::Replace` stays
+untouched. `loaded.rs::from_planning_load` takes the default-false line
+although the brief did not list the file: the struct literal does not compile
+without it. `delete_from` / `update` are deliberately NOT threaded:
+`IcebergDeleteExec::new` and `IcebergUpdateExec::new` take `commit_branch` as
+a positional constructor argument, so handing them `stage_only` would mean
+editing `delete.rs` / `update.rs`, which the brief's file list forbids. That
+is observed out-of-scope, not a silent drop.
+
+### Files
+
+Final line counts: `table/mod.rs` 346, `table/loaded.rs` 61, `commit.rs` 460,
+`commit_tests.rs` 907, `commit_stage_only_tests.rs` 194 (new),
+`tests/stage_only.rs` 340 (new), `tests/map.md` 106. The unit pins live in
+their own `#[path]`-wired module sharing `pub(crate)` fixtures from
+`commit_tests.rs` (the F-STAGE-ONLY-1 pattern): that file sits at 907 of its
+1000-line ceiling and the four pins do not fit inside it.
+
+### Pins
+
+Unit (`commit_stage_only_tests.rs`):
+
+- `test_provider_stage_only_defaults_false_and_threads` — default provider
+  plans an exec with `stage_only == false`; `with_stage_only(true)` plans
+  `true` (downcast through `insert_into`)
+- `test_append_stage_only_adds_snapshot_without_moving_current`
+- `test_overwrite_stage_only_adds_snapshot_without_moving_current`
+- `test_stage_only_with_commit_branch_leaves_branch_unmoved`
+
+End to end (`tests/stage_only.rs`, SQL through `SessionContext`):
+
+- `insert_stage_only_adds_snapshot_without_moving_main` (staged op/parent
+  pinned, main scan still `[1]`)
+- `insert_overwrite_stage_only_adds_snapshot_without_moving_main` (same shape)
+- `stage_only_with_commit_branch_leaves_branch_unmoved`
+- `insert_without_stage_only_advances_main` (near miss)
+- `insert_overwrite_without_stage_only_advances_main` (near miss)
+- `commit_branch_without_stage_only_still_targets_branch` (near miss)
+
+### Mutation arithmetic (one knob at a time, restored and re-greened after each)
+
+1. Append arm `if stage_only` → `if !stage_only`: unit
+   `physical_plan::commit::stage_only` 2 red out of 4 (exactly the two Append
+   pins; overwrite and provider pins stayed green); `--test stage_only` 6 red
+   out of 6, because every end-to-end test seeds through the flipped Append
+   arm so `seed()` itself stages and the head assertion fails. Per-arm
+   precision comes from the unit run.
+2. Overwrite arm `if stage_only` → `if !stage_only`: unit 1 red out of 4
+   (exactly the overwrite pin); `--test stage_only insert_overwrite` 2 red
+   out of 2.
+3. Restored: unit 4/4 and end-to-end 6/6 green again.
+
+### Gates
+
+Measured at
+`ca9e7e47f0fab21e4768cb9886ee5f757d32a1c4` (the docs commit after it adds
+only prose):
+
+- `cargo test -p iceberg-datafusion` — exit 0; lib 381 passed, 0 failed;
+  every test binary 0 failed
+- `cargo test -p iceberg --lib` — exit 0; 4414 passed, 0 failed, 9 ignored
+- `cargo clippy --all-targets -- -D warnings` — exit 0
+- `cargo fmt --all -- --check` — exit 0
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/xf-wap origin/main HEAD`
+  — `comment-ban hits=0`, exit 0
+- `typos .` — exit 0
+- `python3 scripts/check_rust_file_size.py` — 639 files clean (90 legacy
+  ceilings)
+
+### Commits
+
+- `4f7a05fc727623efd55603f2a00ff10f4b1cca72` feat: F-STAGE-ONLY-2 thread
+  stage_only from provider to commit arms
+- `a831ccd6e95a2d7ee467cce465ea3c733df85c00` test: F-STAGE-ONLY-2 unit pins
+  for provider default, both arms, branch composition
+- `ca9e7e47f0fab21e4768cb9886ee5f757d32a1c4` test: F-STAGE-ONLY-2 end-to-end
+  stage_only pins plus tests map row
