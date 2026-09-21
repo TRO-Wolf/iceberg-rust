@@ -54,6 +54,7 @@ use crate::spec::{
     apply_manifest_list_context,
 };
 use crate::table::Table;
+use crate::transaction::rewrite_manifests_cluster::cluster_key_for_columns;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, FirstRowIdPolicy, SnapshotProduceOperation, SnapshotProducer,
 };
@@ -78,12 +79,13 @@ type RewriteIfPredicate = Arc<dyn Fn(&ManifestFile) -> bool + Send + Sync>;
 /// original provenance. See the module doc.
 pub struct RewriteManifestsAction {
     /// The cluster-key function (Java `clusterByFunc`). `None` ⇒ no clustered rewrite is performed.
-    cluster_by: Option<ClusterByFunction>,
+    pub(super) cluster_by: Option<ClusterByFunction>,
+    pub(super) cluster_by_columns: Option<Vec<String>>,
     /// The rewrite predicate (Java `predicate`). `None` ⇒ all data manifests match (rewrite all).
     rewrite_if: Option<RewriteIfPredicate>,
     /// Manifests to delete explicitly (Java `deletedManifests`), matched against the current snapshot by
     /// path. Each must carry a balancing [`Self::added_manifests`] entry or `validateFilesCounts` fires.
-    deleted_manifests: Vec<ManifestFile>,
+    pub(super) deleted_manifests: Vec<ManifestFile>,
     /// Manifests to add explicitly (Java `addedManifests`); each must carry only existing entries with an
     /// unassigned snapshot id + sequence number (validated in [`Self::add_manifest`]).
     added_manifests: Vec<ManifestFile>,
@@ -98,6 +100,7 @@ impl RewriteManifestsAction {
     pub(crate) fn new() -> Self {
         Self {
             cluster_by: None,
+            cluster_by_columns: None,
             rewrite_if: None,
             rewrite_delete_manifests: false,
             deleted_manifests: vec![],
@@ -120,6 +123,7 @@ impl RewriteManifestsAction {
         func: impl Fn(&DataFile) -> String + Send + Sync + 'static,
     ) -> Self {
         self.cluster_by = Some(Arc::new(func));
+        self.cluster_by_columns = None;
         self
     }
 
@@ -351,31 +355,6 @@ struct RewriteOutcome {
 }
 
 impl RewriteManifestsAction {
-    fn validate_deleted_manifests(
-        &self,
-        current_manifests: &[ManifestFile],
-        current_snapshot_id: i64,
-    ) -> Result<()> {
-        let current_paths: HashSet<&str> = current_manifests
-            .iter()
-            .map(|manifest| manifest.manifest_path.as_str())
-            .collect();
-
-        for deleted in &self.deleted_manifests {
-            if !current_paths.contains(deleted.manifest_path.as_str()) {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Deleted manifest {} could not be found in the latest snapshot {}",
-                        deleted.manifest_path, current_snapshot_id
-                    ),
-                ));
-            }
-        }
-
-        Ok(())
-    }
-
     async fn perform_rewrite(
         &self,
         snapshot_producer: &mut SnapshotProducer<'_>,
@@ -392,6 +371,9 @@ impl RewriteManifestsAction {
         let mut rewritten_manifests: Vec<ManifestFile> = Vec::new();
         let mut cluster_writers = ClusterWriters::new(target_size_bytes);
         let mut entries_processed: u64 = 0;
+        let table = snapshot_producer.table;
+        let cluster_columns = self.cluster_by_columns.as_ref();
+        let cluster_by = self.cluster_by.as_ref();
 
         for manifest_file in current_manifests {
             if deleted_paths.contains(manifest_file.manifest_path.as_str()) {
@@ -400,7 +382,7 @@ impl RewriteManifestsAction {
 
             let content_matches =
                 manifest_file.content == ManifestContentType::Data || self.rewrite_delete_manifests;
-            let should_rewrite = self.cluster_by.is_some()
+            let should_rewrite = (self.cluster_by.is_some() || cluster_columns.is_some())
                 && content_matches
                 && self
                     .rewrite_if
@@ -413,10 +395,6 @@ impl RewriteManifestsAction {
                 continue;
             }
 
-            let cluster_by = self
-                .cluster_by
-                .as_ref()
-                .expect("should_rewrite implies cluster_by is set");
             let (_, mut entries) = manifest_file
                 .load_manifest_parts_with_schema_fallback(snapshot_producer.table.file_io(), None)
                 .await?;
@@ -427,7 +405,11 @@ impl RewriteManifestsAction {
                 if !entry.is_alive() {
                     continue;
                 }
-                let cluster_key = cluster_by(entry.data_file());
+                let cluster_key = if let Some(columns) = cluster_columns {
+                    cluster_key_for_columns(columns, entry.data_file(), table.metadata())?
+                } else {
+                    cluster_by.expect("should_rewrite implies a cluster key")(entry.data_file())
+                };
                 cluster_writers
                     .append(
                         snapshot_producer,

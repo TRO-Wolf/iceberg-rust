@@ -32,6 +32,9 @@ mod occ_scoped_projection_tests;
 #[path = "occ_scoped_tests.rs"]
 pub(crate) mod occ_scoped_tests;
 #[cfg(test)]
+#[path = "rewrite_manifests_cluster_tests.rs"]
+mod rewrite_manifests_cluster_tests;
+#[cfg(test)]
 #[path = "rewrite_manifests_deletes_tests.rs"]
 mod rewrite_manifests_deletes_tests;
 
