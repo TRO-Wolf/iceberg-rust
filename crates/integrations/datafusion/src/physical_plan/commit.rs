@@ -95,6 +95,7 @@ pub(crate) struct IcebergCommitExec {
     plan_properties: Arc<PlanProperties>,
     commit_branch: Option<String>,
     stage_only: bool,
+    snapshot_properties: HashMap<String, String>,
     output_spec: PartitionSpecRef,
 }
 
@@ -121,6 +122,7 @@ impl IcebergCommitExec {
             plan_properties,
             commit_branch: None,
             stage_only: false,
+            snapshot_properties: HashMap::new(),
             output_spec,
         }
     }
@@ -132,6 +134,11 @@ impl IcebergCommitExec {
 
     pub(crate) fn with_stage_only(mut self, stage_only: bool) -> Self {
         self.stage_only = stage_only;
+        self
+    }
+
+    pub(crate) fn with_snapshot_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.snapshot_properties = properties;
         self
     }
 
@@ -230,7 +237,8 @@ impl ExecutionPlan for IcebergCommitExec {
                 self.output_spec.clone(),
             )
             .with_commit_branch(self.commit_branch.clone())
-            .with_stage_only(self.stage_only),
+            .with_stage_only(self.stage_only)
+            .with_snapshot_properties(self.snapshot_properties.clone()),
         ))
     }
 
@@ -260,6 +268,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let insert_op = self.insert_op;
         let commit_branch = self.commit_branch.clone();
         let stage_only = self.stage_only;
+        let caller_properties = self.snapshot_properties.clone();
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -373,6 +382,12 @@ impl ExecutionPlan for IcebergCommitExec {
                 // reads table state nor removes files, so nothing can conflict (Java
                 // `SparkWrite.BatchAppend.commit` runs none).
                 InsertOp::Append => {
+                    let mut snapshot_properties = snapshot_properties;
+                    for (key, value) in &caller_properties {
+                        if key != OPERATION_ID_PROP {
+                            snapshot_properties.insert(key.clone(), value.clone());
+                        }
+                    }
                     let base = tx
                         .fast_append()
                         .add_data_files(data_files)
@@ -397,6 +412,12 @@ impl ExecutionPlan for IcebergCommitExec {
                 // `validate_no_conflicting_data` (L371-373). NO explicit conflict-detection filter —
                 // Java never sets one here; the row filter itself is the default conflict filter.
                 InsertOp::Overwrite => {
+                    let mut snapshot_properties = snapshot_properties;
+                    for (key, value) in &caller_properties {
+                        if key != OPERATION_ID_PROP {
+                            snapshot_properties.insert(key.clone(), value.clone());
+                        }
+                    }
                     let mut action = tx
                         .overwrite_files()
                         .overwrite_by_row_filter(Predicate::AlwaysTrue)

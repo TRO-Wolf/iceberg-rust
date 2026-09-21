@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef as ArrowSchemaRef;
@@ -35,6 +36,7 @@ impl IcebergTableProvider {
             schema,
             commit_branch: None,
             stage_only: false,
+            snapshot_properties: HashMap::new(),
             planning_table: Some(table),
             output_spec_id: None,
         })
