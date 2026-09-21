@@ -112,7 +112,7 @@ pub struct FileGroupRewriteResult {
 /// thresholds, then run [`Self::execute`]. The module docs carry the algorithm, the
 /// sequence-number rule, and the defaults.
 pub struct RewriteDataFiles {
-    table: Table,
+    pub(super) table: Table,
     /// `None` resolves from the table property at execute (Java `defaultTargetFileSize`).
     target_file_size_bytes: Option<u64>,
     /// `None` resolves to `0.75 * target` at execute.
@@ -127,7 +127,7 @@ pub struct RewriteDataFiles {
     /// Java `REMOVE_DANGLING_DELETES`, default `false`.
     remove_dangling_deletes: bool,
     max_open_partition_writers: Option<usize>,
-    filter: Predicate,
+    pub(super) filter: Predicate,
     rewrite_all: bool,
     partial_progress: bool,
     partial_progress_max_commits: usize,
@@ -135,6 +135,7 @@ pub struct RewriteDataFiles {
     rewrite_job_order: RewriteJobOrder,
     max_concurrent_file_group_rewrites: usize,
     pub(super) strategy_config: StrategyConfig,
+    pub(super) branch: Option<String>,
 }
 
 impl RewriteDataFiles {
@@ -161,6 +162,7 @@ impl RewriteDataFiles {
             rewrite_job_order: RewriteJobOrder::None,
             max_concurrent_file_group_rewrites: 1,
             strategy_config: StrategyConfig::default(),
+            branch: None,
         }
     }
 
@@ -289,7 +291,7 @@ impl RewriteDataFiles {
         let mut config = self.resolve_config()?;
         let output_spec = self.resolve_output_spec_in(&self.table)?;
 
-        let Some(starting_snapshot) = self.table.metadata().current_snapshot().cloned() else {
+        let Some(starting_snapshot) = self.branch_starting_snapshot()? else {
             return Ok(RewriteDataFilesResult::default());
         };
         let starting_snapshot_id = starting_snapshot.snapshot_id();
@@ -297,7 +299,9 @@ impl RewriteDataFiles {
 
         let tasks = self.plan_scan_tasks().await?;
         let data_files_by_path = self.collect_live_data_files().await?;
-        let live_deletes = rewrite_dv::live_file_scoped_position_deletes(&self.table).await?;
+        let live_deletes =
+            rewrite_dv::live_file_scoped_position_deletes_at(&self.table, &starting_snapshot)
+                .await?;
         config.file_scoped_delete_paths = live_deletes.paths;
         let mut groups = plan_file_groups_for_table(&self.table, tasks, &config);
 
@@ -344,6 +348,9 @@ impl RewriteDataFiles {
             let mut action = transaction
                 .rewrite_files(batch_deletes, batch_adds)
                 .validate_from_snapshot(starting_snapshot_id);
+            if let Some(branch) = self.branch.as_deref() {
+                action = action.to_branch(branch);
+            }
             if self.use_starting_sequence_number {
                 action = action.data_sequence_number(starting_sequence_number);
             }
@@ -499,44 +506,6 @@ impl RewriteDataFiles {
                     )
                 }),
         }
-    }
-
-    /// Plan live data-file scan tasks. The filter selects files only; no residual applies.
-    async fn plan_scan_tasks(&self) -> Result<Vec<FileScanTask>> {
-        use futures::TryStreamExt;
-
-        let stream = self
-            .table
-            .scan()
-            .with_file_prune_only(self.filter.clone())
-            .build()?
-            .plan_files()
-            .await?;
-        stream.try_collect().await
-    }
-
-    /// Maps each live data file path to its [`DataFile`]. The rewrite removal set needs the whole
-    /// file, and a scan task carries only the path.
-    async fn collect_live_data_files(&self) -> Result<HashMap<String, DataFile>> {
-        use crate::spec::DataContentType;
-
-        let mut by_path: HashMap<String, DataFile> = HashMap::new();
-        let metadata = self.table.metadata();
-        let Some(snapshot) = metadata.current_snapshot() else {
-            return Ok(by_path);
-        };
-        let manifest_list = snapshot
-            .load_manifest_list(self.table.file_io(), metadata)
-            .await?;
-        for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(self.table.file_io()).await?;
-            for entry in manifest.entries() {
-                if entry.is_alive() && entry.content_type() == DataContentType::Data {
-                    by_path.insert(entry.file_path().to_string(), entry.data_file().clone());
-                }
-            }
-        }
-        Ok(by_path)
     }
 }
 

@@ -25,7 +25,9 @@ use futures::{StreamExt, TryStreamExt, stream};
 use crate::Result;
 use crate::delete_file_index::{is_deletion_vector, referenced_data_file_location};
 use crate::io::FileIO;
-use crate::spec::{DataContentType, DataFile, Manifest, ManifestContentType, ManifestList};
+use crate::spec::{
+    DataContentType, DataFile, Manifest, ManifestContentType, ManifestList, SnapshotRef,
+};
 use crate::table::Table;
 
 const DELETE_MANIFEST_IO_CONCURRENCY: usize = 8;
@@ -60,19 +62,23 @@ pub(super) fn plan_dv_removal(
 
 #[cfg(test)]
 pub(super) async fn file_scoped_delete_paths(table: &Table) -> Result<HashSet<String>> {
-    Ok(live_file_scoped_position_deletes(table).await?.paths)
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(HashSet::new());
+    };
+    Ok(live_file_scoped_position_deletes_at(table, snapshot)
+        .await?
+        .paths)
 }
 
-pub(super) async fn live_file_scoped_position_deletes(
+pub(super) async fn live_file_scoped_position_deletes_at(
     table: &Table,
+    snapshot: &SnapshotRef,
 ) -> Result<LiveFileScopedDeletes> {
     let mut live = LiveFileScopedDeletes {
         paths: HashSet::new(),
         deletion_vectors: Vec::new(),
     };
-    let Some(manifests) = load_delete_manifests(table).await? else {
-        return Ok(live);
-    };
+    let manifests = load_delete_manifests_at(table, snapshot).await?;
     for manifest in manifests {
         for entry in manifest.entries() {
             if !entry.is_alive() {
@@ -93,18 +99,15 @@ pub(super) async fn live_file_scoped_position_deletes(
     Ok(live)
 }
 
-async fn load_delete_manifests(table: &Table) -> Result<Option<Vec<Manifest>>> {
+async fn load_delete_manifests_at(table: &Table, snapshot: &SnapshotRef) -> Result<Vec<Manifest>> {
     let metadata = table.metadata();
-    let Some(snapshot) = metadata.current_snapshot() else {
-        return Ok(None);
-    };
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), metadata)
         .await?;
     let manifests = delete_manifest_stream(table.file_io(), &manifest_list)
         .try_collect()
         .await?;
-    Ok(Some(manifests))
+    Ok(manifests)
 }
 
 fn delete_manifest_stream<'a>(
