@@ -707,10 +707,9 @@ mod tests {
         )
         .expect_err("puffin must not route to a data-file writer");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("puffin"),
-            "error must name the format, got {}",
-            err.message()
+        assert_eq!(
+            err.message(),
+            "Cannot build a data-file writer for format puffin: a sidecar is never a data file"
         );
     }
 
@@ -728,10 +727,9 @@ mod tests {
         )
         .expect_err("parsed puffin must still hit the error arm");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
-        assert!(
-            err.message().contains("puffin"),
-            "error must name the format, got {}",
-            err.message()
+        assert_eq!(
+            err.message(),
+            "Cannot build a data-file writer for format puffin: a sidecar is never a data file"
         );
     }
 
