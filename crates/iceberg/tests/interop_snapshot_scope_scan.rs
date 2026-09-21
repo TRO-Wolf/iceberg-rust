@@ -23,16 +23,17 @@ use arrow_array::types::{Int32Type, Int64Type};
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
 use futures::TryStreamExt;
 use iceberg::inspect::{
-    EntriesTable, FilesTable, ManifestsTable, PartitionsTable, PositionDeletesTable,
+    EntriesTable, FilesTable, HistoryTable, ManifestsTable, PartitionsTable, PositionDeletesTable,
+    SnapshotsTable,
 };
-use iceberg::io::LocalFsStorageFactory;
+use iceberg::io::{FileIO, LocalFsStorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
 use iceberg::scan::ArrowRecordBatchStream;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileFormat, FormatVersion, Literal, NestedField, PrimitiveType,
-    Schema, SortOrder, Struct, Transform, Type, UnboundPartitionSpec,
+    Schema, SortOrder, Struct, TableMetadata, Transform, Type, UnboundPartitionSpec,
 };
-use iceberg::table::Table;
+use iceberg::table::{StaticTable, Table};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::position_delete_writer::{
     PositionDeleteFileWriterBuilder, PositionDeleteWriterConfig,
@@ -43,7 +44,7 @@ use iceberg::writer::file_writer::location_generator::{
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::file_writer::{FileWriter, FileWriterBuilder, ParquetWriterBuilder};
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation};
+use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
 const UNKNOWN_SNAPSHOT_ID: i64 = 999_999_999_999;
@@ -734,4 +735,281 @@ async fn snapshotless_scoped_tables_fail_loud_but_unscoped_scan_empty() {
     )
     .await;
     assert!(posdel.iter().all(|batch| batch.num_rows() == 0));
+}
+
+async fn append_file(catalog: &MemoryCatalog, table: &Table, ids: &[i64], filename: &str) -> Table {
+    let file = write_data_file(table, ids, filename).await;
+    let tx = Transaction::new(table);
+    let tx = tx
+        .fast_append()
+        .add_data_files(vec![file])
+        .apply(tx)
+        .expect("apply fast append");
+    tx.commit(catalog).await.expect("commit fast append")
+}
+
+async fn three_snapshot_table() -> (TempDir, MemoryCatalog, Table, i64, i64, i64) {
+    let (tmp, catalog, table) = empty_table("snapshot_scope_three").await;
+    let table = append_file(&catalog, &table, &[1], "00000-scope-3a.parquet").await;
+    let snap_a = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snap A is current");
+    let table = append_file(&catalog, &table, &[2], "00000-scope-3b.parquet").await;
+    let snap_b = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snap B is current");
+    let table = append_file(&catalog, &table, &[3], "00000-scope-3c.parquet").await;
+    let snap_c = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snap C is current");
+    assert_ne!(snap_a, snap_b);
+    assert_ne!(snap_b, snap_c);
+    (tmp, catalog, table, snap_a, snap_b, snap_c)
+}
+
+async fn rollback_table() -> (TempDir, MemoryCatalog, Table, i64, i64, i64) {
+    let (tmp, catalog, table) = empty_table("snapshot_scope_rollback").await;
+    let table = append_file(&catalog, &table, &[1], "00000-scope-ra.parquet").await;
+    let snap_a = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snap A is current");
+    let table = append_file(&catalog, &table, &[2], "00000-scope-rb.parquet").await;
+    let snap_b = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snap B is current");
+    let tx = Transaction::new(&table);
+    let tx = tx
+        .manage_snapshots()
+        .rollback_to(snap_a)
+        .apply(tx)
+        .expect("apply rollback to A");
+    let table = tx.commit(&catalog).await.expect("commit rollback to A");
+    assert_eq!(table.metadata().current_snapshot_id(), Some(snap_a));
+    let table = append_file(&catalog, &table, &[3], "00000-scope-rc.parquet").await;
+    let snap_c = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("snap C is current");
+    (tmp, catalog, table, snap_a, snap_b, snap_c)
+}
+
+async fn retimestamped_table(table: &Table, snapshot_ts: &[(i64, i64)], log_ts: &[i64]) -> Table {
+    let mut value = serde_json::to_value(table.metadata()).expect("serialize table metadata");
+    for (snapshot_id, timestamp_ms) in snapshot_ts {
+        let mut matched = false;
+        for snapshot in value["snapshots"]
+            .as_array_mut()
+            .expect("snapshots is an array")
+        {
+            if snapshot["snapshot-id"].as_i64() == Some(*snapshot_id) {
+                snapshot["timestamp-ms"] = (*timestamp_ms).into();
+                matched = true;
+            }
+        }
+        assert!(matched, "snapshot {snapshot_id} must exist in metadata");
+    }
+    let log = value["snapshot-log"]
+        .as_array_mut()
+        .expect("snapshot-log is an array");
+    assert_eq!(log.len(), log_ts.len());
+    for (entry, timestamp_ms) in log.iter_mut().zip(log_ts.iter()) {
+        entry["timestamp-ms"] = (*timestamp_ms).into();
+    }
+    let max_ts = snapshot_ts
+        .iter()
+        .map(|(_, timestamp_ms)| *timestamp_ms)
+        .chain(log_ts.iter().copied())
+        .max()
+        .expect("at least one timestamp");
+    value["last-updated-ms"] = max_ts.into();
+    for entry in value["metadata-log"]
+        .as_array_mut()
+        .expect("metadata-log is an array")
+    {
+        entry["timestamp-ms"] = max_ts.into();
+    }
+    let metadata: TableMetadata =
+        serde_json::from_value(value).expect("parse retimestamped metadata");
+    StaticTable::from_metadata(
+        metadata,
+        TableIdent::from_strs(["snapshot_scope", "retimestamped"]).expect("static ident"),
+        FileIO::new_with_fs(),
+    )
+    .await
+    .expect("load static table")
+    .into_table()
+}
+
+fn history_rows(batches: &[RecordBatch]) -> Vec<(i64, bool)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let snapshot_id = batch
+            .column_by_name("snapshot_id")
+            .unwrap_or_else(|| panic!("snapshot_id column"))
+            .as_primitive::<Int64Type>();
+        let is_current_ancestor = batch
+            .column_by_name("is_current_ancestor")
+            .unwrap_or_else(|| panic!("is_current_ancestor column"))
+            .as_boolean();
+        for i in 0..batch.num_rows() {
+            rows.push((snapshot_id.value(i), is_current_ancestor.value(i)));
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn snapshots_at_snapshot_returns_exact_id_set_with_inclusive_bound() {
+    let (_tmp, _catalog, table, snap_a, snap_b, snap_c) = three_snapshot_table().await;
+    let log_ids: Vec<i64> = table
+        .metadata()
+        .history()
+        .iter()
+        .map(|entry| entry.snapshot_id)
+        .collect();
+    assert_eq!(log_ids, vec![snap_a, snap_b, snap_c]);
+    let table = retimestamped_table(
+        &table,
+        &[(snap_a, 1000), (snap_b, 2000), (snap_c, 2000)],
+        &[1000, 2000, 2000],
+    )
+    .await;
+    let at_a = collect_batches(
+        SnapshotsTable::try_at_snapshot(&table, snap_a)
+            .expect("snapshots at A")
+            .scan()
+            .await
+            .expect("scan snapshots at A"),
+    )
+    .await;
+    assert_eq!(long_column(&at_a, "snapshot_id"), vec![snap_a]);
+    let at_b = collect_batches(
+        SnapshotsTable::try_at_snapshot(&table, snap_b)
+            .expect("snapshots at B")
+            .scan()
+            .await
+            .expect("scan snapshots at B"),
+    )
+    .await;
+    let mut expected = vec![snap_a, snap_b, snap_c];
+    expected.sort();
+    assert_eq!(long_column(&at_b, "snapshot_id"), expected);
+    let live = collect_batches(
+        table
+            .inspect()
+            .snapshots()
+            .scan()
+            .await
+            .expect("scan live snapshots"),
+    )
+    .await;
+    assert_eq!(long_column(&live, "snapshot_id"), expected);
+}
+
+#[tokio::test]
+async fn history_at_snapshot_truncates_log_and_recomputes_ancestors() {
+    let (_tmp, _catalog, table, snap_a, snap_b, snap_c) = rollback_table().await;
+    let log_ids: Vec<i64> = table
+        .metadata()
+        .history()
+        .iter()
+        .map(|entry| entry.snapshot_id)
+        .collect();
+    assert_eq!(log_ids, vec![snap_a, snap_b, snap_a, snap_c]);
+    assert_eq!(table.metadata().current_snapshot_id(), Some(snap_c));
+    let parent_c = table
+        .metadata()
+        .snapshot_by_id(snap_c)
+        .expect("snapshot C")
+        .parent_snapshot_id();
+    assert_eq!(parent_c, Some(snap_a));
+    let table = retimestamped_table(
+        &table,
+        &[(snap_a, 1000), (snap_b, 2000), (snap_c, 4000)],
+        &[1000, 2000, 3000, 4000],
+    )
+    .await;
+    let at_b = collect_batches(
+        HistoryTable::try_at_snapshot(&table, snap_b)
+            .expect("history at B")
+            .scan()
+            .await
+            .expect("scan history at B"),
+    )
+    .await;
+    assert_eq!(history_rows(&at_b), vec![(snap_a, true), (snap_b, true)]);
+    let at_c = collect_batches(
+        HistoryTable::try_at_snapshot(&table, snap_c)
+            .expect("history at C")
+            .scan()
+            .await
+            .expect("scan history at C"),
+    )
+    .await;
+    assert_eq!(history_rows(&at_c), vec![
+        (snap_a, true),
+        (snap_b, false),
+        (snap_a, true),
+        (snap_c, true)
+    ]);
+}
+
+#[tokio::test]
+async fn snapshots_and_history_unknown_snapshot_id_fails_loud() {
+    let (_tmp, _catalog, table, _snap1, _snap2, _path_a, _path_b) = two_snapshot_table().await;
+    let err = match SnapshotsTable::try_at_snapshot(&table, UNKNOWN_SNAPSHOT_ID) {
+        Ok(_) => panic!("unknown snapshot id must refuse snapshots"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(err.message().contains("Cannot find snapshot"));
+    let err = match HistoryTable::try_at_snapshot(&table, UNKNOWN_SNAPSHOT_ID) {
+        Ok(_) => panic!("unknown snapshot id must refuse history"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(err.message().contains("Cannot find snapshot"));
+}
+
+#[tokio::test]
+async fn snapshotless_snapshots_and_history_scoped_fail_loud_but_unscoped_scan_empty() {
+    let (_tmp, _catalog, table) = empty_table("snapshot_scope_empty_meta").await;
+    assert!(table.metadata().current_snapshot_id().is_none());
+    let err = match SnapshotsTable::try_at_snapshot(&table, UNKNOWN_SNAPSHOT_ID) {
+        Ok(_) => panic!("snapshot-less scoped snapshots must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(err.message().contains("Cannot find snapshot"));
+    let err = match HistoryTable::try_at_snapshot(&table, UNKNOWN_SNAPSHOT_ID) {
+        Ok(_) => panic!("snapshot-less scoped history must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(err.message().contains("Cannot find snapshot"));
+    let snapshots = collect_batches(
+        table
+            .inspect()
+            .snapshots()
+            .scan()
+            .await
+            .expect("scan snapshots"),
+    )
+    .await;
+    assert!(long_column(&snapshots, "snapshot_id").is_empty());
+    let history = collect_batches(
+        table
+            .inspect()
+            .history()
+            .scan()
+            .await
+            .expect("scan history"),
+    )
+    .await;
+    assert!(history_rows(&history).is_empty());
 }
