@@ -32,6 +32,7 @@ a format is chosen only by which concrete builder is instantiated.
 | Path | What it does |
 |---|---|
 | `mod.rs` | the `FileWriterBuilder` / `FileWriter` traits and the format re-exports |
+| `any_writer.rs` | the format-selection seam: `AnyFileWriterBuilder::for_format` routes a `DataFileFormat` to the Parquet / Avro / ORC builder; puffin is refused because a sidecar is never a data file |
 | `parquet_writer.rs` | Parquet IO and its per-column metrics; the reference implementation of the per-column metrics contract |
 | `parquet_compression.rs` | `write.parquet.compression-codec` / `-level` → `parquet::basic::Compression` |
 | `parquet_footer.rs` | the Java-identical parquet footer key-values (`iceberg.schema`, `delete-type`) |
