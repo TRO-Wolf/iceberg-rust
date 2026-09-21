@@ -26,7 +26,7 @@ use crate::maintenance::rewrite_data_files_plan::{
     write_max_file_size,
 };
 use crate::scan::FileScanTask;
-use crate::spec::{Literal, PartitionSpec, Struct, Transform};
+use crate::spec::{Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform};
 
 /// Partition grouping. Different partition values never share a group, and a task of a
 /// non-default spec buckets as unpartitioned.
@@ -219,4 +219,54 @@ fn test_pack_bins_forward_first_fit() {
         sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
         vec![vec![7], vec![2, 2]]
     );
+}
+
+#[test]
+fn test_plan_file_groups_partition_order_sorted_and_repeatable() {
+    let (spec, schema) = synthetic_spec_and_schema();
+    let config = config_for(100, 75, 180, 2);
+    let plan_order = || {
+        let tasks = vec![
+            synthetic_task("b1", 10, 2, 0, &spec, &schema),
+            synthetic_task("b2", 10, 2, 0, &spec, &schema),
+            synthetic_task("a1", 10, 0, 0, &spec, &schema),
+            synthetic_task("a2", 10, 0, 0, &spec, &schema),
+            synthetic_task("c1", 10, 1, 0, &spec, &schema),
+            synthetic_task("c2", 10, 1, 0, &spec, &schema),
+        ];
+        plan_file_groups(tasks, &config, &spec)
+            .iter()
+            .map(|group| {
+                let task = group
+                    .first()
+                    .expect("planned group holds its partition tasks");
+                let value = task
+                    .partition
+                    .as_ref()
+                    .expect("synthetic task carries a partition")
+                    .fields()
+                    .first()
+                    .expect("identity(x) partition holds one value")
+                    .as_ref()
+                    .expect("partition value is non-null");
+                match value {
+                    Literal::Primitive(PrimitiveLiteral::Long(part)) => *part,
+                    other => panic!("expected long partition value, saw {other:?}"),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = plan_order();
+    assert_eq!(
+        first,
+        vec![0, 1, 2],
+        "groups emit in ascending partition order"
+    );
+    for _ in 0..50 {
+        assert_eq!(
+            plan_order(),
+            first,
+            "group order is identical on every plan call"
+        );
+    }
 }
