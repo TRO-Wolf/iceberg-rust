@@ -809,6 +809,48 @@ async fn test_provider_schema_is_stable_and_refreshed_serves_the_current_schema(
 }
 
 #[tokio::test]
+async fn test_refreshed_carries_commit_knobs_and_drops_planning_table() {
+    let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+    let table = catalog
+        .load_table(&TableIdent::new(namespace.clone(), table_name.clone()))
+        .await
+        .expect("load table for the planning-load provider");
+    let properties = HashMap::from([("k".to_string(), "v".to_string())]);
+    let provider = IcebergTableProvider::from_planning_load(catalog, table)
+        .expect("construct the planning-load provider")
+        .with_commit_branch("b")
+        .with_stage_only(true)
+        .with_snapshot_properties(properties.clone())
+        .with_output_spec_id(0);
+    assert!(provider.planning_table.is_some());
+    let refreshed = provider.refreshed().await.expect("refresh the provider");
+    assert_eq!(refreshed.commit_branch, Some("b".to_string()));
+    assert!(refreshed.stage_only);
+    assert_eq!(refreshed.snapshot_properties, properties);
+    assert_eq!(refreshed.output_spec_id, Some(0));
+    assert!(refreshed.planning_table.is_none());
+    assert_eq!(provider.commit_branch, Some("b".to_string()));
+    assert!(provider.stage_only);
+    assert_eq!(provider.snapshot_properties, properties);
+    assert_eq!(provider.output_spec_id, Some(0));
+    assert!(provider.planning_table.is_some());
+}
+
+#[tokio::test]
+async fn test_refreshed_of_default_provider_carries_defaults() {
+    let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+    let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
+        .await
+        .expect("construct the default provider");
+    let refreshed = provider.refreshed().await.expect("refresh the provider");
+    assert_eq!(refreshed.commit_branch, None);
+    assert!(!refreshed.stage_only);
+    assert!(refreshed.snapshot_properties.is_empty());
+    assert_eq!(refreshed.output_spec_id, None);
+    assert!(refreshed.planning_table.is_none());
+}
+
+#[tokio::test]
 async fn test_catalog_resolves_a_fresh_provider_per_query() {
     use datafusion::catalog::SchemaProvider;
 
