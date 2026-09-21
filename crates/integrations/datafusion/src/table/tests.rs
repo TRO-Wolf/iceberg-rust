@@ -837,6 +837,22 @@ async fn test_refreshed_carries_commit_knobs_and_drops_planning_table() {
 }
 
 #[tokio::test]
+async fn test_from_planning_load_defaults_commit_knobs() {
+    let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
+    let table = catalog
+        .load_table(&TableIdent::new(namespace.clone(), table_name.clone()))
+        .await
+        .expect("load table for the planning-load provider");
+    let provider = IcebergTableProvider::from_planning_load(catalog, table)
+        .expect("construct the planning-load provider");
+    assert_eq!(provider.commit_branch, None);
+    assert!(!provider.stage_only);
+    assert!(provider.snapshot_properties.is_empty());
+    assert_eq!(provider.output_spec_id, None);
+    assert!(provider.planning_table.is_some());
+}
+
+#[tokio::test]
 async fn test_refreshed_of_default_provider_carries_defaults() {
     let (catalog, namespace, table_name, _temp_dir) = get_test_catalog_and_table().await;
     let provider = IcebergTableProvider::try_new(catalog, namespace, table_name)
