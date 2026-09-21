@@ -32,12 +32,24 @@ use crate::table::Table;
 /// Manifests table.
 pub struct ManifestsTable<'a> {
     table: &'a Table,
+    snapshot_id: Option<i64>,
 }
 
 impl<'a> ManifestsTable<'a> {
     /// Create a new Manifests table instance.
     pub fn new(table: &'a Table) -> Self {
-        Self { table }
+        Self {
+            table,
+            snapshot_id: None,
+        }
+    }
+
+    #[allow(missing_docs)]
+    pub fn at_snapshot(table: &'a Table, snapshot_id: i64) -> Self {
+        Self {
+            table,
+            snapshot_id: Some(snapshot_id),
+        }
     }
 
     /// Returns the iceberg schema of the manifests table.
@@ -157,7 +169,21 @@ impl<'a> ManifestsTable<'a> {
         let mut deleted_delete_files_count = PrimitiveBuilder::<Int32Type>::new();
         let mut partition_summaries = partition_summary_builder(&self.schema())?;
 
-        if let Some(snapshot) = self.table.metadata().current_snapshot() {
+        let snapshot = match self.snapshot_id {
+            Some(snapshot_id) => Some(
+                self.table
+                    .metadata()
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| {
+                        crate::Error::new(
+                            crate::ErrorKind::DataInvalid,
+                            format!("Cannot find snapshot: {snapshot_id}"),
+                        )
+                    })?,
+            ),
+            None => self.table.metadata().current_snapshot(),
+        };
+        if let Some(snapshot) = snapshot {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), &self.table.metadata_ref())
                 .await?;

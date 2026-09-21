@@ -37,6 +37,7 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | `record_batch_predicate_container_tests.rs` | **test-only** Spark container-null oracle over a materialized batch (incl. `st.b` both parities) |
 | `null_propagation.rs` | `array_with_parent_validity`: union a struct parent's nulls into a child column (Arrow never propagates validity downward) |
 | `record_batch_transformer.rs` (+ `*_tests.rs`) | `RecordBatchTransformer`: type promotion, defaults, reorder, partition constants, `_file`/`_pos`/row-lineage virtual columns |
+| `partition_constant.rs` | `_partition` struct-constant synthesis: union partition type across specs, per-file tuple coercion, `ColumnSource::PartitionConstant` source + `StructArray` builder (NULL struct for unpartitioned tables and missing specs) |
 | `record_batch_projector.rs` | batch projection onto the read schema |
 | `record_batch_partition_splitter.rs` | split batches by partition value |
 | `nested_projection.rs` (+ `*_tests.rs`) | nested-column projection with schema evolution |

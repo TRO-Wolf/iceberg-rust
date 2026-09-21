@@ -28,13 +28,16 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use crate::arrow::nested_projection::{
     NestedProjectionPlan, create_constant_column, nested_projection_applies,
 };
+use crate::arrow::partition_constant::{partition_constant_array, partition_constant_source};
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
-    RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_row_lineage_field,
+    RESERVED_FIELD_ID_DELETED, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    RESERVED_FIELD_ID_PARTITION, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID,
+    get_metadata_field, is_row_lineage_field,
 };
 use crate::spec::{
-    Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
+    Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, StructType,
+    Transform,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -146,6 +149,10 @@ pub(crate) enum ColumnSource {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
     },
+    PartitionConstant {
+        partition_type: StructType,
+        value: Option<Struct>,
+    },
 
     /// The reserved `_pos` column: each row's 0-based physical ordinal in the data file.
     ///
@@ -213,6 +220,7 @@ pub(crate) struct RecordBatchTransformerBuilder {
     snapshot_schema: Arc<IcebergSchema>,
     projected_iceberg_field_ids: Vec<i32>,
     constant_fields: HashMap<i32, Datum>,
+    partition_value: Option<Option<Struct>>,
     /// V3 row lineage: the data file's assigned `first_row_id` and its file sequence number. `None`
     /// when the table is not V3 or the file has no assigned range.
     first_row_id: Option<i64>,
@@ -228,6 +236,7 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema,
             projected_iceberg_field_ids: projected_iceberg_field_ids.to_vec(),
             constant_fields: HashMap::new(),
+            partition_value: None,
             first_row_id: None,
             file_sequence_number: None,
         }
@@ -236,6 +245,11 @@ impl RecordBatchTransformerBuilder {
     /// Adds the constant `datum` for `field_id`. Metadata fields such as `_file` use it.
     pub(crate) fn with_constant(mut self, field_id: i32, datum: Datum) -> Self {
         self.constant_fields.insert(field_id, datum);
+        self
+    }
+
+    pub(crate) fn with_partition_value(mut self, value: Option<Struct>) -> Self {
+        self.partition_value = Some(value);
         self
     }
 
@@ -276,6 +290,7 @@ impl RecordBatchTransformerBuilder {
             snapshot_schema: self.snapshot_schema,
             projected_iceberg_field_ids: self.projected_iceberg_field_ids,
             constant_fields: self.constant_fields,
+            partition_value: self.partition_value,
             first_row_id: self.first_row_id,
             file_sequence_number: self.file_sequence_number,
             batch_transform: None,
@@ -307,6 +322,7 @@ pub(crate) struct RecordBatchTransformer {
     projected_iceberg_field_ids: Vec<i32>,
     // Metadata fields such as `_file`, plus the identity-partitioned fields.
     constant_fields: HashMap<i32, Datum>,
+    partition_value: Option<Option<Struct>>,
 
     // See `RecordBatchTransformerBuilder::with_row_lineage`.
     first_row_id: Option<i64>,
@@ -344,6 +360,7 @@ impl RecordBatchTransformer {
                 self.snapshot_schema.as_ref(),
                 &self.projected_iceberg_field_ids,
                 &self.constant_fields,
+                self.partition_value.clone(),
                 self.first_row_id,
                 self.file_sequence_number,
             )?;
@@ -404,6 +421,7 @@ impl RecordBatchTransformer {
         snapshot_schema: &IcebergSchema,
         projected_iceberg_field_ids: &[i32],
         constant_fields: &HashMap<i32, Datum>,
+        partition_value: Option<Option<Struct>>,
         first_row_id: Option<i64>,
         file_sequence_number: Option<i64>,
     ) -> Result<BatchTransform> {
@@ -465,6 +483,19 @@ impl RecordBatchTransformer {
                                 pos_meta.id.to_string(),
                             )])),
                     ))
+                } else if *field_id == RESERVED_FIELD_ID_DELETED {
+                    let deleted_meta = get_metadata_field(*field_id)?;
+                    Ok(Arc::new(
+                        Field::new(
+                            &deleted_meta.name,
+                            DataType::Boolean,
+                            !deleted_meta.required,
+                        )
+                        .with_metadata(HashMap::from([(
+                            PARQUET_FIELD_ID_META_KEY.to_string(),
+                            deleted_meta.id.to_string(),
+                        )])),
+                    ))
                 } else {
                     Ok(field_id_to_mapped_schema_map
                         .get(field_id)
@@ -503,8 +534,8 @@ impl RecordBatchTransformer {
                     projected_iceberg_field_ids,
                     field_id_to_mapped_schema_map,
                     constant_fields,
-                    first_row_id,
-                    file_sequence_number,
+                    partition_value,
+                    (first_row_id, file_sequence_number),
                 )?,
                 target_schema,
             }),
@@ -578,9 +609,10 @@ impl RecordBatchTransformer {
         projected_iceberg_field_ids: &[i32],
         field_id_to_mapped_schema_map: HashMap<i32, (FieldRef, usize)>,
         constant_fields: &HashMap<i32, Datum>,
-        first_row_id: Option<i64>,
-        file_sequence_number: Option<i64>,
+        partition_value: Option<Option<Struct>>,
+        lineage: (Option<i64>, Option<i64>),
     ) -> Result<Vec<ColumnSource>> {
+        let (first_row_id, file_sequence_number) = lineage;
         let field_id_to_source_schema_map =
             Self::build_field_id_to_arrow_schema_map(source_schema)?;
 
@@ -666,6 +698,21 @@ impl RecordBatchTransformer {
                             value: Some(PrimitiveLiteral::Long(file_sequence_number)),
                         },
                     });
+                }
+
+                if *field_id == RESERVED_FIELD_ID_DELETED {
+                    return Ok(match field_id_to_source_schema_map.get(field_id) {
+                        Some((_, source_index)) => ColumnSource::PassThrough {
+                            source_index: *source_index,
+                        },
+                        None => ColumnSource::Add {
+                            target_type: DataType::Boolean,
+                            value: Some(PrimitiveLiteral::Boolean(false)),
+                        },
+                    });
+                }
+                if *field_id == RESERVED_FIELD_ID_PARTITION {
+                    return partition_constant_source(snapshot_schema, partition_value.clone());
                 }
 
                 let target_field = &field_id_to_mapped_schema_map
@@ -826,6 +873,10 @@ impl RecordBatchTransformer {
                     ColumnSource::Add { target_type, value } => {
                         create_constant_column(target_type, value, num_rows)?
                     }
+                    ColumnSource::PartitionConstant {
+                        partition_type,
+                        value,
+                    } => partition_constant_array(partition_type, value.as_ref(), num_rows)?,
 
                     ColumnSource::RowPosition => {
                         let end = start_row_position.saturating_add(num_rows as u64);

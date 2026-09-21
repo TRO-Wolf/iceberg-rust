@@ -25,23 +25,41 @@ use arrow_schema::{DataType, Field};
 use futures::{StreamExt, stream};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::Result;
 use crate::arrow::{DEFAULT_MAP_FIELD_NAME, UTC_TIME_ZONE, schema_to_arrow_schema};
 use crate::scan::ArrowRecordBatchStream;
 use crate::spec::{
     MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, MapType, NestedField, PrimitiveType, Type,
 };
 use crate::table::Table;
+use crate::{Error, ErrorKind, Result};
 
 /// Snapshots table.
 pub struct SnapshotsTable<'a> {
     table: &'a Table,
+    snapshot_id: Option<i64>,
 }
 
 impl<'a> SnapshotsTable<'a> {
     /// Create a new Snapshots table instance.
     pub fn new(table: &'a Table) -> Self {
-        Self { table }
+        Self {
+            table,
+            snapshot_id: None,
+        }
+    }
+
+    #[allow(missing_docs)]
+    pub fn try_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        if table.metadata().snapshot_by_id(snapshot_id).is_none() {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Cannot find snapshot: {snapshot_id}"),
+            ));
+        }
+        Ok(Self {
+            table,
+            snapshot_id: Some(snapshot_id),
+        })
     }
 
     /// Returns the iceberg schema of the snapshots table.
@@ -108,7 +126,25 @@ impl<'a> SnapshotsTable<'a> {
                 (PARQUET_FIELD_ID_META_KEY.to_string(), "8".to_string()),
             ])),
         ));
+        let cutoff = match self.snapshot_id {
+            Some(snapshot_id) => Some(
+                self.table
+                    .metadata()
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Cannot find snapshot: {snapshot_id}"),
+                        )
+                    })?
+                    .timestamp_ms(),
+            ),
+            None => None,
+        };
         for snapshot in self.table.metadata().snapshots() {
+            if cutoff.is_some_and(|cutoff| snapshot.timestamp_ms() > cutoff) {
+                continue;
+            }
             committed_at.append_value(snapshot.timestamp_ms() * 1000);
             snapshot_id.append_value(snapshot.snapshot_id());
             parent_id.append_option(snapshot.parent_snapshot_id());

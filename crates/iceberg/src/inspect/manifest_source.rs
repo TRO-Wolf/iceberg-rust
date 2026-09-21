@@ -39,9 +39,9 @@
 
 use std::collections::HashSet;
 
-use crate::Result;
 use crate::spec::ManifestFile;
 use crate::table::Table;
+use crate::{Error, ErrorKind, Result};
 
 /// The snapshot SCOPE of a file/entry inspection table — orthogonal to the content/kind axis.
 ///
@@ -55,6 +55,7 @@ pub(super) enum MetadataScope {
     /// The deduplicated union of manifests reachable from ALL snapshots (Java
     /// `BaseAllMetadataTableScan.reachableManifests`).
     AllSnapshots,
+    Snapshot(i64),
 }
 
 /// Collects the manifest files an inspection table of the given [`MetadataScope`] must read.
@@ -80,6 +81,9 @@ pub(super) async fn collect_manifest_files(
     match scope {
         MetadataScope::CurrentSnapshot => collect_current_snapshot_manifests(table).await,
         MetadataScope::AllSnapshots => collect_reachable_manifests(table).await,
+        MetadataScope::Snapshot(snapshot_id) => {
+            collect_snapshot_manifests(table, snapshot_id).await
+        }
     }
 }
 
@@ -87,6 +91,19 @@ pub(super) async fn collect_manifest_files(
 async fn collect_current_snapshot_manifests(table: &Table) -> Result<Vec<ManifestFile>> {
     let Some(snapshot) = table.metadata().current_snapshot() else {
         return Ok(Vec::new());
+    };
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await?;
+    Ok(manifest_list.entries().to_vec())
+}
+
+async fn collect_snapshot_manifests(table: &Table, snapshot_id: i64) -> Result<Vec<ManifestFile>> {
+    let Some(snapshot) = table.metadata().snapshot_by_id(snapshot_id) else {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("Cannot find snapshot: {snapshot_id}"),
+        ));
     };
     let manifest_list = snapshot
         .load_manifest_list(table.file_io(), table.metadata())

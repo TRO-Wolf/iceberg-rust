@@ -29,7 +29,7 @@ use crate::{Error, ErrorKind, Result};
 /// Values match BY FIELD ID against the spec the tuple was written under
 /// (Java `PartitionUtil.coercePartition`); absent fields null-fill. Each
 /// matched value widens through a legal promotion before extract.
-pub(super) fn append_partition(
+pub(crate) fn append_partition(
     builder: &mut StructBuilder,
     partition_type: &StructType,
     source_field_ids: &[i32],
