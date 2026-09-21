@@ -27,6 +27,7 @@ pub mod metadata_table;
 mod static_provider;
 pub mod table_provider_factory;
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -71,6 +72,8 @@ pub struct IcebergTableProvider {
     /// FIXED for the life of the instance: DataFusion stores ordinals against it.
     pub(crate) schema: ArrowSchemaRef,
     pub(crate) commit_branch: Option<String>,
+    pub(crate) stage_only: bool,
+    pub(crate) snapshot_properties: HashMap<String, String>,
     pub(crate) planning_table: Option<Table>,
     pub(crate) output_spec_id: Option<i32>,
 }
@@ -91,6 +94,8 @@ impl IcebergTableProvider {
             table_ident,
             schema,
             commit_branch: None,
+            stage_only: false,
+            snapshot_properties: HashMap::new(),
             planning_table: None,
             output_spec_id: None,
         })
@@ -106,6 +111,8 @@ impl IcebergTableProvider {
             table_ident: self.table_ident.clone(),
             schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
             commit_branch: self.commit_branch.clone(),
+            stage_only: self.stage_only,
+            snapshot_properties: self.snapshot_properties.clone(),
             planning_table: None,
             output_spec_id: self.output_spec_id,
         })
@@ -114,6 +121,16 @@ impl IcebergTableProvider {
     /// Scan and commit snapshot-producing DML against `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
     pub fn with_commit_branch(mut self, branch: impl Into<String>) -> Self {
         self.commit_branch = Some(branch.into());
+        self
+    }
+
+    pub fn with_stage_only(mut self, stage_only: bool) -> Self {
+        self.stage_only = stage_only;
+        self
+    }
+
+    pub fn with_snapshot_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.snapshot_properties = properties;
         self
     }
 
@@ -237,7 +254,9 @@ impl TableProvider for IcebergTableProvider {
                 insert_op,
                 output_spec,
             )
-            .with_commit_branch(self.commit_branch.clone()),
+            .with_commit_branch(self.commit_branch.clone())
+            .with_stage_only(self.stage_only)
+            .with_snapshot_properties(self.snapshot_properties.clone()),
         ))
     }
 

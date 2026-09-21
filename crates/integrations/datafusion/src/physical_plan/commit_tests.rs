@@ -377,11 +377,13 @@ IcebergCommitExec: table=test_namespace.test_table
 // ============================================================================================
 
 /// A boxed-error result for the test helpers/bodies below.
-type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-type TestResult = BoxResult<()>;
+pub(crate) type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub(crate) type TestResult = BoxResult<()>;
 
 /// Create a memory catalog + an unpartitioned `(id int, name string)` table with `props`.
-async fn setup_table(props: HashMap<String, String>) -> BoxResult<(Arc<dyn Catalog>, Table)> {
+pub(crate) async fn setup_table(
+    props: HashMap<String, String>,
+) -> BoxResult<(Arc<dyn Catalog>, Table)> {
     let catalog: Arc<dyn Catalog> = Arc::new(
         MemoryCatalogBuilder::default()
             .load(
@@ -413,7 +415,7 @@ async fn setup_table(props: HashMap<String, String>) -> BoxResult<(Arc<dyn Catal
 }
 
 /// Build an unpartitioned metadata-only [`DataFile`] at `path` carrying `record_count` rows.
-fn make_data_file(table: &Table, path: &str, record_count: u64) -> BoxResult<DataFile> {
+pub(crate) fn make_data_file(table: &Table, path: &str, record_count: u64) -> BoxResult<DataFile> {
     Ok(DataFileBuilder::default()
         .content(DataContentType::Data)
         .file_path(path.to_string())
@@ -426,7 +428,7 @@ fn make_data_file(table: &Table, path: &str, record_count: u64) -> BoxResult<Dat
 }
 
 /// Serialize a [`DataFile`] to the JSON the write→commit seam exchanges (what `MockWriteExec` emits).
-fn data_file_json(table: &Table, file: DataFile) -> BoxResult<String> {
+pub(crate) fn data_file_json(table: &Table, file: DataFile) -> BoxResult<String> {
     let partition_type = table.metadata().default_partition_type().clone();
     Ok(iceberg::spec::serialize_data_file_to_json(
         file,
@@ -437,7 +439,7 @@ fn data_file_json(table: &Table, file: DataFile) -> BoxResult<String> {
 
 /// Append `files` via a direct `fast_append` transaction (bypassing the commit exec) and return
 /// the refreshed table — used both to pre-populate a table and to simulate a concurrent commit.
-async fn append_files_direct(
+pub(crate) async fn append_files_direct(
     catalog: &Arc<dyn Catalog>,
     table: &Table,
     files: Vec<DataFile>,
@@ -450,11 +452,14 @@ async fn append_files_direct(
 
 /// Run an [`IcebergCommitExec`] over a `MockWriteExec` emitting `files_json` and collect its
 /// output batches (the row-count batch), or the commit error.
-async fn run_commit_exec(
+pub(crate) async fn run_commit_exec(
     table: &Table,
     catalog: &Arc<dyn Catalog>,
     files_json: Vec<String>,
     insert_op: InsertOp,
+    stage_only: bool,
+    branch: Option<String>,
+    properties: HashMap<String, String>,
 ) -> DFResult<Vec<RecordBatch>> {
     let input = Arc::new(MockWriteExec::new(files_json));
     let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -469,14 +474,17 @@ async fn run_commit_exec(
         arrow_schema,
         insert_op,
         table.metadata().default_partition_spec().clone(),
-    );
+    )
+    .with_commit_branch(branch)
+    .with_stage_only(stage_only)
+    .with_snapshot_properties(properties);
     let stream = exec.execute(0, Arc::new(TaskContext::default()))?;
     collect(stream).await
 }
 
 /// The sorted set of LIVE data-file paths reachable from `snapshot` — the real correctness
 /// signal (what a scan would read).
-async fn live_paths_in(
+pub(crate) async fn live_paths_in(
     table: &Table,
     snapshot: &iceberg::spec::SnapshotRef,
 ) -> BoxResult<Vec<String>> {
@@ -498,7 +506,7 @@ async fn live_paths_in(
 
 /// Assert the single row-count batch reports `expected` rows written (the "rows added" count
 /// semantics — an empty write reports 0, never a zero-row batch).
-fn assert_count(batches: &[RecordBatch], expected: u64) {
+pub(crate) fn assert_count(batches: &[RecordBatch], expected: u64) {
     assert_eq!(batches.len(), 1, "commit emits exactly one count batch");
     let batch = &batches[0];
     assert_eq!(
@@ -542,7 +550,16 @@ async fn test_empty_overwrite_wipes_table_bug001() -> TestResult {
     );
 
     // Empty INSERT OVERWRITE against the table handle at S0.
-    let batches = run_commit_exec(&table, &catalog, vec![], InsertOp::Overwrite).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
 
     // Reload and assert the table is WIPED: zero live files under a NEW snapshot.
@@ -612,7 +629,16 @@ async fn test_empty_overwrite_preserves_serializable_occ_validation() -> TestRes
     .await?;
 
     // Empty overwrite whose transaction still starts at S0 → serializable conflict with B.
-    let result = run_commit_exec(&table_at_s0, &catalog, vec![], InsertOp::Overwrite).await;
+    let result = run_commit_exec(
+        &table_at_s0,
+        &catalog,
+        vec![],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await;
     assert!(
         result.is_err(),
         "empty overwrite under SERIALIZABLE must reject a concurrent add since its start snapshot"
@@ -648,7 +674,16 @@ async fn test_empty_append_stamps_snapshot_bug004() -> TestResult {
         "precondition: brand-new table has no snapshot"
     );
 
-    let batches = run_commit_exec(&table, &catalog, vec![], InsertOp::Append).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Append,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
 
     let reloaded = catalog
@@ -689,7 +724,16 @@ async fn test_nonempty_overwrite_replaces_all_data() -> TestResult {
     .await?;
 
     let new_json = data_file_json(&table, make_data_file(&table, "new.parquet", 42)?)?;
-    let batches = run_commit_exec(&table, &catalog, vec![new_json], InsertOp::Overwrite).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![new_json],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 42);
 
     let reloaded = catalog
@@ -798,7 +842,16 @@ async fn test_empty_overwrite_wipes_all_partitions_partitioned() -> TestResult {
     );
 
     // (1) Empty INSERT INTO append must NOT wipe — both partitions stay live, snapshot stamped.
-    let batches = run_commit_exec(&table, &catalog, vec![], InsertOp::Append).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Append,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
     let table = catalog
         .load_table(&TableIdent::from_strs(["ns", "tp"])?)
@@ -821,7 +874,16 @@ async fn test_empty_overwrite_wipes_all_partitions_partitioned() -> TestResult {
     // (2) Empty INSERT OVERWRITE must WIPE EVERY partition in one new snapshot.
     let prior_snapshot_id = table.metadata().current_snapshot_id().expect("head");
     let prior_snapshots = table.metadata().snapshots().len();
-    let batches = run_commit_exec(&table, &catalog, vec![], InsertOp::Overwrite).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
     let wiped = catalog
         .load_table(&TableIdent::from_strs(["ns", "tp"])?)
@@ -856,7 +918,16 @@ async fn test_empty_overwrite_wipes_all_partitions_partitioned() -> TestResult {
         &table2,
         make_partitioned_data_file(&table2, "new_p3.parquet", 3, 42)?,
     )?;
-    let batches = run_commit_exec(&table2, &catalog2, vec![new_json], InsertOp::Overwrite).await?;
+    let batches = run_commit_exec(
+        &table2,
+        &catalog2,
+        vec![new_json],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 42);
     let reloaded2 = catalog2
         .load_table(&TableIdent::from_strs(["ns", "tp"])?)

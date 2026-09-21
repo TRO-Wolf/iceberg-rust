@@ -94,6 +94,8 @@ pub(crate) struct IcebergCommitExec {
     count_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
     commit_branch: Option<String>,
+    stage_only: bool,
+    snapshot_properties: HashMap<String, String>,
     output_spec: PartitionSpecRef,
 }
 
@@ -119,12 +121,24 @@ impl IcebergCommitExec {
             count_schema,
             plan_properties,
             commit_branch: None,
+            stage_only: false,
+            snapshot_properties: HashMap::new(),
             output_spec,
         }
     }
 
     pub(crate) fn with_commit_branch(mut self, branch: Option<String>) -> Self {
         self.commit_branch = branch;
+        self
+    }
+
+    pub(crate) fn with_stage_only(mut self, stage_only: bool) -> Self {
+        self.stage_only = stage_only;
+        self
+    }
+
+    pub(crate) fn with_snapshot_properties(mut self, properties: HashMap<String, String>) -> Self {
+        self.snapshot_properties = properties;
         self
     }
 
@@ -222,7 +236,9 @@ impl ExecutionPlan for IcebergCommitExec {
                 self.insert_op,
                 self.output_spec.clone(),
             )
-            .with_commit_branch(self.commit_branch.clone()),
+            .with_commit_branch(self.commit_branch.clone())
+            .with_stage_only(self.stage_only)
+            .with_snapshot_properties(self.snapshot_properties.clone()),
         ))
     }
 
@@ -251,6 +267,8 @@ impl ExecutionPlan for IcebergCommitExec {
         let catalog = Arc::clone(&self.catalog);
         let insert_op = self.insert_op;
         let commit_branch = self.commit_branch.clone();
+        let stage_only = self.stage_only;
+        let caller_properties = self.snapshot_properties.clone();
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -364,10 +382,19 @@ impl ExecutionPlan for IcebergCommitExec {
                 // reads table state nor removes files, so nothing can conflict (Java
                 // `SparkWrite.BatchAppend.commit` runs none).
                 InsertOp::Append => {
+                    let mut snapshot_properties = snapshot_properties;
+                    for (key, value) in &caller_properties {
+                        if key != OPERATION_ID_PROP {
+                            snapshot_properties.insert(key.clone(), value.clone());
+                        }
+                    }
+                    let base = tx
+                        .fast_append()
+                        .add_data_files(data_files)
+                        .set_snapshot_properties(snapshot_properties);
+                    let base = if stage_only { base.stage_only() } else { base };
                     let action = crate::physical_plan::snapshot_target::maybe_to_branch(
-                        tx.fast_append()
-                            .add_data_files(data_files)
-                            .set_snapshot_properties(snapshot_properties),
+                        base,
                         commit_branch.as_deref(),
                         |action, branch| action.to_branch(branch),
                     );
@@ -385,11 +412,20 @@ impl ExecutionPlan for IcebergCommitExec {
                 // `validate_no_conflicting_data` (L371-373). NO explicit conflict-detection filter —
                 // Java never sets one here; the row filter itself is the default conflict filter.
                 InsertOp::Overwrite => {
+                    let mut snapshot_properties = snapshot_properties;
+                    for (key, value) in &caller_properties {
+                        if key != OPERATION_ID_PROP {
+                            snapshot_properties.insert(key.clone(), value.clone());
+                        }
+                    }
                     let mut action = tx
                         .overwrite_files()
                         .overwrite_by_row_filter(Predicate::AlwaysTrue)
                         .add_files(data_files)
                         .set_snapshot_properties(snapshot_properties);
+                    if stage_only {
+                        action = action.stage_only();
+                    }
                     if let Some(isolation) = overwrite_isolation_level(&table)? {
                         action = action.validate_no_conflicting_deletes();
                         if isolation == IsolationLevel::Serializable {
@@ -437,6 +473,12 @@ impl ExecutionPlan for IcebergCommitExec {
     }
 }
 
+#[cfg(test)]
+#[path = "commit_snapshot_properties_tests.rs"]
+mod snapshot_properties_tests;
+#[cfg(test)]
+#[path = "commit_stage_only_tests.rs"]
+mod stage_only_tests;
 #[cfg(test)]
 #[path = "commit_tests.rs"]
 mod tests;
