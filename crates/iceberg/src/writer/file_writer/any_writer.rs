@@ -628,6 +628,41 @@ mod tests {
         assert_eq!(rows, 3);
     }
 
+    #[test]
+    fn ocf_codec_name_ignores_key_order() {
+        fn push_long(out: &mut Vec<u8>, value: i64) {
+            let mut raw =
+                u64::try_from(value).expect("the fixture long must be positive") << 1;
+            loop {
+                let chunk = u8::try_from(raw & 0x7f).expect("seven bits must fit in a byte");
+                raw >>= 7;
+                if raw == 0 {
+                    out.push(chunk);
+                    break;
+                }
+                out.push(chunk | 0x80);
+            }
+        }
+        fn push_bytes(out: &mut Vec<u8>, field: &[u8]) {
+            let len = i64::try_from(field.len()).expect("the fixture field must fit in i64");
+            push_long(out, len);
+            out.extend_from_slice(field);
+        }
+        let mut block = Vec::new();
+        push_bytes(&mut block, b"avro.codec.compression_level");
+        push_bytes(&mut block, &[6]);
+        push_bytes(&mut block, b"avro.codec");
+        push_bytes(&mut block, b"zstandard");
+        let mut header = b"Obj\x01".to_vec();
+        push_long(&mut header, 2);
+        let block_len = i64::try_from(block.len()).expect("the fixture block must fit in i64");
+        push_long(&mut header, block_len);
+        header.extend_from_slice(&block);
+        push_long(&mut header, 0);
+        header.extend_from_slice(&[0u8; 16]);
+        assert_eq!(ocf_codec_name(&header), "zstandard");
+    }
+
     #[tokio::test]
     async fn avro_java_alias_uncompressed_writes_null() {
         let (codec, rows) = avro_codec_name_and_rows_for_property("uncompressed").await;
