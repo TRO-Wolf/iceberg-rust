@@ -457,32 +457,33 @@ impl<'a> TableScanBuilder<'a> {
         });
 
         for column_name in column_names.iter() {
+            if let Some(field_id) = schema.field_id_by_name(column_name) {
+                schema
+                    .as_struct()
+                    .field_by_id(field_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::FeatureUnsupported,
+                            format!(
+                            "Column {column_name} is not a direct child of schema but a nested field, which is not supported now. Schema: {schema}"
+                        ),
+                    )
+                })?;
+
+                field_ids.push(field_id);
+                continue;
+            }
+
             // Handle metadata columns (like "_file")
             if is_metadata_column_name(column_name) {
                 field_ids.push(get_metadata_field_id(column_name)?);
                 continue;
             }
 
-            let field_id = schema.field_id_by_name(column_name).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Column {column_name} not found in table. Schema: {schema}"),
-                )
-            })?;
-
-            schema
-                .as_struct()
-                .field_by_id(field_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::FeatureUnsupported,
-                        format!(
-                        "Column {column_name} is not a direct child of schema but a nested field, which is not supported now. Schema: {schema}"
-                    ),
-                )
-            })?;
-
-            field_ids.push(field_id);
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Column {column_name} not found in table. Schema: {schema}"),
+            ));
         }
 
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
