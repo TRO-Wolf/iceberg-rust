@@ -30,8 +30,8 @@ use crate::arrow::nested_projection::{
 };
 use crate::arrow::{datum_to_arrow_type_with_ree, schema_to_arrow_schema};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_POS,
-    RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_row_lineage_field,
+    RESERVED_FIELD_ID_DELETED, RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+    RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_row_lineage_field,
 };
 use crate::spec::{
     Datum, Literal, PartitionSpec, PrimitiveLiteral, Schema as IcebergSchema, Struct, Transform,
@@ -465,6 +465,19 @@ impl RecordBatchTransformer {
                                 pos_meta.id.to_string(),
                             )])),
                     ))
+                } else if *field_id == RESERVED_FIELD_ID_DELETED {
+                    let deleted_meta = get_metadata_field(*field_id)?;
+                    Ok(Arc::new(
+                        Field::new(
+                            &deleted_meta.name,
+                            DataType::Boolean,
+                            !deleted_meta.required,
+                        )
+                        .with_metadata(HashMap::from([(
+                            PARQUET_FIELD_ID_META_KEY.to_string(),
+                            deleted_meta.id.to_string(),
+                        )])),
+                    ))
                 } else {
                     Ok(field_id_to_mapped_schema_map
                         .get(field_id)
@@ -664,6 +677,18 @@ impl RecordBatchTransformer {
                         None => ColumnSource::Add {
                             target_type: DataType::Int64,
                             value: Some(PrimitiveLiteral::Long(file_sequence_number)),
+                        },
+                    });
+                }
+
+                if *field_id == RESERVED_FIELD_ID_DELETED {
+                    return Ok(match field_id_to_source_schema_map.get(field_id) {
+                        Some((_, source_index)) => ColumnSource::PassThrough {
+                            source_index: *source_index,
+                        },
+                        None => ColumnSource::Add {
+                            target_type: DataType::Boolean,
+                            value: Some(PrimitiveLiteral::Boolean(false)),
                         },
                     });
                 }
