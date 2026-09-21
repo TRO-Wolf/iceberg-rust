@@ -756,6 +756,11 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
         stripe_rows.iter().sum::<u64>(),
         "Footer.numberOfRows must equal the sum of stripe row counts"
     );
+    assert_eq!(
+        data_file.file_size_in_bytes(),
+        u64::try_from(bytes.len()).expect("the test file fits in a u64"),
+        "file_size_in_bytes must equal the exact on-disk byte count"
+    );
     let decoded = read_orc_data_bytes(bytes, &schema, 1024).expect("read the multi-stripe file");
     let expected = arrow_select::concat::concat_batches(&batch.schema(), &batches)
         .expect("concatenate the written batches");
