@@ -956,10 +956,12 @@ impl ArrowReader {
                 batch,
                 &mut record_batch_transformer,
                 &mut absolute_pos,
-                positional_deletes.as_ref(),
+                super::pos_apply::BatchDeleteInputs {
+                    positional_deletes: positional_deletes.as_ref(),
+                    eq_delete_predicate: eq_delete_predicate.as_ref(),
+                    eq_delete_sets: eq_delete_sets.as_deref(),
+                },
                 residual_predicate.as_deref(),
-                eq_delete_predicate.as_ref(),
-                eq_delete_sets.as_deref(),
                 task.project_field_ids()
                     .contains(&RESERVED_FIELD_ID_DELETED),
             )
@@ -991,10 +993,12 @@ impl ArrowReader {
                 batch,
                 &mut record_batch_transformer,
                 &mut absolute_pos,
-                positional_deletes.as_ref(),
+                super::pos_apply::BatchDeleteInputs {
+                    positional_deletes: positional_deletes.as_ref(),
+                    eq_delete_predicate: eq_delete_predicate.as_ref(),
+                    eq_delete_sets: eq_delete_sets.as_deref(),
+                },
                 residual_predicate.as_deref(),
-                eq_delete_predicate.as_ref(),
-                eq_delete_sets.as_deref(),
                 task.project_field_ids()
                     .contains(&RESERVED_FIELD_ID_DELETED),
             ) {
@@ -8793,8 +8797,8 @@ mod parquet_eq_keyset_mor_tests {
     use tempfile::TempDir;
 
     use super::eq_delete_key_fields_projected;
+    use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::equality_delete_set::EqDeleteKeySet;
-    use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::io::FileIO;
     use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
     use crate::spec::{

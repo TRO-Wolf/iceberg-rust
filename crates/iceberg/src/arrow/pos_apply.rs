@@ -32,14 +32,18 @@ use crate::expr::BoundPredicate;
 use crate::metadata_columns::RESERVED_COL_NAME_DELETED;
 use crate::{Error, ErrorKind};
 
+pub(super) struct BatchDeleteInputs<'a> {
+    pub(super) positional_deletes: Option<&'a Arc<DeleteVector>>,
+    pub(super) eq_delete_predicate: Option<&'a BoundPredicate>,
+    pub(super) eq_delete_sets: Option<&'a [EqDeleteKeySet]>,
+}
+
 pub(super) fn apply_pos_aware_batch(
     batch: RecordBatch,
     transformer: &mut RecordBatchTransformer,
     absolute_pos: &mut u64,
-    positional_deletes: Option<&Arc<DeleteVector>>,
+    deletes: BatchDeleteInputs<'_>,
     residual_predicate: Option<&BoundPredicate>,
-    eq_delete_predicate: Option<&BoundPredicate>,
-    eq_delete_sets: Option<&[EqDeleteKeySet]>,
     include_deleted: bool,
 ) -> Result<RecordBatch> {
     let row_count = batch.num_rows();
@@ -66,10 +70,10 @@ pub(super) fn apply_pos_aware_batch(
             &batch,
             row_count,
             batch_base,
-            positional_deletes,
+            deletes.positional_deletes,
             residual_predicate,
-            eq_delete_predicate,
-            eq_delete_sets,
+            deletes.eq_delete_predicate,
+            deletes.eq_delete_sets,
         )?;
         return match mask {
             None => Ok(transformed),
@@ -86,10 +90,10 @@ pub(super) fn apply_pos_aware_batch(
         &batch,
         row_count,
         batch_base,
-        positional_deletes,
+        deletes.positional_deletes,
         None,
-        eq_delete_predicate,
-        eq_delete_sets,
+        deletes.eq_delete_predicate,
+        deletes.eq_delete_sets,
     )?;
     let residual_mask = match residual_predicate {
         None => None,
@@ -353,7 +357,10 @@ mod test {
     use parquet::schema::types::SchemaDescriptor;
     use roaring::RoaringTreemap;
 
-    use super::{apply_pos_aware_batch, apply_pushdown_path_batch, selected_groups_start_ordinal};
+    use super::{
+        BatchDeleteInputs, apply_pos_aware_batch, apply_pushdown_path_batch,
+        selected_groups_start_ordinal,
+    };
     use crate::arrow::equality_delete_set::EqDeleteKeySet;
     use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
     use crate::delete_vector::DeleteVector;
@@ -578,9 +585,11 @@ mod test {
             batch,
             &mut transformer,
             &mut absolute_pos,
-            Some(&deletes),
-            None,
-            None,
+            BatchDeleteInputs {
+                positional_deletes: Some(&deletes),
+                eq_delete_predicate: None,
+                eq_delete_sets: None,
+            },
             None,
             true,
         )
