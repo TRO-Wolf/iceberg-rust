@@ -125,6 +125,13 @@ fn snapshot_scope_refused(table_name: &str) -> Error {
     )
 }
 
+fn snapshot_scope_needs_reconstruction(table_name: &str, reason: &str) -> Error {
+    Error::new(
+        ErrorKind::FeatureUnsupported,
+        format!("{table_name}: snapshot scope needs historical metadata reconstruction: {reason}"),
+    )
+}
+
 impl IcebergMetadataTableProvider {
     pub async fn scan(self) -> DFResult<BoxStream<'static, DFResult<RecordBatch>>> {
         let metadata_table = self.table.inspect();
@@ -194,11 +201,17 @@ impl IcebergMetadataTableProvider {
                 None => metadata_table.history().scan().await,
             },
             MetadataTableType::Refs => match snapshot_id {
-                Some(_) => Err(snapshot_scope_refused(&table_name)),
+                Some(_) => Err(snapshot_scope_needs_reconstruction(
+                    &table_name,
+                    "refs are live named pointers, not retained per-snapshot state",
+                )),
                 None => metadata_table.refs().scan().await,
             },
             MetadataTableType::MetadataLogEntries => match snapshot_id {
-                Some(_) => Err(snapshot_scope_refused(&table_name)),
+                Some(_) => Err(snapshot_scope_needs_reconstruction(
+                    &table_name,
+                    "entries need the historical metadata file for that snapshot",
+                )),
                 None => metadata_table.metadata_log_entries().scan().await,
             },
             MetadataTableType::Partitions => match snapshot_id {
