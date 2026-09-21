@@ -89,6 +89,7 @@ mod rewrite_files;
 pub use rewrite_files::RewriteFilesAction;
 mod rewrite_manifests;
 mod rewrite_manifests_cluster;
+mod rewrite_manifests_sort;
 // Re-exported so the action type is nameable as a return type — it is handed out by both
 // `Transaction::rewrite_manifests()` and `maintenance::Actions::rewrite_manifests()`.
 pub use rewrite_manifests::RewriteManifestsAction;
@@ -169,7 +170,6 @@ impl Transaction {
             latest_attempt_snapshot_ids: vec![],
         }
     }
-
     fn starting_snapshot_for(&self, branch: &str) -> Option<i64> {
         self.starting_ref_snapshot_ids
             .get(branch)

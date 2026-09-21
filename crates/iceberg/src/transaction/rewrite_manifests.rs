@@ -81,15 +81,16 @@ pub struct RewriteManifestsAction {
     /// The cluster-key function (Java `clusterByFunc`). `None` ⇒ no clustered rewrite is performed.
     pub(super) cluster_by: Option<ClusterByFunction>,
     pub(super) cluster_by_columns: Option<Vec<String>>,
+    pub(super) sort_by_columns: Option<Vec<String>>,
     /// The rewrite predicate (Java `predicate`). `None` ⇒ all data manifests match (rewrite all).
-    rewrite_if: Option<RewriteIfPredicate>,
+    pub(super) rewrite_if: Option<RewriteIfPredicate>,
     /// Manifests to delete explicitly (Java `deletedManifests`), matched against the current snapshot by
     /// path. Each must carry a balancing [`Self::added_manifests`] entry or `validateFilesCounts` fires.
     pub(super) deleted_manifests: Vec<ManifestFile>,
     /// Manifests to add explicitly (Java `addedManifests`); each must carry only existing entries with an
     /// unassigned snapshot id + sequence number (validated in [`Self::add_manifest`]).
     added_manifests: Vec<ManifestFile>,
-    rewrite_delete_manifests: bool,
+    pub(super) rewrite_delete_manifests: bool,
     /// User-supplied snapshot summary properties (Java `RewriteManifests.set`).
     snapshot_properties: HashMap<String, String>,
     commit_uuid: Option<Uuid>,
@@ -101,6 +102,7 @@ impl RewriteManifestsAction {
         Self {
             cluster_by: None,
             cluster_by_columns: None,
+            sort_by_columns: None,
             rewrite_if: None,
             rewrite_delete_manifests: false,
             deleted_manifests: vec![],
@@ -287,16 +289,14 @@ impl TransactionAction for RewriteManifestsAction {
         // validateDeletedManifests (Java L286-298): every delete_manifest arg must be present in the
         // current manifest list (matched by path — ManifestFile equality is path-based in Java).
         self.validate_deleted_manifests(&current_manifests, current_snapshot_id)?;
-
         // Partition current manifests into KEPT vs REWRITTEN and produce the new cluster manifests.
         let rewrite_outcome = self
-            .perform_rewrite(
+            .perform_selected_rewrite(
                 &mut snapshot_producer,
                 &current_manifests,
                 target_size_bytes,
             )
             .await?;
-
         // validateFilesCounts (Java L300-329): Σ active files over created == Σ over replaced.
         validate_files_counts(
             &rewrite_outcome.new_manifests,
@@ -345,17 +345,17 @@ impl TransactionAction for RewriteManifestsAction {
     }
 }
 
-struct RewriteOutcome {
-    new_manifests: Vec<ManifestFile>,
-    new_manifest_count: usize,
-    rewritten_manifests: Vec<ManifestFile>,
-    kept_manifests: Vec<ManifestFile>,
-    kept_count: usize,
-    entries_processed: u64,
+pub(super) struct RewriteOutcome {
+    pub(super) new_manifests: Vec<ManifestFile>,
+    pub(super) new_manifest_count: usize,
+    pub(super) rewritten_manifests: Vec<ManifestFile>,
+    pub(super) kept_manifests: Vec<ManifestFile>,
+    pub(super) kept_count: usize,
+    pub(super) entries_processed: u64,
 }
 
 impl RewriteManifestsAction {
-    async fn perform_rewrite(
+    pub(super) async fn perform_rewrite(
         &self,
         snapshot_producer: &mut SnapshotProducer<'_>,
         current_manifests: &[ManifestFile],
