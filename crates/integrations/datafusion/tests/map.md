@@ -63,12 +63,14 @@ Integration tests for `iceberg-datafusion`. They register an `IcebergTableProvid
 | `rewrite_size_shared/` | Shared machinery for the F-REWRITE-SIZE-1 measurement targets: the RePark-shaped bed (206 `INSERT INTO` files of `ts TIMESTAMP, grp STRING, id BIGINT`, `grp = g{batch % 20}`, `id`/`ts` globally monotonic), a low-cardinality bed (`id`, `grp` = `g{id % 8}` interleaved, 100 files × 2 000 rows), live-file footer inspection (`parquet::file::reader` per column chunk incl. `column_dictionary_evidence` dict-page/encoding counts), the `WriterProperties` dump, the `manual_rewrite` flip harness used to vary one parquet writer property at a time, and the S2-21 counting `Storage`/`FileRead` harness (`CountingStorageFactory`, `create_counting_fixture`) that records every byte range fetched per file |
 | `rewrite_size_probe.rs` | F-REWRITE-SIZE-1 step 1 measurement probe (`#[ignore]`d, run with `--ignored`): reproduces the RePark bed at `write.parquet.compression-level=3` (the Spark-side input), removes the property, runs the real `rewrite_data_files` at fork defaults, prints per-file/per-chunk footers, first-50-row order, the `WriterProperties` table for both paths, and the one-at-a-time flip table; asserts the bed ratio window and the post-fix ≤1.05× out/in bound |
 | `rewrite_size_pin.rs` | F-REWRITE-SIZE-1 step 2 pins (CI-run, not ignored): (a) RePark bed rewrite output ≤ 1.05× input compressed bytes; (b) low-cardinality bed — output ≤ 1.05× input AND every `grp` chunk keeps a dictionary page with dictionary-encoded data pages while the near-unique `id` writes no dictionary page; (c) an INSERT without `write.parquet.compression-level` byte-matches an explicit level-3 write and differs from level-1 (footers do not store the level — proven by bytes); (d) S2-21 fuse pin — over a whole rewrite each input file's footer tail is fetched exactly once and no byte range is fetched twice |
+| `stage_only.rs` | F-STAGE-ONLY-2: `IcebergTableProvider::with_stage_only(true)` stages SQL INSERT and INSERT OVERWRITE (new snapshot, `main` unmoved, staged op/parent pinned, main scan unchanged); staged commit on a named branch leaves the branch unmoved; near misses (plain append/overwrite advance `main`, branch-only still targets the branch) |
 
 ## I want to...
 
 | I want to... | go to |
 |---|---|
 | Pin `with_commit_branch` scan + commit | `commit_branch.rs` |
+| Pin `with_stage_only` staged INSERT / OVERWRITE | `stage_only.rs` |
 | Pin the Spark-equal DV container layout | `shared_puffin_dv/container.rs`, `interop_f18_dv_sibling_close.rs` |
 | Pin fanout INSERT file order | `fanout_insert_order.rs` |
 | Pin sorted INSERT per-file order + stamp | `sorted_insert.rs` |
