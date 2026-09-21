@@ -239,7 +239,7 @@ impl SchemaProvider for IcebergSchemaProvider {
             return match self.resolve_table(table_name).await? {
                 Some(table) => {
                     let metadata_table = table
-                        .metadata_table(metadata_table_type)
+                        .metadata_table(metadata_table_type, None)
                         .await
                         .map_err(to_datafusion_error)?;
                     Ok(Some(Arc::new(metadata_table)))

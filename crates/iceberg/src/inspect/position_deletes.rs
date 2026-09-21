@@ -72,6 +72,7 @@ pub struct PositionDeletesTable<'a> {
     table: &'a Table,
     /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.
     unified_partition_type: StructType,
+    scope: MetadataScope,
 }
 
 impl<'a> PositionDeletesTable<'a> {
@@ -88,6 +89,17 @@ impl<'a> PositionDeletesTable<'a> {
         Ok(Self {
             table,
             unified_partition_type,
+            scope: MetadataScope::CurrentSnapshot,
+        })
+    }
+
+    #[allow(missing_docs)]
+    pub fn try_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        let unified_partition_type = table.metadata().unified_partition_type()?;
+        Ok(Self {
+            table,
+            unified_partition_type,
+            scope: MetadataScope::Snapshot(snapshot_id),
         })
     }
 
@@ -102,6 +114,7 @@ impl<'a> PositionDeletesTable<'a> {
             Err(_) => Self {
                 table,
                 unified_partition_type: table.metadata().default_partition_type().clone(),
+                scope: MetadataScope::CurrentSnapshot,
             },
         }
     }
@@ -221,8 +234,7 @@ impl<'a> PositionDeletesTable<'a> {
         let mut partition_evaluators: HashMap<i32, Arc<ExpressionEvaluator>> = HashMap::new();
         let mut residual_evaluators: HashMap<i32, Arc<ResidualEvaluator>> = HashMap::new();
 
-        let manifest_files =
-            collect_manifest_files(self.table, MetadataScope::CurrentSnapshot).await?;
+        let manifest_files = collect_manifest_files(self.table, self.scope).await?;
         let schema_fallback = Some(table_schema.clone());
         let mut tasks = Vec::new();
         for manifest_file in &manifest_files {

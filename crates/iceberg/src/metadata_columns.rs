@@ -26,7 +26,9 @@ use std::sync::Arc;
 
 use once_cell::sync::Lazy;
 
-use crate::spec::{FormatVersion, NestedField, NestedFieldRef, PrimitiveType, Schema, Type, join};
+use crate::spec::{
+    FormatVersion, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType, Type, join,
+};
 use crate::{Error, ErrorKind, Result};
 
 /// Reserved field ID for the file path (_file) column per Iceberg spec
@@ -357,6 +359,16 @@ pub fn schema_with_row_lineage(schema: &Schema) -> Result<Schema> {
     join(schema, &lineage)
 }
 
+pub(crate) fn schema_with_partition(
+    schema: &Schema,
+    partition_union: &StructType,
+) -> Result<Schema> {
+    let extra = Schema::builder()
+        .with_fields(vec![partition_field(partition_union.fields().to_vec())])
+        .build()?;
+    join(schema, &extra)
+}
+
 /// Creates the Iceberg field definition for the _partition metadata column.
 ///
 /// The _partition field is a struct whose fields depend on the partition spec.
@@ -390,10 +402,8 @@ pub fn schema_with_row_lineage(schema: &Schema) -> Result<Schema> {
 /// let partition_field = partition_field(fields);
 /// ```
 pub fn partition_field(partition_fields: Vec<NestedFieldRef>) -> NestedFieldRef {
-    use crate::spec::StructType;
-
     Arc::new(
-        NestedField::required(
+        NestedField::optional(
             RESERVED_FIELD_ID_PARTITION,
             RESERVED_COL_NAME_PARTITION,
             Type::Struct(StructType::new(partition_fields)),
@@ -550,7 +560,7 @@ mod tests {
         // Verify field properties
         assert_eq!(partition.id, RESERVED_FIELD_ID_PARTITION);
         assert_eq!(partition.name, RESERVED_COL_NAME_PARTITION);
-        assert!(partition.required);
+        assert!(!partition.required);
 
         // Verify it's a struct type with correct fields
         if let Type::Struct(struct_type) = partition.field_type.as_ref() {
@@ -630,5 +640,39 @@ mod tests {
         assert!(!joined.as_struct().fields()[2].required);
         assert!(format_supports_row_lineage(crate::spec::FormatVersion::V3));
         assert!(!format_supports_row_lineage(crate::spec::FormatVersion::V2));
+    }
+
+    #[test]
+    fn schema_with_partition_appends_optional_union_struct() {
+        use crate::spec::{Schema, StructType};
+
+        let schema = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let union = StructType::new(vec![Arc::new(NestedField::optional(
+            1000,
+            "cat",
+            Type::Primitive(PrimitiveType::String),
+        ))]);
+        let joined = schema_with_partition(&schema, &union).expect("join");
+        assert_eq!(joined.schema_id(), 1);
+        assert_eq!(joined.as_struct().fields().len(), 2);
+        let partition = joined
+            .field_by_id(RESERVED_FIELD_ID_PARTITION)
+            .expect("partition field");
+        assert!(!partition.required);
+        assert_eq!(partition.name, RESERVED_COL_NAME_PARTITION);
+        if let Type::Struct(struct_type) = partition.field_type.as_ref() {
+            assert_eq!(struct_type.fields().len(), 1);
+            assert_eq!(struct_type.fields()[0].name, "cat");
+        } else {
+            panic!("Expected struct type for _partition field");
+        }
     }
 }

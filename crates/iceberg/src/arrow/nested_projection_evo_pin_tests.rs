@@ -63,6 +63,7 @@ fn identical_nested_column_on_a_modify_batch_uses_pass_through() {
         &HashMap::new(),
         None,
         None,
+        None,
     )
     .unwrap();
     let BatchTransform::Modify { operations, .. } = transform else {

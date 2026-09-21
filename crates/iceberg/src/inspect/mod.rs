@@ -29,7 +29,7 @@ mod manifests;
 mod metadata_log_entries;
 mod metadata_table;
 mod partition_summary;
-mod partition_values;
+pub(crate) mod partition_values;
 mod partitions;
 mod position_deletes;
 #[cfg(test)]

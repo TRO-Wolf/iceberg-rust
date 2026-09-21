@@ -142,9 +142,10 @@ impl IcebergTableProvider {
     pub(crate) async fn metadata_table(
         &self,
         r#type: MetadataTableType,
+        snapshot_id: Option<i64>,
     ) -> Result<IcebergMetadataTableProvider> {
         let table = self.catalog.load_table(&self.table_ident).await?;
-        IcebergMetadataTableProvider::try_new(table, r#type)
+        IcebergMetadataTableProvider::try_new(table, r#type, snapshot_id)
     }
 }
 

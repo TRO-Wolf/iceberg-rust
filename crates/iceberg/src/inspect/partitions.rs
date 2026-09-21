@@ -68,6 +68,7 @@ pub struct PartitionsTable<'a> {
     table: &'a Table,
     /// Java `Partitioning.partitionType(table)` — stored so [`Self::schema`] stays infallible.
     unified_partition_type: StructType,
+    snapshot_id: Option<i64>,
 }
 
 impl<'a> PartitionsTable<'a> {
@@ -84,6 +85,17 @@ impl<'a> PartitionsTable<'a> {
         Ok(Self {
             table,
             unified_partition_type,
+            snapshot_id: None,
+        })
+    }
+
+    #[allow(missing_docs)]
+    pub fn try_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        let unified_partition_type = table.metadata().unified_partition_type()?;
+        Ok(Self {
+            table,
+            unified_partition_type,
+            snapshot_id: Some(snapshot_id),
         })
     }
 
@@ -98,6 +110,7 @@ impl<'a> PartitionsTable<'a> {
             Err(_) => Self {
                 table,
                 unified_partition_type: table.metadata().default_partition_type().clone(),
+                snapshot_id: None,
             },
         }
     }
@@ -211,7 +224,16 @@ impl<'a> PartitionsTable<'a> {
         // Aggregate the live entries by coerced partition value (Java
         // `PartitionUtil.coercePartition` into `Partitioning.partitionType`).
         let mut partitions: HashMap<Struct, Partition> = HashMap::new();
-        if let Some(snapshot) = metadata.current_snapshot() {
+        let snapshot = match self.snapshot_id {
+            Some(snapshot_id) => Some(metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot find snapshot: {snapshot_id}"),
+                )
+            })?),
+            None => metadata.current_snapshot(),
+        };
+        if let Some(snapshot) = snapshot {
             let manifest_list = snapshot
                 .load_manifest_list(self.table.file_io(), metadata)
                 .await?;

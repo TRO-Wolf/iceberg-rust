@@ -61,7 +61,11 @@ pub(crate) fn plan_row_filter(
     parquet_schema: &SchemaDescriptor,
     stamped_arrow_schema: &ArrowSchemaRef,
     iceberg_field_ids: &HashSet<i32>,
+    force_residual: bool,
 ) -> Result<RowFilterPlan> {
+    if force_residual {
+        return Ok(RowFilterPlan::Residual);
+    }
     let leaf_lists = match build_field_id_leaf_lists(parquet_schema)? {
         Some(lists) => lists,
         None => {

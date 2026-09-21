@@ -116,6 +116,11 @@ impl<'a> EntriesTable<'a> {
         Self::construct(table, MetadataScope::AllSnapshots)
     }
 
+    #[allow(missing_docs)]
+    pub fn try_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        Self::try_construct(table, MetadataScope::Snapshot(snapshot_id))
+    }
+
     fn try_construct(table: &'a Table, scope: MetadataScope) -> Result<Self> {
         let unified_partition_type = table.metadata().unified_partition_type()?;
         Ok(Self {
