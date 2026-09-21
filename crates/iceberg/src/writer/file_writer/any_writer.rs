@@ -279,13 +279,8 @@ mod tests {
                 break;
             }
         }
-        let magnitude =
-            i64::try_from(raw >> 1).expect("the OCF zigzag magnitude must fit in i64");
-        if raw & 1 == 0 {
-            magnitude
-        } else {
-            !magnitude
-        }
+        let magnitude = i64::try_from(raw >> 1).expect("the OCF zigzag magnitude must fit in i64");
+        if raw & 1 == 0 { magnitude } else { !magnitude }
     }
 
     fn ocf_read_bytes<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
@@ -681,8 +676,7 @@ mod tests {
     #[test]
     fn ocf_codec_name_ignores_key_order() {
         fn push_long(out: &mut Vec<u8>, value: i64) {
-            let mut raw =
-                u64::try_from(value).expect("the fixture long must be positive") << 1;
+            let mut raw = u64::try_from(value).expect("the fixture long must be positive") << 1;
             loop {
                 let chunk = u8::try_from(raw & 0x7f).expect("seven bits must fit in a byte");
                 raw >>= 7;
