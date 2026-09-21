@@ -180,6 +180,8 @@ mod tests {
     use apache_avro::Reader as AvroReader;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
     use arrow_schema::SchemaRef as ArrowSchemaRef;
+    use parquet::basic::Encoding;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use super::*;
     use crate::arrow::schema_to_arrow_schema;
@@ -281,6 +283,48 @@ mod tests {
         String::from_utf8(rest[..len].to_vec()).expect("the codec name must be utf-8")
     }
 
+    fn repeated_batch(schema: &Schema) -> RecordBatch {
+        let arrow_schema: ArrowSchemaRef =
+            Arc::new(schema_to_arrow_schema(schema).expect("iceberg schema to arrow schema"));
+        let words = ["alpha", "beta", "gamma", "delta"];
+        RecordBatch::try_new(arrow_schema, vec![
+            Arc::new(Int32Array::from(
+                (0..512).map(|i| Some(i % 8)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                (0..512).map(|i| Some(words[i % 4])).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ])
+        .expect("build the repeated batch")
+    }
+
+    fn parquet_columns_use_dictionary(bytes: bytes::Bytes) -> Vec<bool> {
+        let reader = SerializedFileReader::new(bytes).expect("read the parquet footer");
+        let metadata = reader.metadata();
+        assert!(
+            metadata.num_row_groups() > 0,
+            "the file must hold a row group"
+        );
+        let mut flags = Vec::new();
+        for row_group in metadata.row_groups() {
+            for column in row_group.columns() {
+                let dictionary_encoded = column.encodings().any(|encoding| {
+                    matches!(
+                        encoding,
+                        Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                    )
+                });
+                assert_eq!(
+                    column.dictionary_page_offset().is_some(),
+                    dictionary_encoded,
+                    "the dictionary page and the dictionary encoding must agree"
+                );
+                flags.push(dictionary_encoded);
+            }
+        }
+        flags
+    }
+
     fn for_format_default(format: DataFileFormat, schema: SchemaRef) -> AnyFileWriterBuilder {
         AnyFileWriterBuilder::for_format(
             format,
@@ -318,6 +362,58 @@ mod tests {
         assert_eq!(data_file.file_format(), DataFileFormat::Parquet);
         assert_eq!(data_file.record_count(), 3);
         assert!(data_file.file_size_in_bytes() > 0);
+    }
+
+    #[tokio::test]
+    async fn parquet_dictionary_follows_table_property() {
+        let (_temp, file_io, location_gen) = make_temp();
+        let schema = Arc::new(schema_simple());
+        let batch = repeated_batch(&schema);
+        let unset_builder = for_format_default(DataFileFormat::Parquet, schema.clone());
+        let (unset_path, _) = write_single_batch(
+            &unset_builder,
+            &file_io,
+            &location_gen,
+            "any-parquet-dict-unset",
+            DataFileFormat::Parquet,
+            &batch,
+        )
+        .await;
+        let enabled_properties = HashMap::from([(
+            "parquet.enable.dictionary".to_string(),
+            "true".to_string(),
+        )]);
+        let enabled_builder = AnyFileWriterBuilder::for_format(
+            DataFileFormat::Parquet,
+            schema.clone(),
+            &enabled_properties,
+            MetricsConfig::default(),
+            FieldMatchMode::Id,
+        )
+        .expect("route the parquet arm");
+        let (enabled_path, _) = write_single_batch(
+            &enabled_builder,
+            &file_io,
+            &location_gen,
+            "any-parquet-dict-on",
+            DataFileFormat::Parquet,
+            &batch,
+        )
+        .await;
+        let unset_flags =
+            parquet_columns_use_dictionary(read_back_bytes(&file_io, &unset_path).await);
+        let enabled_flags =
+            parquet_columns_use_dictionary(read_back_bytes(&file_io, &enabled_path).await);
+        assert!(!unset_flags.is_empty(), "the file must hold columns");
+        assert!(
+            unset_flags.iter().all(|flag| !flag),
+            "an unset property must leave dictionary encoding off"
+        );
+        assert!(!enabled_flags.is_empty(), "the file must hold columns");
+        assert!(
+            enabled_flags.iter().all(|flag| *flag),
+            "parquet.enable.dictionary=true must turn dictionary encoding on"
+        );
     }
 
     #[tokio::test]
