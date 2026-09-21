@@ -24,6 +24,8 @@ use super::CurrentFileStatus;
 use crate::Result;
 use crate::spec::{DataFileBuilder, SchemaRef};
 
+mod any_writer;
+pub use any_writer::{AnyFileWriter, AnyFileWriterBuilder};
 mod avro_reject;
 mod avro_writer;
 pub use avro_writer::{AvroWriter, AvroWriterBuilder};
