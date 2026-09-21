@@ -977,6 +977,16 @@ mod tests {
                 .iceberg_schema()
                 .expect("the builder must expose a schema");
             assert!(Arc::ptr_eq(exposed, &schema));
+            let (path, output) = output_file(&file_io, &location_gen, "any-status", format);
+            let mut writer = builder.build(output).await.expect("build the writer");
+            assert_eq!(writer.current_file_path(), path);
+            assert_eq!(writer.current_row_num(), 0);
+            let idle = writer.current_written_size();
+            writer.write(&batch).await.expect("write the batch");
+            assert_eq!(writer.current_file_path(), path);
+            assert_eq!(writer.current_row_num(), 3);
+            assert!(writer.current_written_size() > idle);
+            writer.close().await.expect("close the writer");
         }
     }
 }
