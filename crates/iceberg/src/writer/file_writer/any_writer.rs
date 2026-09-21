@@ -261,28 +261,78 @@ mod tests {
             .expect("read the written file")
     }
 
-    fn ocf_codec_name(bytes: &[u8]) -> String {
-        let key = b"avro.codec";
-        let start = bytes
-            .windows(key.len())
-            .position(|window| window == key)
-            .expect("the OCF header must carry an avro.codec key");
-        let mut rest = &bytes[start + key.len()..];
+    fn ocf_read_long(rest: &mut &[u8]) -> i64 {
         let mut shift = 0u32;
         let mut raw = 0u64;
         loop {
+            assert!(
+                shift < 70,
+                "the OCF header holds a malformed avro long past ten bytes"
+            );
             let byte = *rest
                 .first()
-                .expect("the codec value must be length-prefixed");
-            rest = &rest[1..];
+                .expect("the OCF header ends inside an avro long");
+            *rest = &rest[1..];
             raw |= u64::from(byte & 0x7f) << shift;
             shift += 7;
             if (byte & 0x80) == 0 {
                 break;
             }
         }
-        let len = (raw >> 1) as usize ^ 0usize.wrapping_sub((raw & 1) as usize);
-        String::from_utf8(rest[..len].to_vec()).expect("the codec name must be utf-8")
+        let magnitude =
+            i64::try_from(raw >> 1).expect("the OCF zigzag magnitude must fit in i64");
+        if raw & 1 == 0 {
+            magnitude
+        } else {
+            !magnitude
+        }
+    }
+
+    fn ocf_read_bytes<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
+        let len = ocf_read_long(rest);
+        let len = usize::try_from(len).expect("the OCF header holds a negative field length");
+        assert!(
+            rest.len() >= len,
+            "the OCF header ends inside a length-prefixed field"
+        );
+        let (head, tail) = rest.split_at(len);
+        *rest = tail;
+        head
+    }
+
+    fn ocf_codec_name(bytes: &[u8]) -> String {
+        assert!(
+            bytes.starts_with(b"Obj\x01"),
+            "the bytes must open with the OCF magic"
+        );
+        let mut rest = &bytes[4..];
+        loop {
+            let count = ocf_read_long(&mut rest);
+            if count == 0 {
+                break;
+            }
+            let count = if count < 0 {
+                let block_len = ocf_read_long(&mut rest);
+                assert!(
+                    block_len >= 0,
+                    "the OCF metadata block size must not be negative"
+                );
+                count
+                    .checked_neg()
+                    .expect("the OCF metadata block count must fit in i64")
+            } else {
+                count
+            };
+            for _ in 0..count {
+                let key = ocf_read_bytes(&mut rest);
+                let value = ocf_read_bytes(&mut rest);
+                if key == b"avro.codec" {
+                    return String::from_utf8(value.to_vec())
+                        .expect("the avro.codec value must be utf-8");
+                }
+            }
+        }
+        panic!("the OCF header must carry an avro.codec key");
     }
 
     async fn avro_codec_name_and_rows_for_property(value: &str) -> (String, usize) {
@@ -648,16 +698,12 @@ mod tests {
             push_long(out, len);
             out.extend_from_slice(field);
         }
-        let mut block = Vec::new();
-        push_bytes(&mut block, b"avro.codec.compression_level");
-        push_bytes(&mut block, &[6]);
-        push_bytes(&mut block, b"avro.codec");
-        push_bytes(&mut block, b"zstandard");
         let mut header = b"Obj\x01".to_vec();
         push_long(&mut header, 2);
-        let block_len = i64::try_from(block.len()).expect("the fixture block must fit in i64");
-        push_long(&mut header, block_len);
-        header.extend_from_slice(&block);
+        push_bytes(&mut header, b"avro.codec.compression_level");
+        push_bytes(&mut header, &[6]);
+        push_bytes(&mut header, b"avro.codec");
+        push_bytes(&mut header, b"zstandard");
         push_long(&mut header, 0);
         header.extend_from_slice(&[0u8; 16]);
         assert_eq!(ocf_codec_name(&header), "zstandard");
