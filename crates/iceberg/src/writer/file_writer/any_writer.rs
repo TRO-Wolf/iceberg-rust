@@ -178,8 +178,9 @@ mod tests {
     use std::sync::Arc;
 
     use apache_avro::Reader as AvroReader;
-    use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+    use arrow_array::{ArrayRef, Float32Array, Int32Array, RecordBatch, StringArray};
     use arrow_schema::SchemaRef as ArrowSchemaRef;
+    use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
     use parquet::basic::{Compression, Encoding};
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -235,6 +236,37 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("a"), Some("bb"), None])) as ArrayRef,
         ])
         .expect("build the simple batch")
+    }
+
+    fn schema_float() -> Schema {
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::optional(1, "c_int", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "c_float", Type::Primitive(PrimitiveType::Float)).into(),
+            ])
+            .build()
+            .expect("build the float schema")
+    }
+
+    fn diverged_name_batch() -> RecordBatch {
+        let fields = vec![
+            arrow_schema::Field::new("renamed_int", arrow_schema::DataType::Int32, true)
+                .with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "1".to_string(),
+                )])),
+            arrow_schema::Field::new("renamed_float", arrow_schema::DataType::Float32, true)
+                .with_metadata(HashMap::from([(
+                    PARQUET_FIELD_ID_META_KEY.to_string(),
+                    "2".to_string(),
+                )])),
+        ];
+        RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(Float32Array::from(vec![1.0, f32::NAN, 3.0])) as ArrayRef,
+        ])
+        .expect("build the diverged batch")
     }
 
     async fn write_single_batch(
@@ -556,6 +588,63 @@ mod tests {
                 "the gzip arm must emit GZIP, got {codec:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn parquet_match_mode_selects_field_resolution() {
+        let (_temp, file_io, location_gen) = make_temp();
+        let schema = Arc::new(schema_float());
+        let batch = diverged_name_batch();
+        let id_builder = AnyFileWriterBuilder::for_format(
+            DataFileFormat::Parquet,
+            schema.clone(),
+            &HashMap::new(),
+            MetricsConfig::default(),
+            FieldMatchMode::Id,
+        )
+        .expect("route the id arm");
+        let (_path, builders) = write_single_batch(
+            &id_builder,
+            &file_io,
+            &location_gen,
+            "any-parquet-id",
+            DataFileFormat::Parquet,
+            &batch,
+        )
+        .await;
+        assert_eq!(builders.len(), 1);
+        let data_file = builders
+            .into_iter()
+            .next()
+            .expect("one builder")
+            .build()
+            .expect("build the data file");
+        assert_eq!(data_file.record_count(), 3);
+        assert_eq!(data_file.nan_value_counts().get(&2), Some(&1));
+        let name_builder = AnyFileWriterBuilder::for_format(
+            DataFileFormat::Parquet,
+            schema.clone(),
+            &HashMap::new(),
+            MetricsConfig::default(),
+            FieldMatchMode::Name,
+        )
+        .expect("route the name arm");
+        let (_path, output) = output_file(
+            &file_io,
+            &location_gen,
+            "any-parquet-name",
+            DataFileFormat::Parquet,
+        );
+        let mut writer = name_builder
+            .build(output)
+            .await
+            .expect("build the name writer");
+        let err = writer
+            .write(&batch)
+            .await
+            .expect_err("diverged names must fail name matching");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(err.message(), "Field id 1 not found in struct array");
     }
 
     #[tokio::test]
