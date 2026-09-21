@@ -108,7 +108,7 @@ F-CHERRYPICK-WAP-ORDER-1. No cherry-pick gap found.
   `target_ref` keeps the default.
 - `mod publish_changes`, `mod stage_only_tests` and `mod
   stage_only_publish_tests` are `#[path]`-wired from `action.rs` — `mod.rs` sits
-  on its 1937-line legacy ceiling; the escape valve is the same one
+  on its 1936-line legacy ceiling; the escape valve is the same one
   `occ_scoped_tests.rs` uses. The publish pins split into their own file under
   the 1000-line ceiling, sharing fixtures through `pub(crate)` helpers.
 
@@ -137,7 +137,7 @@ Stage + lookup pins live in `stage_only_tests.rs`; publish pins live in
 
 ## 7. Mutation evidence
 
-### Critic-run mutations (rv-verify.json, round-1 head `b26c0ac`)
+### Critic-run mutations (rv-verify.json, round-1 head — a pre-rebase branch tip, no longer resolvable; no post-rebase commit carries that tree state)
 
 | # | mutation | result |
 |---|---|---|
@@ -222,14 +222,14 @@ is untouched (`stage_only: false` defaults pass through unchanged).
 
 ## Gates
 
-Round 2 (this head):
+Round 2 (re-measured 2026-09-21 after the rebase onto fork main `caebaf7e3`):
 
 - `cargo fmt --all -- --check` — clean
 - `CARGO_BUILD_JOBS=6 cargo clippy -q -p iceberg --all-targets -- -D warnings` — clean
 - `CARGO_BUILD_JOBS=6 RUST_TEST_THREADS=6 cargo test -q -p iceberg --lib transaction`
-  — 812 passed; 0 failed; 1 ignored (29 stage-only pins inside)
-- `python3 scripts/check_rust_file_size.py` — 606 files clean (90 legacy ceilings)
-- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/rd-fork origin/main` —
+  — 818 passed; 0 failed; 1 ignored (29 stage-only pins inside)
+- `python3 scripts/check_rust_file_size.py` — 634 files clean (90 legacy ceilings)
+- `python3 /tmp/oc-worker/_lib/comment_ban.py /tmp/xf-wap origin/main HEAD` —
   `comment-ban hits=0`
 - `git log --format='%B' origin/main..HEAD | grep -i co-authored` — no matches
 
