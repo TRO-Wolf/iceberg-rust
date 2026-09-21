@@ -748,23 +748,21 @@ async fn append_file(catalog: &MemoryCatalog, table: &Table, ids: &[i64], filena
     tx.commit(catalog).await.expect("commit fast append")
 }
 
+fn current_id(table: &Table) -> i64 {
+    match table.metadata().current_snapshot_id() {
+        Some(snapshot_id) => snapshot_id,
+        None => panic!("table has no current snapshot"),
+    }
+}
+
 async fn three_snapshot_table() -> (TempDir, MemoryCatalog, Table, i64, i64, i64) {
     let (tmp, catalog, table) = empty_table("snapshot_scope_three").await;
     let table = append_file(&catalog, &table, &[1], "00000-scope-3a.parquet").await;
-    let snap_a = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snap A is current");
+    let snap_a = current_id(&table);
     let table = append_file(&catalog, &table, &[2], "00000-scope-3b.parquet").await;
-    let snap_b = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snap B is current");
+    let snap_b = current_id(&table);
     let table = append_file(&catalog, &table, &[3], "00000-scope-3c.parquet").await;
-    let snap_c = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snap C is current");
+    let snap_c = current_id(&table);
     assert_ne!(snap_a, snap_b);
     assert_ne!(snap_b, snap_c);
     (tmp, catalog, table, snap_a, snap_b, snap_c)
@@ -773,15 +771,9 @@ async fn three_snapshot_table() -> (TempDir, MemoryCatalog, Table, i64, i64, i64
 async fn rollback_table() -> (TempDir, MemoryCatalog, Table, i64, i64, i64) {
     let (tmp, catalog, table) = empty_table("snapshot_scope_rollback").await;
     let table = append_file(&catalog, &table, &[1], "00000-scope-ra.parquet").await;
-    let snap_a = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snap A is current");
+    let snap_a = current_id(&table);
     let table = append_file(&catalog, &table, &[2], "00000-scope-rb.parquet").await;
-    let snap_b = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snap B is current");
+    let snap_b = current_id(&table);
     let tx = Transaction::new(&table);
     let tx = tx
         .manage_snapshots()
@@ -791,10 +783,7 @@ async fn rollback_table() -> (TempDir, MemoryCatalog, Table, i64, i64, i64) {
     let table = tx.commit(&catalog).await.expect("commit rollback to A");
     assert_eq!(table.metadata().current_snapshot_id(), Some(snap_a));
     let table = append_file(&catalog, &table, &[3], "00000-scope-rc.parquet").await;
-    let snap_c = table
-        .metadata()
-        .current_snapshot_id()
-        .expect("snap C is current");
+    let snap_c = current_id(&table);
     (tmp, catalog, table, snap_a, snap_b, snap_c)
 }
 
@@ -863,6 +852,28 @@ fn history_rows(batches: &[RecordBatch]) -> Vec<(i64, bool)> {
     rows
 }
 
+async fn snapshots_at(table: &Table, snapshot_id: i64) -> Vec<RecordBatch> {
+    collect_batches(
+        SnapshotsTable::try_at_snapshot(table, snapshot_id)
+            .expect("snapshots at snapshot")
+            .scan()
+            .await
+            .expect("scan snapshots at snapshot"),
+    )
+    .await
+}
+
+async fn history_at(table: &Table, snapshot_id: i64) -> Vec<RecordBatch> {
+    collect_batches(
+        HistoryTable::try_at_snapshot(table, snapshot_id)
+            .expect("history at snapshot")
+            .scan()
+            .await
+            .expect("scan history at snapshot"),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn snapshots_at_snapshot_returns_exact_id_set_with_inclusive_bound() {
     let (_tmp, _catalog, table, snap_a, snap_b, snap_c) = three_snapshot_table().await;
@@ -879,23 +890,9 @@ async fn snapshots_at_snapshot_returns_exact_id_set_with_inclusive_bound() {
         &[1000, 2000, 2000],
     )
     .await;
-    let at_a = collect_batches(
-        SnapshotsTable::try_at_snapshot(&table, snap_a)
-            .expect("snapshots at A")
-            .scan()
-            .await
-            .expect("scan snapshots at A"),
-    )
-    .await;
+    let at_a = snapshots_at(&table, snap_a).await;
     assert_eq!(long_column(&at_a, "snapshot_id"), vec![snap_a]);
-    let at_b = collect_batches(
-        SnapshotsTable::try_at_snapshot(&table, snap_b)
-            .expect("snapshots at B")
-            .scan()
-            .await
-            .expect("scan snapshots at B"),
-    )
-    .await;
+    let at_b = snapshots_at(&table, snap_b).await;
     let mut expected = vec![snap_a, snap_b, snap_c];
     expected.sort();
     assert_eq!(long_column(&at_b, "snapshot_id"), expected);
@@ -922,35 +919,17 @@ async fn history_at_snapshot_truncates_log_and_recomputes_ancestors() {
         .collect();
     assert_eq!(log_ids, vec![snap_a, snap_b, snap_a, snap_c]);
     assert_eq!(table.metadata().current_snapshot_id(), Some(snap_c));
-    let parent_c = table
-        .metadata()
-        .snapshot_by_id(snap_c)
-        .expect("snapshot C")
-        .parent_snapshot_id();
-    assert_eq!(parent_c, Some(snap_a));
+    let snapshot_c = table.metadata().snapshot_by_id(snap_c).expect("snapshot C");
+    assert_eq!(snapshot_c.parent_snapshot_id(), Some(snap_a));
     let table = retimestamped_table(
         &table,
         &[(snap_a, 1000), (snap_b, 2000), (snap_c, 4000)],
         &[1000, 2000, 3000, 4000],
     )
     .await;
-    let at_b = collect_batches(
-        HistoryTable::try_at_snapshot(&table, snap_b)
-            .expect("history at B")
-            .scan()
-            .await
-            .expect("scan history at B"),
-    )
-    .await;
+    let at_b = history_at(&table, snap_b).await;
     assert_eq!(history_rows(&at_b), vec![(snap_a, true), (snap_b, true)]);
-    let at_c = collect_batches(
-        HistoryTable::try_at_snapshot(&table, snap_c)
-            .expect("history at C")
-            .scan()
-            .await
-            .expect("scan history at C"),
-    )
-    .await;
+    let at_c = history_at(&table, snap_c).await;
     assert_eq!(history_rows(&at_c), vec![
         (snap_a, true),
         (snap_b, false),
