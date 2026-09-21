@@ -79,6 +79,7 @@ struct TestFileLayout {
     postscript_version: Vec<u64>,
     postscript_magic: Vec<u8>,
     stripe_timezones: Vec<Vec<u8>>,
+    type_attributes: Vec<std::collections::HashMap<String, String>>,
 }
 
 fn test_read_stripe_record(body: &[u8]) -> (u64, u64, u64, u64) {
@@ -113,6 +114,49 @@ fn test_read_timezone(stripe_footer: &[u8]) -> Vec<u8> {
         }
     }
     Vec::new()
+}
+
+fn test_read_string_pair(body: &[u8]) -> (String, String) {
+    let mut at = 0;
+    let mut key = String::new();
+    let mut value = String::new();
+    while at < body.len() {
+        let sub = test_read_varint(body, &mut at);
+        match (sub >> 3, sub & 7) {
+            (1, 2) => {
+                let len = test_read_varint(body, &mut at) as usize;
+                key = String::from_utf8(body[at..at + len].to_vec())
+                    .expect("type attribute keys are utf-8");
+                at += len;
+            }
+            (2, 2) => {
+                let len = test_read_varint(body, &mut at) as usize;
+                value = String::from_utf8(body[at..at + len].to_vec())
+                    .expect("type attribute values are utf-8");
+                at += len;
+            }
+            (_, wire) => test_skip_field(body, &mut at, wire),
+        }
+    }
+    (key, value)
+}
+
+fn test_read_type_attributes(body: &[u8]) -> std::collections::HashMap<String, String> {
+    let mut at = 0;
+    let mut attributes = std::collections::HashMap::new();
+    while at < body.len() {
+        let sub = test_read_varint(body, &mut at);
+        match (sub >> 3, sub & 7) {
+            (7, 2) => {
+                let len = test_read_varint(body, &mut at) as usize;
+                let (key, value) = test_read_string_pair(&body[at..at + len]);
+                attributes.insert(key, value);
+                at += len;
+            }
+            (_, wire) => test_skip_field(body, &mut at, wire),
+        }
+    }
+    attributes
 }
 
 fn test_file_layout(file: &[u8]) -> TestFileLayout {
@@ -162,6 +206,7 @@ fn test_file_layout(file: &[u8]) -> TestFileLayout {
     let mut content_length = 0;
     let mut row_index_stride = 0;
     let mut stripes = Vec::new();
+    let mut type_attributes = Vec::new();
     while at < footer.len() {
         let key = test_read_varint(&footer, &mut at);
         match (key >> 3, key & 7) {
@@ -172,6 +217,11 @@ fn test_file_layout(file: &[u8]) -> TestFileLayout {
             (3, 2) => {
                 let len = test_read_varint(&footer, &mut at) as usize;
                 stripes.push(test_read_stripe_record(&footer[at..at + len]));
+                at += len;
+            }
+            (4, 2) => {
+                let len = test_read_varint(&footer, &mut at) as usize;
+                type_attributes.push(test_read_type_attributes(&footer[at..at + len]));
                 at += len;
             }
             (_, wire) => test_skip_field(&footer, &mut at, wire),
@@ -209,5 +259,6 @@ fn test_file_layout(file: &[u8]) -> TestFileLayout {
         postscript_version: version,
         postscript_magic: magic,
         stripe_timezones,
+        type_attributes,
     }
 }
