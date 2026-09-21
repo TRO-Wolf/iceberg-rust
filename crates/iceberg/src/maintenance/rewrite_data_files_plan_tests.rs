@@ -26,7 +26,7 @@ use crate::maintenance::rewrite_data_files_plan::{
     write_max_file_size,
 };
 use crate::scan::FileScanTask;
-use crate::spec::{Literal, PartitionSpec, Struct, Transform};
+use crate::spec::{Literal, Map, PartitionSpec, PrimitiveLiteral, Struct, Transform};
 
 /// Partition grouping. Different partition values never share a group, and a task of a
 /// non-default spec buckets as unpartitioned.
@@ -219,4 +219,150 @@ fn test_pack_bins_forward_first_fit() {
         sizes_of(&pack_bins(tasks, |task| task.file_size_in_bytes, 6)),
         vec![vec![7], vec![2, 2]]
     );
+}
+
+#[test]
+fn test_plan_file_groups_partition_order_sorted_and_repeatable() {
+    let (spec, schema) = synthetic_spec_and_schema();
+    let config = config_for(100, 75, 180, 2);
+    let plan_order = || {
+        let tasks = vec![
+            synthetic_task("b1", 10, 2, 0, &spec, &schema),
+            synthetic_task("b2", 10, 2, 0, &spec, &schema),
+            synthetic_task("a1", 10, 0, 0, &spec, &schema),
+            synthetic_task("a2", 10, 0, 0, &spec, &schema),
+            synthetic_task("c1", 10, 1, 0, &spec, &schema),
+            synthetic_task("c2", 10, 1, 0, &spec, &schema),
+        ];
+        plan_file_groups(tasks, &config, &spec)
+            .iter()
+            .map(|group| {
+                let task = group
+                    .first()
+                    .expect("planned group holds its partition tasks");
+                let value = task
+                    .partition
+                    .as_ref()
+                    .expect("synthetic task carries a partition")
+                    .fields()
+                    .first()
+                    .expect("identity(x) partition holds one value")
+                    .as_ref()
+                    .expect("partition value is non-null");
+                match value {
+                    Literal::Primitive(PrimitiveLiteral::Long(part)) => *part,
+                    other => panic!("expected long partition value, saw {other:?}"),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = plan_order();
+    assert_eq!(
+        first,
+        vec![0, 1, 2],
+        "groups emit in ascending partition order"
+    );
+    for _ in 0..50 {
+        assert_eq!(
+            plan_order(),
+            first,
+            "group order is identical on every plan call"
+        );
+    }
+}
+
+#[test]
+fn test_plan_file_groups_partition_order_null_empty_and_nested_values() {
+    let (spec, schema) = synthetic_spec_and_schema();
+    let config = config_for(100, 75, 180, 2);
+    let single_pair_map = |key: &str, value: i64| {
+        let mut map = Map::new();
+        map.insert(Literal::string(key), Some(Literal::long(value)));
+        Struct::from_iter([Some(Literal::Map(map))])
+    };
+    let two_pair_map = |first: &str, second: &str| {
+        let mut map = Map::new();
+        map.insert(
+            Literal::string(first),
+            Some(Literal::long(i64::from(first.as_bytes()[0]))),
+        );
+        map.insert(
+            Literal::string(second),
+            Some(Literal::long(i64::from(second.as_bytes()[0]))),
+        );
+        Struct::from_iter([Some(Literal::Map(map))])
+    };
+    let partitions: Vec<Struct> = vec![
+        single_pair_map("k", 2),
+        single_pair_map("a", i64::from(b'a')),
+        two_pair_map("b", "a"),
+        two_pair_map("a", "b"),
+        Struct::from_iter([Some(Literal::List(vec![Some(Literal::long(2))]))]),
+        Struct::from_iter([Some(Literal::List(vec![Some(Literal::long(1))]))]),
+        Struct::from_iter([Some(Literal::Struct(Struct::from_iter([Some(
+            Literal::long(2),
+        )])))]),
+        Struct::from_iter([Some(Literal::Struct(Struct::from_iter([Some(
+            Literal::long(1),
+        )])))]),
+        Struct::from_iter([Some(Literal::long(10))]),
+        Struct::from_iter([Some(Literal::long(9))]),
+        Struct::from_iter([None]),
+        Struct::empty(),
+        single_pair_map("k", 1),
+    ];
+    let plan_keys = || {
+        let mut tasks = Vec::new();
+        for (index, partition) in partitions.iter().enumerate() {
+            for copy in 0..2 {
+                let mut task =
+                    synthetic_task(&format!("p{index}-{copy}"), 10, 0, 0, &spec, &schema);
+                task.partition = Some(partition.clone());
+                tasks.push(task);
+            }
+        }
+        plan_file_groups(tasks, &config, &spec)
+            .iter()
+            .map(|group| {
+                group
+                    .first()
+                    .expect("planned group holds its partition tasks")
+                    .partition
+                    .as_ref()
+                    .expect("task carries a partition")
+                    .clone()
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = plan_keys();
+    assert_eq!(
+        first,
+        vec![
+            Struct::empty(),
+            Struct::from_iter([None]),
+            Struct::from_iter([Some(Literal::long(9))]),
+            Struct::from_iter([Some(Literal::long(10))]),
+            Struct::from_iter([Some(Literal::Struct(Struct::from_iter([Some(
+                Literal::long(1)
+            )])))]),
+            Struct::from_iter([Some(Literal::Struct(Struct::from_iter([Some(
+                Literal::long(2)
+            )])))]),
+            Struct::from_iter([Some(Literal::List(vec![Some(Literal::long(1))]))]),
+            Struct::from_iter([Some(Literal::List(vec![Some(Literal::long(2))]))]),
+            single_pair_map("a", i64::from(b'a')),
+            two_pair_map("a", "b"),
+            two_pair_map("b", "a"),
+            single_pair_map("k", 1),
+            single_pair_map("k", 2),
+        ],
+        "empty struct, then null, then primitives numerically, then struct, list, map"
+    );
+    for _ in 0..50 {
+        assert_eq!(
+            plan_keys(),
+            first,
+            "nested partition order is identical on every plan call"
+        );
+    }
 }

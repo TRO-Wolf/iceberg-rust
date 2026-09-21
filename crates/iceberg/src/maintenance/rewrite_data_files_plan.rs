@@ -17,13 +17,14 @@
 
 //! Planner predicates for [`super::RewriteDataFiles`]. Java `BinPackRewriteFilePlanner`.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::maintenance::rewrite_data_files_sort::ResolvedStrategy;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
-use crate::spec::{DataContentType, Struct, TableProperties};
+use crate::spec::{DataContentType, Literal, Map, Struct, TableProperties};
 
 /// Java `SizeBasedFileRewritePlanner.MIN_FILE_SIZE_DEFAULT_RATIO`.
 pub(super) const MIN_FILE_SIZE_DEFAULT_RATIO: f64 = 0.75;
@@ -183,8 +184,11 @@ pub(super) fn plan_file_groups(
         by_partition.entry(key).or_default().push(task);
     }
 
+    let mut partitions: Vec<(Struct, Vec<FileScanTask>)> = by_partition.into_iter().collect();
+    partitions.sort_by(|left, right| cmp_partition(&left.0, &right.0));
+
     let mut groups: Vec<Vec<FileScanTask>> = Vec::new();
-    for (_partition, partition_tasks) in by_partition {
+    for (_partition, partition_tasks) in partitions {
         let candidates: Vec<FileScanTask> = if config.rewrite_all {
             partition_tasks
         } else {
@@ -214,6 +218,74 @@ pub(super) fn plan_file_groups(
 
 fn task_spec_id(task: &FileScanTask) -> Option<i32> {
     task.partition_spec.as_ref().map(|spec| spec.spec_id())
+}
+
+fn cmp_partition(left: &Struct, right: &Struct) -> Ordering {
+    cmp_field_sequence(left.fields(), right.fields())
+}
+
+fn cmp_field_sequence(left: &[Option<Literal>], right: &[Option<Literal>]) -> Ordering {
+    for (left_field, right_field) in left.iter().zip(right.iter()) {
+        let ordering = cmp_field(left_field.as_ref(), right_field.as_ref());
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn cmp_field(left: Option<&Literal>, right: Option<&Literal>) -> Ordering {
+    match (left, right) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Less,
+        (Some(_), None) => Ordering::Greater,
+        (Some(left), Some(right)) => cmp_literal(left, right),
+    }
+}
+
+fn cmp_literal(left: &Literal, right: &Literal) -> Ordering {
+    match (left, right) {
+        (Literal::Primitive(left), Literal::Primitive(right)) => {
+            left.partial_cmp(right).unwrap_or(Ordering::Equal)
+        }
+        (Literal::Struct(left), Literal::Struct(right)) => cmp_partition(left, right),
+        (Literal::List(left), Literal::List(right)) => cmp_field_sequence(left, right),
+        (Literal::Map(left), Literal::Map(right)) => cmp_map(left, right),
+        _ => cmp_literal_tag(left).cmp(&cmp_literal_tag(right)),
+    }
+}
+
+fn cmp_literal_tag(literal: &Literal) -> u8 {
+    match literal {
+        Literal::Primitive(_) => 0,
+        Literal::Struct(_) => 1,
+        Literal::List(_) => 2,
+        Literal::Map(_) => 3,
+    }
+}
+
+fn cmp_map(left: &Map, right: &Map) -> Ordering {
+    let left_pairs = left.pairs();
+    let right_pairs = right.pairs();
+    for ((left_key, left_value), (right_key, right_value)) in
+        left_pairs.iter().zip(right_pairs.iter())
+    {
+        let ordering = cmp_map_pair(
+            (left_key, left_value.as_ref()),
+            (right_key, right_value.as_ref()),
+        );
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left_pairs.len().cmp(&right_pairs.len())
+}
+
+fn cmp_map_pair(
+    left: (&Literal, Option<&Literal>),
+    right: (&Literal, Option<&Literal>),
+) -> Ordering {
+    cmp_literal(left.0, right.0).then_with(|| cmp_field(left.1, right.1))
 }
 
 /// Java `BinPackRewriteFilePlanner.filterFiles`.

@@ -233,6 +233,14 @@ Round 2 (re-measured 2026-09-21 after the rebase onto fork main `21c27eb5`):
   `comment-ban hits=0`
 - `git log --format='%B' origin/main..HEAD | grep -i co-authored` — no matches
 
+## Base integration
+
+2026-09-21: fork main advanced to
+`b466ad6003bc61a3a9d692326da28d67f2ce105e` (F-RDF-DETERMINISTIC-ORDER-1), which
+touches only `crates/iceberg/src/maintenance/`. It is merged into this branch so
+the branch contains current fork main; the merge carries no changes of its own
+and leaves every file this PR owns byte-identical.
+
 Round 1 (for the record):
 
 - `cargo fmt --all` — clean
