@@ -318,6 +318,33 @@ async fn test_the_written_footer_carries_the_iceberg_id_attributes_the_reader_re
         "the ORC footer must carry the iceberg.required type attributes"
     );
 
+    let layout = test_file_layout(&bytes);
+    for (id, key, expected) in [
+        ("3", "iceberg.long-type", "LONG"),
+        ("9", "iceberg.long-type", "TIME"),
+        ("10", "iceberg.timestamp-unit", "MICROS"),
+        ("11", "iceberg.timestamp-unit", "MICROS"),
+        ("12", "iceberg.timestamp-unit", "NANOS"),
+        ("13", "iceberg.timestamp-unit", "NANOS"),
+        ("7", "iceberg.binary-type", "BINARY"),
+        ("15", "iceberg.binary-type", "UUID"),
+        ("16", "iceberg.binary-type", "FIXED"),
+        ("16", "iceberg.length", "10"),
+    ] {
+        let actual = layout.type_attributes.iter().find_map(|attributes| {
+            if attributes.get("iceberg.id").is_some_and(|got| got.as_str() == id) {
+                attributes.get(key)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            actual.map(String::as_str),
+            Some(expected),
+            "iceberg.id {id} must carry {key}={expected} on the emitted bytes"
+        );
+    }
+
     let projection = Schema::builder()
         .with_schema_id(1)
         .with_fields(vec![
