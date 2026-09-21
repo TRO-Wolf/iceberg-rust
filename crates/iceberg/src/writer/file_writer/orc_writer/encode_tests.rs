@@ -125,6 +125,27 @@ fn test_svarint_is_zigzag() {
 }
 
 #[test]
+fn test_svarint_pins_the_i64_extremes_byte_exact() {
+    let mut out = Vec::new();
+    put_svarint(&mut out, i64::MIN);
+    assert_eq!(out, vec![
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01
+    ]);
+    let (decoded, rest) = read_varint(&out, true);
+    assert_eq!(decoded, i64::MIN);
+    assert!(rest.is_empty());
+
+    out.clear();
+    put_svarint(&mut out, i64::MAX);
+    assert_eq!(out, vec![
+        0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01
+    ]);
+    let (decoded, rest) = read_varint(&out, true);
+    assert_eq!(decoded, i64::MAX);
+    assert!(rest.is_empty());
+}
+
+#[test]
 fn test_unbounded_varint_round_trips_i128_decimal_range() {
     for value in [
         0i128,

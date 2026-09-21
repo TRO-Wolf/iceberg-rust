@@ -68,7 +68,7 @@ pub(crate) fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
 }
 
 pub(crate) fn put_svarint(out: &mut Vec<u8>, value: i64) {
-    put_uvarint(out, ((value << 1) ^ (value >> 63)) as u64);
+    put_uvarint(out, (value.wrapping_shl(1) ^ (value >> 63)) as u64);
 }
 
 pub(crate) fn put_unbounded_varint_i128(out: &mut Vec<u8>, value: i128) {
