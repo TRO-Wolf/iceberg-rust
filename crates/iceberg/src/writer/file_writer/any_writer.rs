@@ -96,6 +96,9 @@ fn parse_avro_codec(raw: &str) -> Result<Codec> {
         "null" => Ok(Codec::Null),
         "deflate" => Ok(Codec::Deflate(DeflateSettings::default())),
         "zstandard" => Ok(Codec::Zstandard(ZstandardSettings::default())),
+        "uncompressed" => Ok(Codec::Null),
+        "gzip" => Ok(Codec::Deflate(DeflateSettings::default())),
+        "zstd" => Ok(Codec::Zstandard(ZstandardSettings::default())),
         _ => Err(Error::new(
             ErrorKind::DataInvalid,
             format!("Invalid value for write.avro.compression-codec: {raw}"),
