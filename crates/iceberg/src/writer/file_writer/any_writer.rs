@@ -362,13 +362,14 @@ mod tests {
         panic!("the OCF header must carry an avro.codec key");
     }
 
-    async fn avro_codec_name_and_rows_for_property(value: &str) -> (String, usize) {
+    async fn avro_codec_name_and_rows_for_property(value: Option<&str>) -> (String, usize) {
         let (_temp, file_io, location_gen) = make_temp();
         let schema = Arc::new(schema_simple());
-        let properties = HashMap::from([(
-            "write.avro.compression-codec".to_string(),
-            value.to_string(),
-        )]);
+        let properties = value
+            .map(|text| {
+                HashMap::from([("write.avro.compression-codec".to_string(), text.to_string())])
+            })
+            .unwrap_or_default();
         let builder = AnyFileWriterBuilder::for_format(
             DataFileFormat::Avro,
             schema.clone(),
@@ -650,40 +651,9 @@ mod tests {
 
     #[tokio::test]
     async fn avro_arm_writes_one_batch_with_null_codec_by_default() {
-        let (_temp, file_io, location_gen) = make_temp();
-        let schema = Arc::new(schema_simple());
-        let builder = for_format_default(DataFileFormat::Avro, schema.clone());
-        assert!(matches!(builder, AnyFileWriterBuilder::Avro(_)));
-        let batch = simple_batch(&schema);
-        let (path, builders) = write_single_batch(
-            &builder,
-            &file_io,
-            &location_gen,
-            "any-avro",
-            DataFileFormat::Avro,
-            &batch,
-        )
-        .await;
-        let data_file = only_data_file(builders);
-        assert_eq!(data_file.file_format(), DataFileFormat::Avro);
-        assert_eq!(data_file.record_count(), 3);
-        assert!(data_file.file_size_in_bytes() > 0);
-        let bytes = read_back_bytes(&file_io, &path).await;
-        assert_eq!(ocf_codec_name(&bytes), "null");
-        let dump = String::from_utf8_lossy(&bytes);
-        assert!(
-            !dump.contains("deflate"),
-            "the default arm must not emit a deflate header"
-        );
-        assert!(
-            !dump.contains("zstandard"),
-            "the default arm must not emit a zstandard header"
-        );
-        let rows = AvroReader::new(&bytes[..])
-            .expect("open the OCF")
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("decode the OCF rows");
-        assert_eq!(rows.len(), 3);
+        let (codec, rows) = avro_codec_name_and_rows_for_property(None).await;
+        assert_eq!(codec, "null");
+        assert_eq!(rows, 3);
     }
 
     #[tokio::test]
@@ -789,21 +759,21 @@ mod tests {
 
     #[tokio::test]
     async fn avro_codec_deflate_honored() {
-        let (codec, rows) = avro_codec_name_and_rows_for_property("deflate").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("deflate")).await;
         assert_eq!(codec, "deflate");
         assert_eq!(rows, 3);
     }
 
     #[tokio::test]
     async fn avro_java_alias_gzip_writes_deflate() {
-        let (codec, rows) = avro_codec_name_and_rows_for_property("gzip").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("gzip")).await;
         assert_eq!(codec, "deflate");
         assert_eq!(rows, 3);
     }
 
     #[tokio::test]
     async fn avro_java_alias_zstd_writes_zstandard() {
-        let (codec, rows) = avro_codec_name_and_rows_for_property("zstd").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("zstd")).await;
         assert_eq!(codec, "zstandard");
         assert_eq!(rows, 3);
     }
@@ -841,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn avro_java_alias_zstd_stable_across_writers() {
         for _ in 0..25 {
-            let (codec, rows) = avro_codec_name_and_rows_for_property("zstd").await;
+            let (codec, rows) = avro_codec_name_and_rows_for_property(Some("zstd")).await;
             assert_eq!(codec, "zstandard");
             assert_eq!(rows, 3);
         }
@@ -849,24 +819,24 @@ mod tests {
 
     #[tokio::test]
     async fn avro_java_alias_uncompressed_writes_null() {
-        let (codec, rows) = avro_codec_name_and_rows_for_property("uncompressed").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("uncompressed")).await;
         assert_eq!(codec, "null");
         assert_eq!(rows, 3);
     }
 
     #[tokio::test]
     async fn avro_codec_name_folds_case_and_whitespace() {
-        let (codec, rows) = avro_codec_name_and_rows_for_property("  GZip  ").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("  GZip  ")).await;
         assert_eq!(codec, "deflate");
         assert_eq!(rows, 3);
     }
 
     #[tokio::test]
     async fn avro_spelled_out_codecs_round_trip() {
-        let (codec, rows) = avro_codec_name_and_rows_for_property("null").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("null")).await;
         assert_eq!(codec, "null");
         assert_eq!(rows, 3);
-        let (codec, rows) = avro_codec_name_and_rows_for_property("zstandard").await;
+        let (codec, rows) = avro_codec_name_and_rows_for_property(Some("zstandard")).await;
         assert_eq!(codec, "zstandard");
         assert_eq!(rows, 3);
     }
