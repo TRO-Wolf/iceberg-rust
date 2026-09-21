@@ -87,6 +87,7 @@ async fn test_append_stage_only_adds_snapshot_without_moving_current() -> TestRe
         InsertOp::Append,
         true,
         None,
+        HashMap::new(),
     )
     .await?;
     assert_count(&batches, 42);
@@ -125,6 +126,7 @@ async fn test_overwrite_stage_only_adds_snapshot_without_moving_current() -> Tes
         InsertOp::Overwrite,
         true,
         None,
+        HashMap::new(),
     )
     .await?;
     assert_count(&batches, 42);
@@ -175,6 +177,7 @@ async fn test_stage_only_with_commit_branch_leaves_branch_unmoved() -> TestResul
         InsertOp::Append,
         true,
         Some("b".to_string()),
+        HashMap::new(),
     )
     .await?;
     assert_count(&batches, 42);

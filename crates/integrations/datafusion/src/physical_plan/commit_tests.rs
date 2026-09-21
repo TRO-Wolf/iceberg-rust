@@ -459,6 +459,7 @@ pub(crate) async fn run_commit_exec(
     insert_op: InsertOp,
     stage_only: bool,
     branch: Option<String>,
+    properties: HashMap<String, String>,
 ) -> DFResult<Vec<RecordBatch>> {
     let input = Arc::new(MockWriteExec::new(files_json));
     let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -475,7 +476,8 @@ pub(crate) async fn run_commit_exec(
         table.metadata().default_partition_spec().clone(),
     )
     .with_commit_branch(branch)
-    .with_stage_only(stage_only);
+    .with_stage_only(stage_only)
+    .with_snapshot_properties(properties);
     let stream = exec.execute(0, Arc::new(TaskContext::default()))?;
     collect(stream).await
 }
@@ -548,8 +550,16 @@ async fn test_empty_overwrite_wipes_table_bug001() -> TestResult {
     );
 
     // Empty INSERT OVERWRITE against the table handle at S0.
-    let batches =
-        run_commit_exec(&table, &catalog, vec![], InsertOp::Overwrite, false, None).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
 
     // Reload and assert the table is WIPED: zero live files under a NEW snapshot.
@@ -626,6 +636,7 @@ async fn test_empty_overwrite_preserves_serializable_occ_validation() -> TestRes
         InsertOp::Overwrite,
         false,
         None,
+        HashMap::new(),
     )
     .await;
     assert!(
@@ -663,7 +674,16 @@ async fn test_empty_append_stamps_snapshot_bug004() -> TestResult {
         "precondition: brand-new table has no snapshot"
     );
 
-    let batches = run_commit_exec(&table, &catalog, vec![], InsertOp::Append, false, None).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Append,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
 
     let reloaded = catalog
@@ -711,6 +731,7 @@ async fn test_nonempty_overwrite_replaces_all_data() -> TestResult {
         InsertOp::Overwrite,
         false,
         None,
+        HashMap::new(),
     )
     .await?;
     assert_count(&batches, 42);
@@ -821,7 +842,16 @@ async fn test_empty_overwrite_wipes_all_partitions_partitioned() -> TestResult {
     );
 
     // (1) Empty INSERT INTO append must NOT wipe — both partitions stay live, snapshot stamped.
-    let batches = run_commit_exec(&table, &catalog, vec![], InsertOp::Append, false, None).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Append,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
     let table = catalog
         .load_table(&TableIdent::from_strs(["ns", "tp"])?)
@@ -844,8 +874,16 @@ async fn test_empty_overwrite_wipes_all_partitions_partitioned() -> TestResult {
     // (2) Empty INSERT OVERWRITE must WIPE EVERY partition in one new snapshot.
     let prior_snapshot_id = table.metadata().current_snapshot_id().expect("head");
     let prior_snapshots = table.metadata().snapshots().len();
-    let batches =
-        run_commit_exec(&table, &catalog, vec![], InsertOp::Overwrite, false, None).await?;
+    let batches = run_commit_exec(
+        &table,
+        &catalog,
+        vec![],
+        InsertOp::Overwrite,
+        false,
+        None,
+        HashMap::new(),
+    )
+    .await?;
     assert_count(&batches, 0);
     let wiped = catalog
         .load_table(&TableIdent::from_strs(["ns", "tp"])?)
@@ -887,6 +925,7 @@ async fn test_empty_overwrite_wipes_all_partitions_partitioned() -> TestResult {
         InsertOp::Overwrite,
         false,
         None,
+        HashMap::new(),
     )
     .await?;
     assert_count(&batches, 42);

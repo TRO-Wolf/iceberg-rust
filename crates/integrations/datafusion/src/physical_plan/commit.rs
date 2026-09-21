@@ -474,6 +474,9 @@ impl ExecutionPlan for IcebergCommitExec {
 }
 
 #[cfg(test)]
+#[path = "commit_snapshot_properties_tests.rs"]
+mod snapshot_properties_tests;
+#[cfg(test)]
 #[path = "commit_stage_only_tests.rs"]
 mod stage_only_tests;
 #[cfg(test)]
