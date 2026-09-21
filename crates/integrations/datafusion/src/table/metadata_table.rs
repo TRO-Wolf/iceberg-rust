@@ -575,13 +575,74 @@ mod tests {
                 message.contains(&name),
                 "refusal must name the table {name}, got: {message}"
             );
+            let expected = match name.as_str() {
+                "refs" | "metadata_log_entries" => "needs historical metadata reconstruction",
+                _ => "snapshot scope not yet served",
+            };
             assert!(
-                message.contains("snapshot scope not yet served"),
-                "refusal must state snapshot scope is unserved, got: {message}"
+                message.contains(expected),
+                "refusal must state snapshot scope status for {name}, got: {message}"
             );
             refused += 1;
         }
         assert_eq!(refused, 7);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_scope_refs_and_mle_refuse_with_reconstruction_reason() {
+        let table = test_table().await;
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot_id()
+            .expect("fixture has a current snapshot");
+        for (r#type, reason) in [
+            (
+                MetadataTableType::Refs,
+                "refs are live named pointers, not retained per-snapshot state",
+            ),
+            (
+                MetadataTableType::MetadataLogEntries,
+                "entries need the historical metadata file for that snapshot",
+            ),
+        ] {
+            let name = r#type.as_str().to_owned();
+            let provider =
+                IcebergMetadataTableProvider::try_new(table.clone(), r#type, Some(snapshot_id))
+                    .unwrap_or_else(|e| panic!("try_new failed for {name}: {e}"));
+            let err = match provider.scan().await {
+                Ok(_) => panic!("scan with Some must refuse for {name}"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                iceberg_kind(&err),
+                iceberg::ErrorKind::FeatureUnsupported,
+                "refusal kind for {name}"
+            );
+            let message = datafusion_message(err);
+            assert!(
+                message.contains(&name),
+                "refusal must name the table {name}, got: {message}"
+            );
+            assert!(
+                message.contains("needs historical metadata reconstruction"),
+                "refusal must state reconstruction is needed for {name}, got: {message}"
+            );
+            assert!(
+                message.contains(reason),
+                "refusal must carry the reconstruction reason for {name}, got: {message}"
+            );
+        }
+        for r#type in [
+            MetadataTableType::Refs,
+            MetadataTableType::MetadataLogEntries,
+        ] {
+            let name = r#type.as_str().to_owned();
+            let outcome = provider_scan_outcome(&table, r#type, None).await;
+            assert!(
+                outcome.is_ok(),
+                "scan with None must serve for {name}, got: {outcome:?}"
+            );
+        }
     }
 
     #[tokio::test]
