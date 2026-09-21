@@ -627,6 +627,27 @@ mod tests {
         assert_eq!(err.message(), "Field id 1 not found in struct array");
     }
 
+    #[test]
+    fn parquet_bogus_codec_errors_naming_value() {
+        let schema = Arc::new(schema_simple());
+        let err = AnyFileWriterBuilder::for_format(
+            DataFileFormat::Parquet,
+            schema,
+            &HashMap::from([(
+                "write.parquet.compression-codec".to_string(),
+                "brotli".to_string(),
+            )]),
+            MetricsConfig::default(),
+            FieldMatchMode::Id,
+        )
+        .expect_err("a bogus parquet codec must fail");
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "Invalid value for write.parquet.compression-codec: brotli"
+        );
+    }
+
     #[tokio::test]
     async fn avro_arm_writes_one_batch_with_null_codec_by_default() {
         let (_temp, file_io, location_gen) = make_temp();
