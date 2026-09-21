@@ -180,7 +180,7 @@ mod tests {
     use apache_avro::Reader as AvroReader;
     use arrow_array::{ArrayRef, Int32Array, RecordBatch, StringArray};
     use arrow_schema::SchemaRef as ArrowSchemaRef;
-    use parquet::basic::Encoding;
+    use parquet::basic::{Compression, Encoding};
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     use super::*;
@@ -407,6 +407,18 @@ mod tests {
         flags
     }
 
+    fn parquet_column_compressions(bytes: bytes::Bytes) -> Vec<Compression> {
+        let reader = SerializedFileReader::new(bytes).expect("read the parquet footer");
+        let mut codecs = Vec::new();
+        for group in reader.metadata().row_groups() {
+            for column in group.columns() {
+                codecs.push(column.compression());
+            }
+        }
+        assert!(!codecs.is_empty(), "the file must hold column chunks");
+        codecs
+    }
+
     fn for_format_default(format: DataFileFormat, schema: SchemaRef) -> AnyFileWriterBuilder {
         AnyFileWriterBuilder::for_format(
             format,
@@ -494,6 +506,56 @@ mod tests {
             enabled_flags.iter().all(|flag| *flag),
             "parquet.enable.dictionary=true must turn dictionary encoding on"
         );
+    }
+
+    #[tokio::test]
+    async fn parquet_compression_follows_table_property() {
+        let (_temp, file_io, location_gen) = make_temp();
+        let schema = Arc::new(schema_simple());
+        let batch = simple_batch(&schema);
+        let default_builder = for_format_default(DataFileFormat::Parquet, schema.clone());
+        let (default_path, _) = write_single_batch(
+            &default_builder,
+            &file_io,
+            &location_gen,
+            "any-parquet-zstd",
+            DataFileFormat::Parquet,
+            &batch,
+        )
+        .await;
+        let gzip_properties = HashMap::from([(
+            "write.parquet.compression-codec".to_string(),
+            "gzip".to_string(),
+        )]);
+        let gzip_builder = AnyFileWriterBuilder::for_format(
+            DataFileFormat::Parquet,
+            schema.clone(),
+            &gzip_properties,
+            MetricsConfig::default(),
+            FieldMatchMode::Id,
+        )
+        .expect("route the parquet arm");
+        let (gzip_path, _) = write_single_batch(
+            &gzip_builder,
+            &file_io,
+            &location_gen,
+            "any-parquet-gzip",
+            DataFileFormat::Parquet,
+            &batch,
+        )
+        .await;
+        for codec in parquet_column_compressions(read_back_bytes(&file_io, &default_path).await) {
+            assert!(
+                matches!(codec, Compression::ZSTD(_)),
+                "the default arm must emit ZSTD, got {codec:?}"
+            );
+        }
+        for codec in parquet_column_compressions(read_back_bytes(&file_io, &gzip_path).await) {
+            assert!(
+                matches!(codec, Compression::GZIP(_)),
+                "the gzip arm must emit GZIP, got {codec:?}"
+            );
+        }
     }
 
     #[tokio::test]
