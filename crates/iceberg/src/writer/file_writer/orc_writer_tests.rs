@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::io::Read as _;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -194,6 +195,108 @@ async fn write_orc(
     }
     let files = writer.close().await.expect("close the ORC writer");
     (path, files)
+}
+
+fn test_read_varint(bytes: &[u8], at: &mut usize) -> u64 {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = bytes[*at];
+        *at += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+        shift += 7;
+    }
+}
+
+fn test_skip_field(bytes: &[u8], at: &mut usize, wire: u64) {
+    match wire {
+        0 => {
+            test_read_varint(bytes, at);
+        }
+        2 => {
+            let len = test_read_varint(bytes, at) as usize;
+            *at += len;
+        }
+        other => panic!("unexpected wire type {other}"),
+    }
+}
+
+fn test_inflate_chunks(mut raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while !raw.is_empty() {
+        let header =
+            usize::from(raw[0]) | (usize::from(raw[1]) << 8) | (usize::from(raw[2]) << 16);
+        let is_original = header & 1 == 1;
+        let chunk_len = header >> 1;
+        raw = &raw[3..];
+        let (chunk, rest) = raw.split_at(chunk_len);
+        if is_original {
+            out.extend_from_slice(chunk);
+        } else {
+            let mut decoder = flate2::read::DeflateDecoder::new(chunk);
+            decoder
+                .read_to_end(&mut out)
+                .expect("inflate a zlib footer chunk");
+        }
+        raw = rest;
+    }
+    out
+}
+
+fn test_footer_row_counts(file: &[u8]) -> (u64, Vec<u64>) {
+    let ps_len = usize::from(*file.last().expect("a non-empty ORC file"));
+    let ps_end = file.len() - 1;
+    let ps_start = ps_end - ps_len;
+    let ps = &file[ps_start..ps_end];
+    let mut at = 0;
+    let mut footer_length = 0usize;
+    let mut compression = 0u64;
+    while at < ps.len() {
+        let key = test_read_varint(ps, &mut at);
+        match (key >> 3, key & 7) {
+            (1, 0) => footer_length = test_read_varint(ps, &mut at) as usize,
+            (2, 0) => compression = test_read_varint(ps, &mut at),
+            (_, wire) => test_skip_field(ps, &mut at, wire),
+        }
+    }
+    let footer_start = ps_start - footer_length;
+    let raw_footer = &file[footer_start..ps_start];
+    let footer = match compression {
+        0 => raw_footer.to_vec(),
+        1 => test_inflate_chunks(raw_footer),
+        other => panic!("unexpected test footer compression {other}"),
+    };
+    let mut at = 0;
+    let mut number_of_rows = None;
+    let mut stripe_rows = Vec::new();
+    while at < footer.len() {
+        let key = test_read_varint(&footer, &mut at);
+        match (key >> 3, key & 7) {
+            (6, 0) => number_of_rows = Some(test_read_varint(&footer, &mut at)),
+            (3, 2) => {
+                let len = test_read_varint(&footer, &mut at) as usize;
+                let body = &footer[at..at + len];
+                at += len;
+                let mut inner = 0;
+                while inner < body.len() {
+                    let sub = test_read_varint(body, &mut inner);
+                    if (sub >> 3, sub & 7) == (5, 0) {
+                        stripe_rows.push(test_read_varint(body, &mut inner));
+                    } else {
+                        test_skip_field(body, &mut inner, sub & 7);
+                    }
+                }
+            }
+            (_, wire) => test_skip_field(&footer, &mut at, wire),
+        }
+    }
+    (
+        number_of_rows.expect("Footer.numberOfRows must be present"),
+        stripe_rows,
+    )
 }
 
 #[tokio::test]
@@ -637,6 +740,22 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
     );
 
     let bytes = read_back_bytes(&file_io, &path).await;
+    let (footer_rows, stripe_rows) = test_footer_row_counts(&bytes);
+    assert_eq!(
+        stripe_rows,
+        vec![3, 3, 3],
+        "one 3-row batch per stripe in the emitted footer"
+    );
+    assert_eq!(
+        footer_rows,
+        data_file.record_count(),
+        "Footer.numberOfRows must equal the committed record count"
+    );
+    assert_eq!(
+        footer_rows,
+        stripe_rows.iter().sum::<u64>(),
+        "Footer.numberOfRows must equal the sum of stripe row counts"
+    );
     let decoded = read_orc_data_bytes(bytes, &schema, 1024).expect("read the multi-stripe file");
     let expected = arrow_select::concat::concat_batches(&batch.schema(), &batches)
         .expect("concatenate the written batches");
