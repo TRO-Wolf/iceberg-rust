@@ -259,17 +259,17 @@ async fn sort_by_columns_compares_the_second_key() {
     let spec_id = table.metadata().default_partition_spec_id();
     assert_ne!(spec_id, 0, "evolution creates a new default spec");
     let table = append_files(&catalog, &table, vec![wide_file(
-        "test/sort-y1.parquet",
-        spec_id,
-        0,
-        1,
-    )])
-    .await;
-    let table = append_files(&catalog, &table, vec![wide_file(
         "test/sort-y0.parquet",
         spec_id,
         0,
         0,
+    )])
+    .await;
+    let table = append_files(&catalog, &table, vec![wide_file(
+        "test/sort-y1.parquet",
+        spec_id,
+        0,
+        1,
     )])
     .await;
 
