@@ -45,7 +45,7 @@ a format is chosen only by which concrete builder is instantiated.
 | `orc_writer/footer_write.rs` | the hand-rolled protobuf writer for `StripeFooter`, `Footer` and `PostScript` — the mirror image of `../../arrow/orc_reader/footer.rs`, which hand-parses them. `orc-rust` keeps its `writer` and `encoding` modules private and stamps `attributes: vec![]` on every type, so neither its writer nor its encoders can produce an Iceberg ORC file |
 | `orc_writer/null_repair.rs` | forces list/map `Literal` slots to null wherever the Arrow column is null, recursing into structs; `schema_has_container` gates the repair |
 | `orc_writer/metrics.rs` | the ORC manifest statistics, accumulated from the `Literal` rows and keyed by Iceberg field id, under `MetricsConfig`. Uses the same `MetricsMode::truncate_lower_bound` / `truncate_upper_bound` the parquet writer uses |
-| `orc_writer_tests.rs`, `orc_writer_layout_tests.rs`, `orc_writer/*_tests.rs` | the `#[cfg(test)]` cells for the ORC writer |
+| `orc_writer_tests.rs`, `orc_writer_layout_tests.rs`, `orc_writer_metrics_tests.rs`, `orc_writer/*_tests.rs` | the `#[cfg(test)]` cells for the ORC writer |
 | `rolling_writer.rs` | size-based rolling over any `FileWriterBuilder` |
 | `location_generator.rs` | file naming and placement; the extension comes from `DataFileFormat`'s `Display` |
 

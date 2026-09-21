@@ -329,4 +329,5 @@ impl CurrentFileStatus for OrcWriter {
 mod tests {
     include!("orc_writer_tests.rs");
     include!("orc_writer_layout_tests.rs");
+    include!("orc_writer_metrics_tests.rs");
 }
