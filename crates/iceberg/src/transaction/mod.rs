@@ -88,6 +88,7 @@ pub use replace_partitions::ReplacePartitionsAction;
 mod rewrite_files;
 pub use rewrite_files::RewriteFilesAction;
 mod rewrite_manifests;
+mod rewrite_manifests_cluster;
 // Re-exported so the action type is nameable as a return type — it is handed out by both
 // `Transaction::rewrite_manifests()` and `maintenance::Actions::rewrite_manifests()`.
 pub use rewrite_manifests::RewriteManifestsAction;
@@ -107,7 +108,6 @@ mod update_properties;
 mod update_schema;
 mod update_statistics;
 mod upgrade_format_version;
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

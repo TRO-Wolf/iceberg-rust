@@ -160,6 +160,9 @@ mod remove_dangling_delete_files;
 #[cfg(test)]
 mod replace_commit_summary_tests;
 mod rewrite_data_files;
+mod rewrite_data_files_branch;
+#[cfg(test)]
+mod rewrite_data_files_branch_tests;
 #[cfg(test)]
 mod rewrite_data_files_cow_bytes_tests;
 #[cfg(test)]

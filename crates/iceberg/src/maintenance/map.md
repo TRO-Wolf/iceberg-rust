@@ -38,6 +38,8 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | `rewrite_data_files_zorder.rs` | Java `ZOrderByteUtils` + `SparkZOrderUDF`, byte for byte: 8-byte whole numbers, the arithmetic-shift float mask, `timestamptz` in SECONDS (Spark's `cast(ts AS LONG)`) against `timestamp` in micros, character-boundary string truncation, `min(sum, max-output-size)` interleave. |
 | `rewrite_data_files_sort_tests.rs`, `rewrite_data_files_sort_bound_tests.rs`, `rewrite_data_files_zorder_tests.rs`, `rewrite_data_files_sort_key_tests.rs`, `rewrite_data_files_sort_harness.rs`, `rewrite_data_files_sort_vectors.rs` | RDF-SORT-1 pins: the run-25d Spark sort oracle cells replayed row for row, Java's own z bytes measured through the JVM, and the bounded-memory pins. `_sort_key_tests.rs` drives the two encoders directly, where an oracle cell's row order cannot see a clause break (the output-size cap, the sign flip, the escaping and terminator, the wide decimal). `_vectors.rs` is recorded data, not code. |
 | `rewrite_data_files_router.rs` | Bounded LRU partition router for rewrite output. Default 64 open writers. Private to maintenance. |
+| `rewrite_data_files_branch.rs` | Branch-targeted compaction (P-RDF-BRANCH): `branch()` resolves the named ref's snapshot as the scan/plan base and every commit batch carries `.to_branch`, so only that ref moves. Homes `plan_scan_tasks` / `collect_live_data_files` (moved from `rewrite_data_files.rs`, file-size split). |
+| `rewrite_data_files_branch_tests.rs` | Branch pins: the rewrite commits onto the ref while main stays, a diverged plan base, per-batch partial progress, the unknown-ref refusal, explicit main. |
 | `rewrite_data_files_evolved_spec_tests.rs` | Spec-evolution output routing pins: source-field, transform, unpartitioned, mixed specs. |
 | `rewrite_data_files_evolved_schema_tests.rs` | Schema-evolution compaction pins: add(+spec), add-only, drop, rename, promote, v3-DV, unpartitioned controls. |
 | `rewrite_data_files_router_bound_tests.rs` | Writer bound, eviction, V3 lineage, and evolved-spec delete-class pins. |
@@ -77,6 +79,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | Change how rewritten rows are routed after spec evolution | `rewrite_data_files_write.rs` + `rewrite_data_files_router.rs` |
 | Pin evolved-spec output tuples or the writer bound | `rewrite_data_files_evolved_spec_tests.rs`, `rewrite_data_files_router_bound_tests.rs` |
 | Pin evolved-schema compaction (add/drop/rename/promote/v3-DV) | `rewrite_data_files_evolved_schema_tests.rs` |
+| Compact a named branch instead of main | `rewrite_data_files_branch.rs` (`RewriteDataFiles::branch(name)`; planning reads the ref's snapshot, every batch commits via `.to_branch`) |
 | See why an all-void current spec (`void(x)`, one field, `is_unpartitioned`) fails rewrite | unsupported current-spec shape: `RecordBatchPartitionSplitter` refuses it (`Cannot create partition calculator for unpartitioned table`). Pin: `all_void_current_spec_is_refused` |
 | Pin delete-ratio or 100%-dead in-band rewrite | `rewrite_data_files_ratio_tests.rs` |
 
@@ -107,6 +110,7 @@ remove files. Status lives on GAP_MATRIX rows R133–R140.
 | After spec evolution, partition-pruned scans miss live rows | Output used `group.first()` under the current spec. Routing must recompute tuples from rows (`rewrite_data_files_write.rs`). Pin: `source_field_identity_x_to_identity_y_rewrites_two_old_partitions`. |
 | Rewrite fails with `Cannot create partition calculator for unpartitioned table` | Current spec is all-void (`void(x)`, one field, `is_unpartitioned` but `fields()` is not empty). Unsupported current-spec shape. Pin: `all_void_current_spec_is_refused`. |
 | Rewrite after schema evolution fails with a batch/expected width, name, or type mismatch | Tasks plan under the snapshot-pinned old schema while the calculator/writer build on the current schema. The write path re-points each task at the current schema with the full current projection (`rewrite_data_files_write.rs`), so the reader evolves every file's batches first. Pins: `rewrite_data_files_evolved_schema_tests::*`. |
+| A branch rewrite moved main, or rewrote main's files | Planning or a commit batch missed the ref: `branch_starting_snapshot` must resolve every planning input and `.to_branch` must run on EVERY batch. A ref created at main stays green under a main-read — re-fixture diverged. Pins: `rewrite_data_files_branch_tests::*`. |
 | Manifest write after promoting a partition source fails with `value is not compatible with type` | Old carried tuples keep the narrow literal while summaries build against the current wide type. `PartitionFieldStats::update` widens via `PrimitiveLiteral::promote_to` (int→long, float→double; anything else still fails loud). Pin: `promote_partition_source_int_to_long_rewrites_old_files`. |
 
 ### First checks
