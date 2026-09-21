@@ -43,6 +43,13 @@ async fn publish_changes_fast_forwards_the_staged_snapshot() {
         .expect("a staged snapshot exists");
     let snapshot_count_before = table.metadata().snapshots().count();
     let base_live = live_file_paths(&table, ManifestContentType::Data).await;
+    let staged_props = table
+        .metadata()
+        .snapshot_by_id(staged_id)
+        .expect("the staged snapshot is readable by id")
+        .summary()
+        .additional_properties
+        .clone();
 
     let table = publish_changes(&catalog, &table, "wap-ff").await;
 
@@ -68,6 +75,11 @@ async fn publish_changes_fast_forwards_the_staged_snapshot() {
             .map(String::as_str),
         Some("wap-ff"),
         "the fast-forwarded snapshot keeps its wap.id, as Java does"
+    );
+    assert_eq!(
+        published.summary().additional_properties,
+        staged_props,
+        "a fast-forward adds no summary keys and changes no summary value"
     );
     let live = live_file_paths(&table, ManifestContentType::Data).await;
     assert!(
