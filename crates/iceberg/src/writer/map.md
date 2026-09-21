@@ -62,7 +62,7 @@ GAP_MATRIX row R114.
 | Write an unpartitioned file without a `PartitionKey` | `unpartitioned()` on the base writer, then `build(None)` |
 | Persist stored `_row_id` / `_last_updated_sequence_number` on a rewrite | join them into the write schema via `metadata_columns::schema_with_row_lineage`, then `DataFileWriter` |
 | Produce position deletes for `RowDelta` | `base_writer/position_delete_writer.rs` → commit via [../transaction/map.md](../transaction/map.md) `row_delta` |
-| Touch metrics written into files | `file_writer/parquet_writer.rs` — these bounds feed the metrics evaluators; exact-byte sensitive |
+| Touch metrics written into files | `file_writer/parquet_writer.rs` + `file_writer/orc_writer/metrics.rs` — these bounds feed the metrics evaluators; exact-byte sensitive |
 | Parse parquet compression table properties | `file_writer/parquet_compression.rs` |
 | Add a new physical format | `file_writer/` behind the `FileWriter` trait |
 
