@@ -389,7 +389,7 @@ mod tests {
     use std::fmt::{Debug, Formatter};
     use std::sync::Arc;
 
-    use datafusion::arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
+    use datafusion::arrow::array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
     use datafusion::arrow::datatypes::{
         DataType, Field, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
     };
@@ -402,8 +402,10 @@ mod tests {
     use futures::{StreamExt, stream};
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use iceberg::spec::{
-        DataFileFormat, NestedField, PrimitiveType, Schema, Type, deserialize_data_file_from_json,
+        DataFile, DataFileFormat, NestedField, PrimitiveType, Schema, TableProperties, Type,
+        deserialize_data_file_from_json,
     };
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::{
         Catalog, CatalogBuilder, Error, ErrorKind, MemoryCatalog, NamespaceIdent, Result,
         TableCreation,
@@ -813,6 +815,186 @@ mod tests {
             "metrics.default=none must write no upper_bounds"
         );
 
+        Ok(())
+    }
+
+    async fn format_table(format: &str) -> Result<(MemoryCatalog, Table)> {
+        let catalog = get_iceberg_catalog().await;
+        let namespace = NamespaceIdent::new("format_ns".to_string());
+        catalog.create_namespace(&namespace, HashMap::new()).await?;
+        let prop = TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string();
+        let creation = TableCreation::builder()
+            .location(temp_path())
+            .name(format!("format_{format}_table"))
+            .properties(HashMap::from([(prop, format.to_string())]))
+            .schema(get_test_schema()?)
+            .build();
+        let table = catalog.create_table(&namespace, creation).await?;
+        Ok((catalog, table))
+    }
+
+    fn plan_format_write(table: &Table) -> IcebergWriteExec {
+        let meta =
+            |id: &str| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(meta("1")),
+            Field::new("name", DataType::Utf8, false).with_metadata(meta("2")),
+        ]));
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef,
+        ])
+        .expect("fixture batch builds");
+        let input_plan = Arc::new(MockExecutionPlan::new(arrow_schema, vec![batch]));
+        IcebergWriteExec::new(
+            table.clone(),
+            input_plan,
+            table.metadata().default_partition_spec().clone(),
+            None,
+        )
+    }
+
+    async fn run_format_write(table: &Table) -> Result<Vec<DataFile>> {
+        let mut stream = plan_format_write(table)
+            .execute(0, Arc::new(TaskContext::default()))
+            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("execute: {e}")))?;
+        let mut files = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| Error::new(ErrorKind::Unexpected, format!("{e}")))?;
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("data_files column is Utf8");
+            for row in 0..column.len() {
+                files.push(deserialize_data_file_from_json(
+                    column.value(row),
+                    table.metadata().default_partition_spec_id(),
+                    table.metadata().default_partition_type(),
+                    table.metadata().current_schema(),
+                )?);
+            }
+        }
+        Ok(files)
+    }
+
+    async fn commit_format_files(
+        catalog: &MemoryCatalog,
+        table: &Table,
+        files: Vec<DataFile>,
+    ) -> Result<Table> {
+        let tx = Transaction::new(table);
+        let action = tx.fast_append().add_data_files(files);
+        action.apply(tx)?.commit(catalog).await
+    }
+
+    async fn scan_format_rows(table: &Table) -> Result<Vec<(i32, String)>> {
+        let mut stream = table
+            .scan()
+            .select(["id", "name"])
+            .build()?
+            .to_arrow()
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("id column is Int32");
+            let names = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column is Utf8");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), names.value(row).to_string()));
+            }
+        }
+        rows.sort();
+        Ok(rows)
+    }
+
+    async fn write_commit_scan(
+        name: &str,
+        format: DataFileFormat,
+        check_bytes: impl Fn(&[u8]),
+    ) -> Result<()> {
+        let (catalog, table) = format_table(name).await?;
+        let files = run_format_write(&table).await?;
+        assert_eq!(files.len(), 1, "one write produces one data file");
+        assert_eq!(files[0].file_format(), format);
+        let bytes = table
+            .file_io()
+            .new_input(files[0].file_path())?
+            .read()
+            .await?;
+        check_bytes(&bytes);
+        let table = commit_format_files(&catalog, &table, files).await?;
+        assert_eq!(scan_format_rows(&table).await?, vec![
+            (1, "Alice".to_string()),
+            (2, "Bob".to_string()),
+            (3, "Charlie".to_string()),
+        ]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_orc_writes_orc_bytes() -> Result<()> {
+        write_commit_scan("orc", DataFileFormat::Orc, |bytes| {
+            assert!(
+                bytes.len() > 4 && &bytes[bytes.len() - 4..bytes.len() - 1] == b"ORC",
+                "orc tail magic"
+            );
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_avro_writes_avro_bytes() -> Result<()> {
+        write_commit_scan("avro", DataFileFormat::Avro, |bytes| {
+            assert!(bytes.starts_with(b"Obj\x01"), "avro OCF header");
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_puffin_refuses_data_invalid() -> Result<()> {
+        let (_catalog, table) = format_table("puffin").await?;
+        let Err(err) = plan_format_write(&table).execute(0, Arc::new(TaskContext::default()))
+        else {
+            panic!("puffin is never a data file");
+        };
+        let DataFusionError::External(inner) = err else {
+            panic!("expected External iceberg error, got {err}");
+        };
+        let iceberg_err = inner
+            .downcast_ref::<Error>()
+            .expect("external wraps iceberg Error");
+        assert_eq!(iceberg_err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            iceberg_err.message(),
+            "Cannot build a data-file writer for format puffin: a sidecar is never a data file"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_bogus_format_surfaces_from_str() -> Result<()> {
+        let (_catalog, table) = format_table("csv").await?;
+        let Err(err) = plan_format_write(&table).execute(0, Arc::new(TaskContext::default()))
+        else {
+            panic!("bogus format refuses");
+        };
+        let DataFusionError::External(inner) = err else {
+            panic!("expected External iceberg error, got {err}");
+        };
+        let iceberg_err = inner
+            .downcast_ref::<Error>()
+            .expect("external wraps iceberg Error");
+        assert_eq!(iceberg_err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(iceberg_err.message(), "Unsupported data file format: csv");
         Ok(())
     }
 }

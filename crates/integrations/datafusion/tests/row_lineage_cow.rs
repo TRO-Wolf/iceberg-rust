@@ -27,7 +27,8 @@ use iceberg::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
 };
 use iceberg::spec::{
-    FormatVersion, NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
+    TableProperties, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
@@ -53,17 +54,27 @@ async fn catalog() -> MemoryCatalog {
 }
 
 async fn v3_cow_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
-    v3_cow_ctx_inner(ns, tbl, false).await
+    v3_cow_ctx_inner(ns, tbl, false, HashMap::new()).await
+}
+
+async fn v3_cow_ctx_with_format(
+    ns: &str,
+    tbl: &str,
+    format: &str,
+) -> (SessionContext, Arc<MemoryCatalog>) {
+    let prop = TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string();
+    v3_cow_ctx_inner(ns, tbl, false, HashMap::from([(prop, format.to_string())])).await
 }
 
 async fn v3_cow_partitioned_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
-    v3_cow_ctx_inner(ns, tbl, true).await
+    v3_cow_ctx_inner(ns, tbl, true, HashMap::new()).await
 }
 
 async fn v3_cow_ctx_inner(
     ns: &str,
     tbl: &str,
     partitioned: bool,
+    properties: HashMap<String, String>,
 ) -> (SessionContext, Arc<MemoryCatalog>) {
     let iceberg_catalog = catalog().await;
     let namespace = NamespaceIdent::new(ns.to_string());
@@ -100,6 +111,7 @@ async fn v3_cow_ctx_inner(
             .location(location)
             .schema(schema)
             .partition_spec(partition_spec)
+            .properties(properties)
             .format_version(FormatVersion::V3)
             .build()
     } else {
@@ -107,6 +119,7 @@ async fn v3_cow_ctx_inner(
             .name(tbl.to_string())
             .location(location)
             .schema(schema)
+            .properties(properties)
             .format_version(FormatVersion::V3)
             .build()
     };
@@ -659,4 +672,96 @@ async fn spark_three_single_row_inserts_then_delete_id_2_then_id_1() {
     .await;
     let table = client.load_table(&ident).await.expect("reload");
     assert_state(&table, &[(3, "c", 2, 3)], 3).await;
+}
+
+async fn live_data_files(table: &Table) -> Vec<DataFile> {
+    let snapshot = table.metadata().current_snapshot().expect("snapshot");
+    let list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let mut files = Vec::new();
+    for manifest_file in list.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("manifest");
+        for entry in manifest.entries() {
+            if entry.is_alive() && entry.content_type() == DataContentType::Data {
+                files.push(entry.data_file().clone());
+            }
+        }
+    }
+    files
+}
+
+async fn assert_rewrite_format(ns: &str, format: DataFileFormat, check_bytes: impl Fn(&[u8])) {
+    let tbl = "t";
+    let name = format.to_string();
+    let (ctx, client) = v3_cow_ctx_with_format(ns, tbl, &name).await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("reload");
+    let files = live_data_files(&table).await;
+    assert!(!files.is_empty(), "delete leaves live data files");
+    for file in &files {
+        assert_eq!(file.content_type(), DataContentType::Data);
+        assert_eq!(file.file_format(), format, "rewritten file keeps {name}");
+        let bytes = table
+            .file_io()
+            .new_input(file.file_path())
+            .expect("input")
+            .read()
+            .await
+            .expect("read");
+        check_bytes(&bytes);
+    }
+    let df = ctx
+        .sql(&format!(
+            "SELECT id, val FROM catalog.{ns}.{tbl} ORDER BY id"
+        ))
+        .await
+        .expect("select")
+        .collect()
+        .await
+        .expect("collect");
+    assert_batches_eq!(
+        &[
+            "+----+-----+",
+            "| id | val |",
+            "+----+-----+",
+            "| 1  | a   |",
+            "| 3  | c   |",
+            "+----+-----+",
+        ],
+        &df
+    );
+}
+
+#[tokio::test]
+async fn cow_delete_rewrites_orc_as_orc() {
+    assert_rewrite_format("lineage_cow_rewrite_orc", DataFileFormat::Orc, |bytes| {
+        assert!(
+            bytes.len() > 4 && &bytes[bytes.len() - 4..bytes.len() - 1] == b"ORC",
+            "orc tail magic"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cow_delete_rewrites_avro_as_avro() {
+    assert_rewrite_format("lineage_cow_rewrite_avro", DataFileFormat::Avro, |bytes| {
+        assert!(bytes.starts_with(b"Obj\x01"), "avro OCF header");
+    })
+    .await;
 }
