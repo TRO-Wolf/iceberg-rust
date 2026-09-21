@@ -738,42 +738,9 @@ mod tests {
 
     #[tokio::test]
     async fn avro_codec_deflate_honored() {
-        let (_temp, file_io, location_gen) = make_temp();
-        let schema = Arc::new(schema_simple());
-        let properties = HashMap::from([(
-            "write.avro.compression-codec".to_string(),
-            "deflate".to_string(),
-        )]);
-        let builder = AnyFileWriterBuilder::for_format(
-            DataFileFormat::Avro,
-            schema.clone(),
-            &properties,
-            MetricsConfig::default(),
-            FieldMatchMode::Id,
-        )
-        .expect("route the avro arm");
-        assert!(matches!(builder, AnyFileWriterBuilder::Avro(_)));
-        let batch = simple_batch(&schema);
-        let (path, builders) = write_single_batch(
-            &builder,
-            &file_io,
-            &location_gen,
-            "any-avro-deflate",
-            DataFileFormat::Avro,
-            &batch,
-        )
-        .await;
-        assert_eq!(builders.len(), 1);
-        let bytes = read_back_bytes(&file_io, &path).await;
-        assert!(
-            String::from_utf8_lossy(&bytes).contains("deflate"),
-            "the OCF header must name the deflate codec"
-        );
-        let rows = AvroReader::new(&bytes[..])
-            .expect("open the OCF")
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("decode the OCF rows");
-        assert_eq!(rows.len(), 3);
+        let (codec, rows) = avro_codec_name_and_rows_for_property("deflate").await;
+        assert_eq!(codec, "deflate");
+        assert_eq!(rows, 3);
     }
 
     #[tokio::test]
