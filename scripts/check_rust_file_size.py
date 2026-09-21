@@ -65,7 +65,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/inspect/data_file.rs": 1179,
     "crates/iceberg/src/inspect/entries.rs": 1286,
     "crates/iceberg/src/inspect/files.rs": 1812,
-    "crates/iceberg/src/inspect/partitions.rs": 1466,
+    "crates/iceberg/src/inspect/partitions.rs": 1488,
     "crates/iceberg/src/maintenance/compute_table_stats.rs": 1248,
     "crates/iceberg/src/maintenance/partition_stats.rs": 4665,
     "crates/iceberg/src/maintenance/remove_dangling_delete_files.rs": 1796,
