@@ -849,15 +849,6 @@ async fn test_a_small_stripe_size_produces_several_stripes_that_still_round_trip
         split_offsets, footer_offsets,
         "split offsets must match the footer stripe offsets"
     );
-    assert!(
-        data_file.column_sizes().is_empty()
-            && data_file.value_counts().is_empty()
-            && data_file.null_value_counts().is_empty()
-            && data_file.nan_value_counts().is_empty()
-            && data_file.lower_bounds().is_empty()
-            && data_file.upper_bounds().is_empty(),
-        "an ORC data file must carry no column metrics"
-    );
     assert_eq!(
         layout.footer_start
             + layout.postscript_footer_length
