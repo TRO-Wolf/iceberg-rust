@@ -195,6 +195,33 @@ impl<'a> FilesTable<'a> {
         Self::try_new(table, FilesTableKind::Deletes, MetadataScope::AllSnapshots)
     }
 
+    #[allow(missing_docs)]
+    pub fn try_all_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        Self::try_new(
+            table,
+            FilesTableKind::All,
+            MetadataScope::Snapshot(snapshot_id),
+        )
+    }
+
+    #[allow(missing_docs)]
+    pub fn try_data_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        Self::try_new(
+            table,
+            FilesTableKind::Data,
+            MetadataScope::Snapshot(snapshot_id),
+        )
+    }
+
+    #[allow(missing_docs)]
+    pub fn try_deletes_at_snapshot(table: &'a Table, snapshot_id: i64) -> Result<Self> {
+        Self::try_new(
+            table,
+            FilesTableKind::Deletes,
+            MetadataScope::Snapshot(snapshot_id),
+        )
+    }
+
     /// Returns the iceberg schema of the files metadata table.
     ///
     /// Mirrors Java `BaseFilesTable.schema()`. It drops `PARTITION_ID` when the partition type has
