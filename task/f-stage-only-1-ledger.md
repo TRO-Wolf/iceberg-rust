@@ -222,7 +222,7 @@ is untouched (`stage_only: false` defaults pass through unchanged).
 
 ## Gates
 
-Round 2 (re-measured 2026-09-21 after the rebase onto fork main `caebaf7e3`):
+Round 2 (re-measured 2026-09-21 after the rebase onto fork main `21c27eb5`):
 
 - `cargo fmt --all -- --check` — clean
 - `CARGO_BUILD_JOBS=6 cargo clippy -q -p iceberg --all-targets -- -D warnings` — clean

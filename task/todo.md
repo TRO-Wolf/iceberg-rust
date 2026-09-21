@@ -38,20 +38,20 @@ write's snapshot producer adds a snapshot with `wap.id` and moves no ref;
       `publish_changes.rs`, the `to_branch.rs` pattern, because the three capped
       files only get field/ctor/chain lines back-filled by blank-line reclamation);
       `stage_only_tests.rs` pins (staged snapshot exists with `wap.id`, `main` ref
-      unmoved, main read unchanged, staged snapshot readable by id). `5293dfe7b`
+      unmoved, main read unchanged, staged snapshot readable by id). `df5ad0a49`
 - [x] SLICE 2 — `staged_snapshot_for_wap_id(&TableMetadata, &str) -> Result<SnapshotRef>`:
       Java `PublishChangesProcedure` lookup (unknown → "Cannot apply unknown WAP ID
       '<id>'", >1 → "Cannot apply non-unique WAP ID. Found multiple snapshots with WAP
       ID '<id>'"); a unique already-published match returns `Ok` (ruling Q-26d-2) and
       the duplicate check lives in `CherryPickAction::validate_wap_publish`; pins found /
       unknown / non-unique / already-published-returns-Ok.
-      `33d85af32`
+      `7fa2daa6ba44973cba2d8af6f8263358d6941f31`
 - [x] SLICE 3 — `PublishChangesAction` + `Transaction::publish_changes(wap_id)` =
       lookup + `CherryPickAction` delegation; pins: FF publish moves main keeping
       `wap.id`, replay publish stamps `source-snapshot-id` + `published-wap-id` with
       the staged data, unknown id error, double-publish error, V3 first-row-id
       reassigned at publish (Java `MergingSnapshotProducer` suppress + fresh range).
-      `ed9c7a15b`
+      `3ccf88623`
 - [x] SLICE 4 — mutations (round 1, 14 pins then): stage flag ignored in merge_append →
       1 red / 14 (merge_append pin); duplicate check bypassed in the lookup → 1 red / 14
       (already-published pin; `publish_changes_twice` stayed green — cherry-pick's
