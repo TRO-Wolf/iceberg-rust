@@ -29,7 +29,7 @@ use crate::maintenance::add_files::{AddFiles, AddFilesEntry, AddFilesSource};
 pub(super) use crate::maintenance::rewrite_data_files::tests::local_fs_catalog;
 use crate::spec::{
     DEFAULT_SCHEMA_NAME_MAPPING, DataFile, FormatVersion, ManifestContentType, NestedField,
-    PartitionSpec, PrimitiveType, Schema, Transform, Type,
+    PartitionSpec, PrimitiveType, Schema, TableProperties, Transform, Type,
 };
 use crate::table::Table;
 use crate::{Catalog, NamespaceIdent, TableCreation, TableIdent};
@@ -299,7 +299,7 @@ async fn unpartitioned_source_is_adopted_in_place_in_one_append_snapshot() {
         .expect("add_files on an unpartitioned source");
 
     assert_eq!(result.added_files_count, 1, "oracle cell UNPARTITIONED");
-    assert_eq!(result.changed_partition_count, Some(1));
+    assert_eq!(result.changed_partition_count, None);
 
     let table = catalog
         .load_table(table.identifier())
@@ -845,4 +845,105 @@ async fn a_source_whose_partition_columns_match_no_spec_is_refused() {
             .contains("that matches the partition columns ([dept]) in input table"),
         "Java SparkTableUtil.findCompatibleSpec: {error}"
     );
+}
+
+async fn assert_add_files_summary(table: &Table, added_files: u64, added_records: u64) {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("add_files commits one snapshot");
+    assert_eq!(snapshot.summary().operation.as_str(), "append");
+    let files = live_data_files(table).await;
+    let size: u64 = files.iter().map(|file| file.file_size_in_bytes()).sum();
+    assert!(size > 0);
+    let expected = HashMap::from([
+        ("added-data-files".to_string(), added_files.to_string()),
+        ("added-records".to_string(), added_records.to_string()),
+        ("added-files-size".to_string(), size.to_string()),
+        ("total-data-files".to_string(), added_files.to_string()),
+        ("total-delete-files".to_string(), "0".to_string()),
+        ("total-records".to_string(), added_records.to_string()),
+        ("total-files-size".to_string(), size.to_string()),
+        ("total-position-deletes".to_string(), "0".to_string()),
+        ("total-equality-deletes".to_string(), "0".to_string()),
+        ("manifests-created".to_string(), "1".to_string()),
+        ("manifests-kept".to_string(), "0".to_string()),
+        ("manifests-replaced".to_string(), "0".to_string()),
+    ]);
+    assert_eq!(
+        snapshot.summary().additional_properties,
+        expected,
+        "Java importSparkPartitions commits appendManifest: no changed-partition-count"
+    );
+}
+
+#[tokio::test]
+async fn partitioned_import_summary_carries_no_changed_partition_count() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table(&catalog, id_v_cat_schema(), Some("cat"), FormatVersion::V2).await;
+    let root = source_root(&temp_dir, "summary-partitioned");
+    hive_source(&table, &root).await;
+
+    let result = AddFiles::new(table.clone(), AddFilesSource::Directory(root))
+        .execute(&catalog)
+        .await
+        .expect("add_files on a hive-layout source");
+
+    assert_eq!(result.added_files_count, 3);
+    assert_eq!(result.changed_partition_count, None);
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload table");
+    assert_add_files_summary(&table, 3, 4).await;
+}
+
+#[tokio::test]
+async fn unpartitioned_import_summary_carries_no_changed_partition_count() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table(&catalog, id_v_schema(), None, FormatVersion::V2).await;
+    let root = source_root(&temp_dir, "summary-unpartitioned");
+    flat_source(&table, &root).await;
+
+    let result = AddFiles::new(table.clone(), AddFilesSource::Directory(root))
+        .execute(&catalog)
+        .await
+        .expect("add_files on an unpartitioned source");
+
+    assert_eq!(result.added_files_count, 1);
+    assert_eq!(result.changed_partition_count, None);
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload table");
+    assert_add_files_summary(&table, 1, 2).await;
+}
+
+#[tokio::test]
+async fn import_summary_carries_no_partition_keys_under_a_high_summary_limit() {
+    let (catalog, temp_dir) = local_fs_catalog().await;
+    let table = create_table_with_properties(
+        &catalog,
+        id_v_cat_schema(),
+        Some("cat"),
+        FormatVersion::V2,
+        HashMap::from([(
+            TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT.to_string(),
+            "100".to_string(),
+        )]),
+    )
+    .await;
+    let root = source_root(&temp_dir, "summary-limit");
+    hive_source(&table, &root).await;
+
+    AddFiles::new(table.clone(), AddFilesSource::Directory(root))
+        .execute(&catalog)
+        .await
+        .expect("add_files under a high partition summary limit");
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload table");
+    assert_add_files_summary(&table, 3, 4).await;
 }

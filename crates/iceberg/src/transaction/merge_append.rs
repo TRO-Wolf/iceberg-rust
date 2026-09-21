@@ -62,6 +62,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::TableUpdate;
 use crate::error::Result;
 use crate::spec::{
     DataFile, MAIN_BRANCH, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
@@ -85,6 +86,7 @@ use crate::transaction::{ActionCommit, TransactionAction};
 /// file set (the paths a scan reads) is identical to what the equivalent fast append would produce.
 pub struct MergeAppendAction {
     check_duplicate: bool,
+    trust_partition_metrics: bool,
     // below are properties used to create SnapshotProducer when commit
     commit_uuid: Option<Uuid>,
     key_metadata: Option<Vec<u8>>,
@@ -97,6 +99,7 @@ impl MergeAppendAction {
     pub(crate) fn new() -> Self {
         Self {
             check_duplicate: true,
+            trust_partition_metrics: true,
             commit_uuid: None,
             key_metadata: None,
             snapshot_properties: HashMap::default(),
@@ -108,6 +111,11 @@ impl MergeAppendAction {
     /// Set whether to check duplicate files (mirrors `FastAppendAction::with_check_duplicate`).
     pub fn with_check_duplicate(mut self, v: bool) -> Self {
         self.check_duplicate = v;
+        self
+    }
+
+    pub(crate) fn with_trust_partition_metrics(mut self, trust: bool) -> Self {
+        self.trust_partition_metrics = trust;
         self
     }
 
@@ -168,9 +176,36 @@ impl TransactionAction for MergeAppendAction {
         let merge_process =
             MergeManifestProcess::new(snapshot_producer.snapshot_id(), merge_settings);
 
-        snapshot_producer
+        let mut commit = snapshot_producer
             .commit(MergeAppendOperation, merge_process)
-            .await
+            .await?;
+        if !self.trust_partition_metrics {
+            let updates: Vec<TableUpdate> = commit
+                .take_updates()
+                .into_iter()
+                .map(|update| {
+                    if let TableUpdate::AddSnapshot { mut snapshot } = update {
+                        snapshot
+                            .summary
+                            .additional_properties
+                            .remove("changed-partition-count");
+                        snapshot
+                            .summary
+                            .additional_properties
+                            .remove("partition-summaries-included");
+                        snapshot
+                            .summary
+                            .additional_properties
+                            .retain(|key, _| !key.starts_with("partitions."));
+                        TableUpdate::AddSnapshot { snapshot }
+                    } else {
+                        update
+                    }
+                })
+                .collect();
+            commit = ActionCommit::new(updates, commit.take_requirements());
+        }
+        Ok(commit)
     }
 }
 
