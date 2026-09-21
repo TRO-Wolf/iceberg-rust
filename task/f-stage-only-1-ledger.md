@@ -175,7 +175,7 @@ published Append (`publish_changes_twice_has_java_message`).
 |---|---|---|---|
 | V-01 | verify | CLOSED — replay-publish dedup pin added: stage append, advance main, `publish_changes` stamps `published-wap-id`, then `publish_changes` of the same id gives the duplicate-WAP text; AM-5 proves the `published-wap-id` arm is load-bearing | `publish_changes_replay_publish_blocks_the_wap_id_via_published_wap_id` (stage_only_publish_tests.rs); pins: f-stage-only-1/C-009 |
 | V-02 | verify | CLOSED — the stale-metadata resolve is moot: the wap id now binds once per attempt into `PublishBinding`, and `commit` uses the bound `CherryPickAction` against the refreshed table | `PublishChangesAction::bound_cherry_pick` (publish_changes.rs); pins: f-stage-only-1/C-006 |
-| V-03 | verify | CLOSED — every stage pin now asserts Operation, `parent_snapshot_id` == base head, and the staged live file set (overwrite drops the base file; replace-partitions marker + replaced file gone; row delta carries the delete file); per-action publish coverage added; the round-1 ledger's overclaim is corrected by the clause table | five stage pins (stage_only_tests.rs), six per-action publish pins (stage_only_publish_tests.rs); pins: f-stage-only-1/C-002, C-011 |
+| V-03 | verify | CLOSED — every stage pin now asserts Operation, `parent_snapshot_id` == base head, and the staged live file set (overwrite drops the base file; replace-partitions marker + replaced file gone; row delta carries the delete file); per-action publish coverage added; the round-1 ledger's overclaim is corrected by the clause table | five stage pins (stage_only_tests.rs), seven per-action publish pins (stage_only_publish_tests.rs); pins: f-stage-only-1/C-002, C-011 |
 | V-04 | verify | CLOSED — staged overwrite + `validate_no_conflicting_data` rejects a concurrent main append; staged row delta + `validate_no_conflicting_delete_files` rejects a concurrent delete commit; AM-3/AM-4 prove skipping validation under `stage_only` reddens | stage_only_tests.rs; pins: f-stage-only-1/C-004 |
 | V-05 | verify | CLOSED — `staged.sequence_number() == base last_sequence_number + 1`, `last_sequence_number` advances while `current-snapshot-id` is unchanged; v3 publish `first_row_id == next_row_id` captured immediately before `publish_changes` and `!= staged.first_row_id` | `stage_only_consumes_a_sequence_number_at_stage_time`, `publish_changes_replay_assigns_fresh_row_ids_on_v3`; pins: f-stage-only-1/C-003, C-010 |
 | V-06 | verify | CLOSED — one `CherryPickAction` per attempt: bound in a `Mutex` on `PublishChangesAction`, re-checked for existence and `wap.id` on every use; AM-1 proves re-resolving reddens both pins | publish_changes.rs `PublishBinding`/`bound_cherry_pick`; pins: f-stage-only-1/C-006 |
@@ -215,7 +215,7 @@ published Append (`publish_changes_twice_has_java_message`).
 
 COVERAGE_ATTESTATION: 12 clauses (C-001..C-012): 11 PROVEN, 1
 DIVERGENCE-DECLARED (C-012, pinned, named and dated). Findings V-01..V-06 CLOSED,
-L-01..L-03 CLOSED, L-04 DIVERGENCE-DECLARED under ruling Q-26d-3. 13 critic +
+L-01..L-03 CLOSED, L-04 DIVERGENCE-DECLARED under ruling Q-26d-3. 11 critic +
 5 actor mutations recorded above; every mutation run against product code either
 reddened a named pin or is mapped to a closed finding. The non-staged write path
 is untouched (`stage_only: false` defaults pass through unchanged).
