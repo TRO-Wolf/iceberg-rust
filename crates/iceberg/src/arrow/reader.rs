@@ -22,12 +22,11 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_array::{Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_cast::cast::cast;
 use arrow_schema::{
     ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
 };
-use arrow_select::filter::filter_record_batch;
 use bytes::Bytes;
 use fnv::FnvHashSet;
 use futures::future::BoxFuture;
@@ -52,7 +51,6 @@ use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::ranges::merge_ranges;
-use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
@@ -67,8 +65,8 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, get_metadata_field,
-    is_metadata_field, is_row_lineage_field,
+    RESERVED_FIELD_ID_DELETED, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS,
+    RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_metadata_field, is_row_lineage_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
@@ -550,6 +548,9 @@ impl ArrowReader {
 
         let needs_physical_ordinals = task.project_field_ids().contains(&RESERVED_FIELD_ID_POS)
             || task.project_field_ids().contains(&RESERVED_FIELD_ID_ROW_ID);
+        let projecting_deleted = task
+            .project_field_ids()
+            .contains(&RESERVED_FIELD_ID_DELETED);
 
         // Metadata fields are not in the file. The V3 row-lineage pair is the exception: it can be
         // stored, and Java prefers the stored value.
@@ -654,6 +655,14 @@ impl ArrowReader {
 
         // The residual pushed into RowFilter, row-group skip, and page selection. It carries the
         // eq-delete predicate only when the keyset path is not taken.
+        let fused_predicate = match (task.predicate.as_deref(), delete_predicate.clone()) {
+            (None, None) => None,
+            (Some(predicate), None) => Some(predicate.clone()),
+            (None, Some(predicate)) => Some(predicate),
+            (Some(filter_predicate), Some(delete_predicate)) => {
+                Some(filter_predicate.clone().and(delete_predicate))
+            }
+        };
         let (final_predicate, post_decode_eq_sets, post_decode_eq_predicate) = if keyset_post_decode
         {
             (
@@ -661,16 +670,10 @@ impl ArrowReader {
                 eq_delete_sets,
                 delete_predicate,
             )
+        } else if projecting_deleted {
+            (fused_predicate, eq_delete_sets, delete_predicate)
         } else {
-            let final_predicate = match (task.predicate.as_deref(), delete_predicate) {
-                (None, None) => None,
-                (Some(predicate), None) => Some(predicate.clone()),
-                (None, Some(predicate)) => Some(predicate),
-                (Some(filter_predicate), Some(delete_predicate)) => {
-                    Some(filter_predicate.clone().and(delete_predicate))
-                }
-            };
-            (final_predicate, None, None)
+            (fused_predicate, None, None)
         };
 
         if (task.start != 0 || task.length != 0) && selected_row_group_indices.is_none() {
@@ -697,6 +700,7 @@ impl ArrowReader {
                 record_batch_stream_builder.parquet_schema(),
                 record_batch_stream_builder.schema(),
                 &iceberg_field_ids,
+                projecting_deleted,
             )? {
                 RowFilterPlan::Push(pushed) => {
                     record_batch_stream_builder =
@@ -726,7 +730,7 @@ impl ArrowReader {
                 }
             }
 
-            if row_group_filtering_enabled && row_selection.is_none() {
+            if row_group_filtering_enabled && row_selection.is_none() && !projecting_deleted {
                 let predicate_filtered_row_groups = Self::get_selected_row_group_indices(
                     &predicate,
                     record_batch_stream_builder.metadata(),
@@ -746,7 +750,7 @@ impl ArrowReader {
                 };
             }
 
-            if row_selection_enabled && row_selection.is_none() {
+            if row_selection_enabled && row_selection.is_none() && !projecting_deleted {
                 row_selection = Self::get_row_selection_for_filter_predicate(
                     &predicate,
                     record_batch_stream_builder.metadata(),
@@ -757,9 +761,15 @@ impl ArrowReader {
             }
         }
 
+        if projecting_deleted {
+            post_decode_residual = task.predicate.as_deref().cloned();
+        }
+
         let positional_delete_indexes = delete_filter.get_delete_vector(&task);
 
-        if let Some(positional_delete_indexes) = positional_delete_indexes {
+        if !projecting_deleted
+            && let Some(positional_delete_indexes) = positional_delete_indexes.as_ref()
+        {
             // The frozen `Arc<DeleteVector>` needs no mutex: row selection reads the bitmap.
             let delete_row_selection = Self::build_deletes_row_selection(
                 record_batch_stream_builder.metadata().row_groups(),
@@ -779,6 +789,11 @@ impl ArrowReader {
             record_batch_stream_builder =
                 record_batch_stream_builder.with_row_selection(row_selection);
         }
+
+        let mut absolute_pos = super::pos_apply::selected_groups_start_ordinal(
+            record_batch_stream_builder.metadata().row_groups(),
+            selected_row_group_indices.as_deref(),
+        );
 
         if let Some(selected_row_group_indices) = selected_row_group_indices {
             record_batch_stream_builder =
@@ -811,33 +826,16 @@ impl ArrowReader {
                 .build()?
                 .map(move |batch| match batch {
                     Ok(batch) => {
-                        let mut batch = record_batch_transformer.process_record_batch(batch)?;
-                        if let Some(mask) = Self::eq_delete_keep_mask(
-                            &batch,
-                            batch.num_rows(),
+                        let batch = record_batch_transformer.process_record_batch(batch)?;
+                        let mut batch = super::pos_apply::apply_pushdown_path_batch(
+                            batch,
+                            &mut absolute_pos,
+                            positional_delete_indexes.as_ref(),
                             post_decode_eq_predicate.as_ref(),
                             post_decode_eq_sets.as_deref(),
-                        )? {
-                            batch = filter_record_batch(&batch, &mask).map_err(|e| {
-                                Error::new(
-                                    ErrorKind::Unexpected,
-                                    "Failed to apply equality-delete keyset keep-mask to a Parquet data batch",
-                                )
-                                .with_source(e)
-                            })?;
-                        }
-                        if let Some(residual) = post_decode_residual.as_ref() {
-                            let mask = coerce_nulls_to_false(&evaluate_predicate_to_mask(
-                                residual, &batch,
-                            )?);
-                            batch = filter_record_batch(&batch, &mask).map_err(|e| {
-                                Error::new(
-                                    ErrorKind::Unexpected,
-                                    "Failed to apply post-decode residual predicate to a Parquet data batch",
-                                )
-                                .with_source(e)
-                            })?;
-                        }
+                            post_decode_residual.as_ref(),
+                            projecting_deleted,
+                        )?;
                         if prune_extra_columns {
                             batch = batch.project(&projected_column_indices).map_err(|e| {
                                 Error::new(
@@ -962,6 +960,8 @@ impl ArrowReader {
                 residual_predicate.as_deref(),
                 eq_delete_predicate.as_ref(),
                 eq_delete_sets.as_deref(),
+                task.project_field_ids()
+                    .contains(&RESERVED_FIELD_ID_DELETED),
             )
         });
 
@@ -995,6 +995,8 @@ impl ArrowReader {
                 residual_predicate.as_deref(),
                 eq_delete_predicate.as_ref(),
                 eq_delete_sets.as_deref(),
+                task.project_field_ids()
+                    .contains(&RESERVED_FIELD_ID_DELETED),
             ) {
                 Ok(b) => output.push(Ok(b)),
                 Err(e) => {
@@ -1060,15 +1062,6 @@ impl ArrowReader {
             eq_delete_predicate,
             eq_delete_sets,
         ))
-    }
-
-    fn eq_delete_keep_mask(
-        batch: &RecordBatch,
-        num_rows: usize,
-        eq_delete_predicate: Option<&BoundPredicate>,
-        eq_delete_sets: Option<&[EqDeleteKeySet]>,
-    ) -> Result<Option<BooleanArray>> {
-        super::pos_apply::eq_delete_keep_mask(batch, num_rows, eq_delete_predicate, eq_delete_sets)
     }
 
     /// computes a `RowSelection` from positional delete indices.
@@ -1800,10 +1793,6 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
         self.field_ids.insert(reference.field().id);
         Ok(())
     }
-}
-
-fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
-    super::pos_apply::coerce_nulls_to_false(mask)
 }
 
 /// `true` when every key field id of `sets` is projected. The keyset path needs it to resolve
@@ -9118,7 +9107,7 @@ mod parquet_eq_keyset_mor_tests {
             .map(|i| !(survives.is_valid(i) && survives.value(i)))
             .collect();
 
-        let keep = ArrowReader::eq_delete_keep_mask(
+        let keep = crate::arrow::pos_apply::eq_delete_keep_mask(
             &batch,
             batch.num_rows(),
             Some(&bound),
