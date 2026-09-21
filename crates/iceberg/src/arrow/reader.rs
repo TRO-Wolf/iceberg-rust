@@ -22,8 +22,7 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_arith::boolean::and;
-use arrow_array::{Array, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_array::{BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
 use arrow_cast::cast::cast;
 use arrow_schema::{
     ArrowError, DataType, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
@@ -47,7 +46,6 @@ use typed_builder::TypedBuilder;
 use crate::arrow::arrow_schema_to_schema;
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
-use crate::arrow::delete_filter::positional_delete_keep_mask;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
@@ -939,7 +937,7 @@ impl ArrowReader {
 
     /// The Parquet path when `_pos` is projected. It decodes in physical order with no
     /// `RowFilter`, `RowSelection`, or row-group prune, and streams batches through
-    /// [`Self::apply_pos_aware_batch`], so memory stays O(batch).
+    /// [`super::pos_apply::apply_pos_aware_batch`], so memory stays O(batch).
     async fn stream_pos_projection_scan_task<S>(
         task: FileScanTask,
         parquet_stream: S,
@@ -957,7 +955,7 @@ impl ArrowReader {
         let mut absolute_pos: u64 = 0;
         let record_batch_stream = parquet_stream.map(move |batch_result| {
             let batch = batch_result.map_err(Error::from)?;
-            Self::apply_pos_aware_batch(
+            super::pos_apply::apply_pos_aware_batch(
                 batch,
                 &mut record_batch_transformer,
                 &mut absolute_pos,
@@ -975,7 +973,7 @@ impl ArrowReader {
     /// materialized `batches`. It builds the same [`RecordBatchTransformer`] the Parquet path
     /// feeds, ANDs the equality-delete predicate with the scan residual into one survival
     /// predicate, and applies merge-on-read deletes after materialization. The per-batch apply is
-    /// [`Self::apply_pos_aware_batch`], shared with the Parquet `_pos` streaming path.
+    /// [`super::pos_apply::apply_pos_aware_batch`], shared with the Parquet `_pos` streaming path.
     async fn finish_whole_file_scan_task(
         task: FileScanTask,
         batches: Vec<RecordBatch>,
@@ -991,7 +989,7 @@ impl ArrowReader {
         let mut output: Vec<Result<RecordBatch>> = Vec::with_capacity(batches.len());
         let mut absolute_pos: u64 = 0;
         for batch in batches {
-            match Self::apply_pos_aware_batch(
+            match super::pos_apply::apply_pos_aware_batch(
                 batch,
                 &mut record_batch_transformer,
                 &mut absolute_pos,
@@ -1066,176 +1064,13 @@ impl ArrowReader {
         ))
     }
 
-    /// Transform one decoded batch, assign `_pos` from the running physical counter (via the
-    /// transformer), apply MoR survival (positional / residual / eq), advance `absolute_pos` by the
-    /// **full pre-filter** row count. Shared by Parquet `_pos` streaming and Avro/ORC whole-file. #
-    /// Notes `absolute_pos` and the transformer's `next_row_position` must track the same physical
-    /// ordinal base.
-    fn apply_pos_aware_batch(
-        batch: RecordBatch,
-        transformer: &mut RecordBatchTransformer,
-        absolute_pos: &mut u64,
-        positional_deletes: Option<&Arc<DeleteVector>>,
-        residual_predicate: Option<&BoundPredicate>,
-        eq_delete_predicate: Option<&BoundPredicate>,
-        eq_delete_sets: Option<&[EqDeleteKeySet]>,
-    ) -> Result<RecordBatch> {
-        let row_count = batch.num_rows();
-        let batch_base = *absolute_pos;
-        let transformed = transformer.process_record_batch(batch.clone())?;
-        // `absolute_pos` and the transformer's `next_row_position` must stay aligned. Under a
-        // `_pos` projection the first ordinal in the batch equals `batch_base`. A desync corrupts
-        // written position deletes.
-        debug_assert!(
-            {
-                use arrow_array::Int64Array;
-
-                use crate::metadata_columns::RESERVED_COL_NAME_POS;
-                match transformed.column_by_name(RESERVED_COL_NAME_POS) {
-                    Some(col) if row_count > 0 => col
-                        .as_any()
-                        .downcast_ref::<Int64Array>()
-                        .is_some_and(|a| a.value(0) as u64 == batch_base),
-                    _ => true,
-                }
-            },
-            "absolute_pos desynced from transformer _pos (batch_base={batch_base}, rows={row_count})"
-        );
-        let mask = Self::survival_mask(
-            &batch,
-            row_count,
-            batch_base,
-            positional_deletes,
-            residual_predicate,
-            eq_delete_predicate,
-            eq_delete_sets,
-        )?;
-        // Advance by the full batch before any mask filter, so the next batch's ordinals follow.
-        *absolute_pos = absolute_pos.saturating_add(row_count as u64);
-        match mask {
-            None => Ok(transformed),
-            Some(mask) => filter_record_batch(&transformed, &mask).map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to apply merge-on-read deletes to a data batch under _pos / whole-file scan",
-                )
-                .with_source(e)
-            }),
-        }
-    }
-
-    /// Builds the per-row survival mask for a transformed batch, from the positional deletes over
-    /// `[batch_base, batch_base + num_rows)`, the scan residual, and the equality deletes. Returns
-    /// `None` when nothing applies, else a mask where `true` keeps the row. `eq_delete_sets`, when
-    /// `Some`, holds the hashed key sets for the task's eq-delete files.
-    fn survival_mask(
-        batch: &RecordBatch,
-        num_rows: usize,
-        batch_base: u64,
-        positional_deletes: Option<&Arc<DeleteVector>>,
-        residual_predicate: Option<&BoundPredicate>,
-        eq_delete_predicate: Option<&BoundPredicate>,
-        eq_delete_sets: Option<&[EqDeleteKeySet]>,
-    ) -> Result<Option<BooleanArray>> {
-        // Positional deletes give a keep-mask of `!deleted` over this batch's position window.
-        // The memoized vector is frozen, so the apply path takes no lock.
-        let positional_mask: Option<BooleanArray> = match positional_deletes {
-            Some(deletes) => {
-                if deletes.is_empty() {
-                    None
-                } else {
-                    // The range walk equals the per-row `!contains` probe, in O(D_window).
-                    Some(positional_delete_keep_mask(
-                        deletes.as_ref(),
-                        batch_base,
-                        num_rows,
-                    ))
-                }
-            }
-            None => None,
-        };
-
-        // The mask is already two-valued under Java nulls-first semantics. The coercion is
-        // defense in depth.
-        let predicate_keep = |predicate: &BoundPredicate| -> Result<BooleanArray> {
-            Ok(coerce_nulls_to_false(&evaluate_predicate_to_mask(
-                predicate, batch,
-            )?))
-        };
-
-        // Scan residual (`task.predicate`) → always via the predicate path.
-        let residual_mask: Option<BooleanArray> = match residual_predicate {
-            Some(predicate) => Some(predicate_keep(predicate)?),
-            None => None,
-        };
-
-        // Equality-delete keep-mask (shared with the Parquet pushdown post-decode keyset path).
-        let eq_delete_mask =
-            Self::eq_delete_keep_mask(batch, num_rows, eq_delete_predicate, eq_delete_sets)?;
-
-        // AND the present keep-masks together.
-        let combine =
-            |a: Option<BooleanArray>, b: Option<BooleanArray>| -> Result<Option<BooleanArray>> {
-                match (a, b) {
-                    (None, None) => Ok(None),
-                    (Some(m), None) | (None, Some(m)) => Ok(Some(m)),
-                    (Some(x), Some(y)) => Ok(Some(and(&x, &y).map_err(|e| {
-                        Error::new(
-                            ErrorKind::Unexpected,
-                            "Failed to combine merge-on-read delete masks for a data batch",
-                        )
-                        .with_source(e)
-                    })?)),
-                }
-            };
-        let combined = combine(positional_mask, residual_mask)?;
-        combine(combined, eq_delete_mask)
-    }
-
-    /// The equality-delete keep-mask for one transformed batch. It uses the O(R)
-    /// [`EqDeleteKeySet`] path, and falls back to the bound predicate for the whole batch when any
-    /// set reports a NULL key column. Returns `None` when no eq-deletes apply.
     fn eq_delete_keep_mask(
         batch: &RecordBatch,
         num_rows: usize,
         eq_delete_predicate: Option<&BoundPredicate>,
         eq_delete_sets: Option<&[EqDeleteKeySet]>,
     ) -> Result<Option<BooleanArray>> {
-        // A NULL key column in any set sends the whole batch to the predicate.
-        let mut from_sets: Option<BooleanArray> = None;
-        if let Some(sets) = eq_delete_sets.filter(|s| !s.is_empty()) {
-            let mut keep = vec![true; num_rows];
-            let mut all_sets_safe = true;
-            for set in sets {
-                // Call `delete_mask` even on an empty set. The I64 store drops null delete cells,
-                // so a null-only eq-delete file reports empty but must still bail to the
-                // predicate, or `col IS NULL` deletes never apply.
-                match set.delete_mask(batch)? {
-                    Some(deleted) => {
-                        for (k, d) in keep.iter_mut().zip(deleted.iter()) {
-                            *k &= !*d;
-                        }
-                    }
-                    None => {
-                        all_sets_safe = false;
-                        break;
-                    }
-                }
-            }
-            if all_sets_safe {
-                from_sets = Some(BooleanArray::from(keep));
-            }
-        }
-        match from_sets {
-            Some(mask) => Ok(Some(mask)),
-            // No usable set, so use the predicate.
-            None => match eq_delete_predicate {
-                Some(predicate) => Ok(Some(coerce_nulls_to_false(&evaluate_predicate_to_mask(
-                    predicate, batch,
-                )?))),
-                None => Ok(None),
-            },
-        }
+        super::pos_apply::eq_delete_keep_mask(batch, num_rows, eq_delete_predicate, eq_delete_sets)
     }
 
     /// computes a `RowSelection` from positional delete indices.
@@ -1969,14 +1804,8 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
     }
 }
 
-/// Coerces a three-valued keep-mask to two values, turning NULL into `false`, as the Parquet
-/// `RowFilter` does. [`evaluate_predicate_to_mask`] already returns a two-valued mask, so this is
-/// defense in depth against a future three-valued-logic leak.
 fn coerce_nulls_to_false(mask: &BooleanArray) -> BooleanArray {
-    if mask.null_count() == 0 {
-        return mask.clone();
-    }
-    BooleanArray::from_iter((0..mask.len()).map(|i| Some(mask.is_valid(i) && mask.value(i))))
+    super::pos_apply::coerce_nulls_to_false(mask)
 }
 
 /// `true` when every key field id of `sets` is projected. The keyset path needs it to resolve

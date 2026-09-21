@@ -42,6 +42,7 @@ mod int96;
 pub(crate) mod null_propagation;
 mod open_parquet;
 pub(crate) mod orc_reader;
+mod pos_apply;
 mod ranges;
 mod reader;
 pub(crate) mod record_batch_predicate;
