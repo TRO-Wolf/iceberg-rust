@@ -42,6 +42,7 @@ mod int96;
 pub(crate) mod null_propagation;
 mod open_parquet;
 pub(crate) mod orc_reader;
+pub(crate) mod partition_constant;
 mod pos_apply;
 mod ranges;
 mod reader;

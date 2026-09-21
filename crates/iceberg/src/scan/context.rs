@@ -20,11 +20,13 @@ use std::sync::Arc;
 use futures::channel::mpsc::Sender;
 use futures::{SinkExt, TryFutureExt};
 
+use crate::arrow::partition_constant::unified_partition_type;
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
 use crate::expr::visitors::residual_evaluator::ResidualEvaluator;
 use crate::expr::{BoundPredicate, Predicate};
 use crate::io::object_cache::ObjectCache;
+use crate::metadata_columns::{RESERVED_FIELD_ID_PARTITION, schema_with_partition};
 use crate::scan::metrics_collector::ScanMetricsCollector;
 use crate::scan::{
     BoundPredicates, ExpressionEvaluatorCache, FileScanTask, ManifestEvaluatorCache,
@@ -32,7 +34,7 @@ use crate::scan::{
 };
 use crate::spec::{
     DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestEntryRef, ManifestFile,
-    ManifestList, NameMapping, PartitionSpecRef, SchemaRef, SnapshotRef, TableMetadata,
+    ManifestList, NameMapping, PartitionSpecRef, SchemaRef, SnapshotRef, StructType, TableMetadata,
     TableMetadataRef, TableProperties,
 };
 use crate::{Error, ErrorKind, Result};
@@ -106,6 +108,8 @@ pub(crate) struct ManifestFileContext {
     /// in the table metadata, in which case the reader reads those columns from the file.
     partition_spec: Option<PartitionSpecRef>,
 
+    partition_type_union: Option<Arc<StructType>>,
+
     /// The table's default name mapping (property `schema.name-mapping.default`), parsed once per
     /// plan and shared across every manifest. Threaded onto each [`FileScanTask`] so the arrow
     /// reader can resolve field ids by column name when a data file lacks embedded field ids (the
@@ -140,6 +144,8 @@ pub(crate) struct ManifestEntryContext {
     /// materialization in the arrow reader (Java `PartitionUtil.constantsMap`).
     pub partition_spec: Option<PartitionSpecRef>,
 
+    pub partition_type_union: Option<Arc<StructType>>,
+
     /// The table's default name mapping, shared from the manifest context (parsed once per plan).
     /// Threaded onto the produced [`FileScanTask`] so the arrow reader resolves field ids by column
     /// name for data files that lack embedded field ids. `None` when the table has no name-mapping
@@ -164,6 +170,7 @@ impl ManifestFileContext {
             delete_file_index,
             residual_evaluator,
             partition_spec,
+            partition_type_union,
             name_mapping,
             ..
         } = self;
@@ -193,6 +200,7 @@ impl ManifestFileContext {
                 case_sensitive: self.case_sensitive,
                 residual_evaluator: residual_evaluator.clone(),
                 partition_spec: partition_spec.clone(),
+                partition_type_union: partition_type_union.clone(),
                 name_mapping: name_mapping.clone(),
             };
 
@@ -242,7 +250,7 @@ impl ManifestEntryContext {
             data_file_path: Arc::from(self.manifest_entry.file_path()),
             data_file_format: self.manifest_entry.file_format(),
 
-            schema: self.snapshot_schema.clone(),
+            schema: self.task_schema()?,
             // field_ids is already Arc<Vec<i32>> on the plan context — share the slice.
             project_field_ids: Arc::from(self.field_ids.as_slice()),
             predicate,
@@ -320,6 +328,18 @@ impl ManifestEntryContext {
             self.bound_predicates.as_deref(),
             &self.expression_evaluator_cache,
         )
+    }
+
+    fn task_schema(&self) -> Result<SchemaRef> {
+        if self.field_ids.contains(&RESERVED_FIELD_ID_PARTITION)
+            && let Some(partition_union) = self.partition_type_union.as_deref()
+        {
+            return Ok(Arc::new(schema_with_partition(
+                &self.snapshot_schema,
+                partition_union,
+            )?));
+        }
+        Ok(self.snapshot_schema.clone())
     }
 }
 
@@ -583,6 +603,21 @@ impl PlanContext {
             .partition_spec_by_id(manifest_file.partition_spec_id)
             .cloned();
 
+        let partition_type_union = if self.field_ids.contains(&RESERVED_FIELD_ID_PARTITION) {
+            let specs: Vec<PartitionSpecRef> = self
+                .table_metadata
+                .partition_specs
+                .values()
+                .cloned()
+                .collect();
+            Some(Arc::new(unified_partition_type(
+                &specs,
+                &self.snapshot_schema,
+            )?))
+        } else {
+            None
+        };
+
         // Build the residual evaluator once per manifest file, sharing it across all
         // entries (the spec + snapshot filter are constant within a manifest). It is
         // only needed when the scan has a row filter AND residual application is
@@ -623,6 +658,7 @@ impl PlanContext {
             case_sensitive: self.case_sensitive,
             residual_evaluator,
             partition_spec,
+            partition_type_union,
             name_mapping: self.name_mapping.clone(),
         })
     }

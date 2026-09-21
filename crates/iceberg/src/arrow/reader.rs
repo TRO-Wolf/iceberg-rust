@@ -50,6 +50,7 @@ use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
 use crate::arrow::orc_reader::read_orc_data_file;
+use crate::arrow::partition_constant::partition_value_for_task;
 use crate::arrow::ranges::merge_ranges;
 use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
@@ -65,8 +66,9 @@ use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::io::{FileIO, FileMetadata, FileRead};
 use crate::metadata_columns::{
-    RESERVED_FIELD_ID_DELETED, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_POS,
-    RESERVED_FIELD_ID_ROW_ID, get_metadata_field, is_metadata_field, is_row_lineage_field,
+    RESERVED_FIELD_ID_DELETED, RESERVED_FIELD_ID_FILE, RESERVED_FIELD_ID_PARTITION,
+    RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID, get_metadata_field,
+    is_metadata_field, is_row_lineage_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
 use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
@@ -810,6 +812,29 @@ impl ArrowReader {
                 record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
         }
 
+        if task
+            .project_field_ids()
+            .contains(&RESERVED_FIELD_ID_SPEC_ID)
+            && let Some(spec) = task.partition_spec.as_deref()
+        {
+            let spec_datum = Datum::int(spec.spec_id());
+            record_batch_transformer_builder = record_batch_transformer_builder
+                .with_constant(RESERVED_FIELD_ID_SPEC_ID, spec_datum);
+        }
+
+        if task
+            .project_field_ids()
+            .contains(&RESERVED_FIELD_ID_PARTITION)
+        {
+            let partition_value = partition_value_for_task(
+                &task.schema,
+                task.partition_spec.as_deref(),
+                task.partition.as_ref(),
+            )?;
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_partition_value(partition_value);
+        }
+
         if let (Some(partition_spec), Some(partition_data)) =
             (task.partition_spec.clone(), task.partition.clone())
         {
@@ -1023,6 +1048,27 @@ impl ArrowReader {
             let file_datum = Datum::string(task.data_file_path.clone());
             record_batch_transformer_builder =
                 record_batch_transformer_builder.with_constant(RESERVED_FIELD_ID_FILE, file_datum);
+        }
+        if task
+            .project_field_ids()
+            .contains(&RESERVED_FIELD_ID_SPEC_ID)
+            && let Some(spec) = task.partition_spec.as_deref()
+        {
+            let spec_datum = Datum::int(spec.spec_id());
+            record_batch_transformer_builder = record_batch_transformer_builder
+                .with_constant(RESERVED_FIELD_ID_SPEC_ID, spec_datum);
+        }
+        if task
+            .project_field_ids()
+            .contains(&RESERVED_FIELD_ID_PARTITION)
+        {
+            let partition_value = partition_value_for_task(
+                &task.schema,
+                task.partition_spec.as_deref(),
+                task.partition.as_ref(),
+            )?;
+            record_batch_transformer_builder =
+                record_batch_transformer_builder.with_partition_value(partition_value);
         }
         if let (Some(partition_spec), Some(partition_data)) =
             (task.partition_spec.clone(), task.partition.clone())
