@@ -937,7 +937,6 @@ impl ArrowReader {
 
     /// The Parquet path when `_pos` is projected. It decodes in physical order with no
     /// `RowFilter`, `RowSelection`, or row-group prune, and streams batches through
-    /// [`super::pos_apply::apply_pos_aware_batch`], so memory stays O(batch).
     async fn stream_pos_projection_scan_task<S>(
         task: FileScanTask,
         parquet_stream: S,
@@ -973,7 +972,6 @@ impl ArrowReader {
     /// materialized `batches`. It builds the same [`RecordBatchTransformer`] the Parquet path
     /// feeds, ANDs the equality-delete predicate with the scan residual into one survival
     /// predicate, and applies merge-on-read deletes after materialization. The per-batch apply is
-    /// [`super::pos_apply::apply_pos_aware_batch`], shared with the Parquet `_pos` streaming path.
     async fn finish_whole_file_scan_task(
         task: FileScanTask,
         batches: Vec<RecordBatch>,
