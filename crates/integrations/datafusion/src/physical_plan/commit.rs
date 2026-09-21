@@ -453,5 +453,8 @@ impl ExecutionPlan for IcebergCommitExec {
 }
 
 #[cfg(test)]
+#[path = "commit_stage_only_tests.rs"]
+mod stage_only_tests;
+#[cfg(test)]
 #[path = "commit_tests.rs"]
 mod tests;
