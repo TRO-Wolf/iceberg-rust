@@ -831,6 +831,16 @@ mod tests {
         assert_eq!(rows, 3);
     }
 
+    #[tokio::test]
+    async fn avro_spelled_out_codecs_round_trip() {
+        let (codec, rows) = avro_codec_name_and_rows_for_property("null").await;
+        assert_eq!(codec, "null");
+        assert_eq!(rows, 3);
+        let (codec, rows) = avro_codec_name_and_rows_for_property("zstandard").await;
+        assert_eq!(codec, "zstandard");
+        assert_eq!(rows, 3);
+    }
+
     #[test]
     fn avro_bogus_codec_errors_naming_value() {
         for value in ["broccoli", "snappy", "bzip2", "xz"] {
