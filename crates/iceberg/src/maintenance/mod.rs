@@ -175,6 +175,8 @@ mod rewrite_data_files_evolved_schema_tests;
 #[cfg(test)]
 mod rewrite_data_files_evolved_spec_tests;
 #[cfg(test)]
+mod rewrite_data_files_format_tests;
+#[cfg(test)]
 mod rewrite_data_files_fuse_tests;
 #[cfg(test)]
 mod rewrite_data_files_lineage_tests;
