@@ -38,6 +38,7 @@ use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::partitioning::fanout_writer::ascending_partition_order;
 
+use crate::physical_plan::commit_order::apply_commit_order;
 use crate::physical_plan::delete::IsolationLevel;
 use crate::physical_plan::{DATA_FILES_COL_NAME, WRITE_PARTITION_INDEX_COL_NAME};
 use crate::to_datafusion_error;
@@ -269,6 +270,7 @@ impl ExecutionPlan for IcebergCommitExec {
         let commit_branch = self.commit_branch.clone();
         let stage_only = self.stage_only;
         let caller_properties = self.snapshot_properties.clone();
+        let session_config = context.session_config().clone();
 
         // Process the input streams from all partitions and commit the data files
         let stream = futures::stream::once(async move {
@@ -349,6 +351,7 @@ impl ExecutionPlan for IcebergCommitExec {
                 .into_iter()
                 .map(|(_, data_file)| data_file)
                 .collect();
+            let data_files = apply_commit_order(data_files, &session_config)?;
 
             // NOTE (empty-commit semantics, BUG-001/BUG-004): there is deliberately NO
             // `if data_files.is_empty() { return empty }` short-circuit here. A blanket early
