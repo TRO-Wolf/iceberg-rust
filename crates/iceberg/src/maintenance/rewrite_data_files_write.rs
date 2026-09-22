@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_arith::boolean::is_null;
@@ -34,8 +35,8 @@ use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
 use crate::arrow::{
-    ArrowFileReader, ArrowReaderBuilder, ParquetReadOptions, RecordBatchPartitionSplitter,
-    schema_to_arrow_schema,
+    ArrowFileReader, ArrowReaderBuilder, FieldMatchMode, ParquetReadOptions,
+    RecordBatchPartitionSplitter, schema_to_arrow_schema,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::io::{FileIO, FileMetadata};
@@ -65,7 +66,9 @@ use crate::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, LocationGenerator, TableLocationGenerator,
 };
 use crate::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use crate::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
+use crate::writer::file_writer::{
+    AnyFileWriterBuilder, ParquetWriterBuilder, parquet_compression_from_properties,
+};
 use crate::writer::{IcebergWriter, IcebergWriterBuilder};
 
 pub(crate) struct CompactedWrite {
@@ -79,7 +82,7 @@ pub(crate) struct CompactedWrite {
 const SORTED_OUTPUT_ROWS: usize = 8192;
 
 type RewriteWriterBuilder =
-    DataFileWriterBuilder<ParquetWriterBuilder, TableLocationGenerator, DefaultFileNameGenerator>;
+    DataFileWriterBuilder<AnyFileWriterBuilder, TableLocationGenerator, DefaultFileNameGenerator>;
 
 struct RewriteOutput {
     chunk_rows: usize,
@@ -185,23 +188,44 @@ pub(crate) async fn write_compacted_files(
         None,
         &format!("rewrite-sort-spill-{}", uuid::Uuid::now_v7()),
     );
+    let table_props = table.metadata().table_properties()?;
+    let file_format = DataFileFormat::from_str(&table_props.write_format_default)?;
     let file_name_generator = DefaultFileNameGenerator::new(
         "compacted".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
-        DataFileFormat::Parquet,
+        file_format,
     );
-    let compression = parquet_compression_from_properties(table.metadata().properties())?;
-    let (fallback_columns, input_footers) =
-        dictionary_fallback_columns(table.file_io(), group).await?;
-    let mut writer_properties = WriterProperties::builder().set_compression(compression);
-    for path in fallback_columns {
-        writer_properties = writer_properties.set_column_dictionary_enabled(path, false);
-    }
-    let parquet_builder = ParquetWriterBuilder::new(writer_properties.build(), schema.clone())
-        .with_metrics_config(MetricsConfig::for_table(table.metadata())?);
+    let (file_writer_builder, input_footers) = match file_format {
+        DataFileFormat::Parquet => {
+            let compression = parquet_compression_from_properties(table.metadata().properties())?;
+            let (fallback_columns, input_footers) =
+                dictionary_fallback_columns(table.file_io(), group).await?;
+            let mut writer_properties = WriterProperties::builder().set_compression(compression);
+            for path in fallback_columns {
+                writer_properties = writer_properties.set_column_dictionary_enabled(path, false);
+            }
+            let parquet_builder =
+                ParquetWriterBuilder::new(writer_properties.build(), schema.clone())
+                    .with_metrics_config(MetricsConfig::for_table(table.metadata())?);
+            (
+                AnyFileWriterBuilder::Parquet(Box::new(parquet_builder)),
+                input_footers,
+            )
+        }
+        other => {
+            let builder = AnyFileWriterBuilder::for_format(
+                other,
+                schema.clone(),
+                table.metadata().properties(),
+                MetricsConfig::for_table(table.metadata())?,
+                FieldMatchMode::Id,
+            )?;
+            (builder, HashMap::new())
+        }
+    };
     let write_max = write_max_file_size(config.target_file_size_bytes, config.max_file_size_bytes);
     let rolling_builder = RollingFileWriterBuilder::new(
-        parquet_builder,
+        file_writer_builder,
         usize::try_from(write_max).unwrap_or(usize::MAX),
         table.file_io().clone(),
         location_generator,
@@ -367,7 +391,7 @@ async fn write_sorted_run(
     keys: &[RewriteSortKey],
     splitter: Option<&RecordBatchPartitionSplitter>,
     rolling_builder: &RollingFileWriterBuilder<
-        ParquetWriterBuilder,
+        AnyFileWriterBuilder,
         TableLocationGenerator,
         DefaultFileNameGenerator,
     >,
