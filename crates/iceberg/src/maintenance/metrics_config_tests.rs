@@ -665,10 +665,8 @@ async fn position_delete_keeps_full_bounds_under_none_default() {
         file.column_sizes().keys().copied().collect::<HashSet<_>>(),
         reserved
     );
-    assert_eq!(
-        file.value_counts().keys().copied().collect::<HashSet<_>>(),
-        reserved
-    );
+    assert!(file.value_counts().is_empty());
+    assert!(file.null_value_counts().is_empty());
     assert_eq!(
         file.lower_bounds().keys().copied().collect::<HashSet<_>>(),
         reserved
@@ -676,13 +674,6 @@ async fn position_delete_keeps_full_bounds_under_none_default() {
     assert_eq!(
         file.upper_bounds().keys().copied().collect::<HashSet<_>>(),
         reserved
-    );
-    assert_eq!(
-        *file
-            .value_counts()
-            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH)
-            .unwrap(),
-        1
     );
     let path_bound = file
         .lower_bounds()
@@ -786,14 +777,6 @@ async fn compacted_pos_delete_keeps_full_bounds_under_none_default() {
             .keys()
             .copied()
             .collect::<HashSet<i32>>(),
-        file.value_counts()
-            .keys()
-            .copied()
-            .collect::<HashSet<i32>>(),
-        file.null_value_counts()
-            .keys()
-            .copied()
-            .collect::<HashSet<i32>>(),
         file.lower_bounds()
             .keys()
             .copied()
@@ -805,6 +788,8 @@ async fn compacted_pos_delete_keeps_full_bounds_under_none_default() {
     ] {
         assert_eq!(keys, reserved);
     }
+    assert!(file.value_counts().is_empty());
+    assert!(file.null_value_counts().is_empty());
     assert!(file.nan_value_counts().is_empty());
     assert_eq!(
         file.lower_bounds()

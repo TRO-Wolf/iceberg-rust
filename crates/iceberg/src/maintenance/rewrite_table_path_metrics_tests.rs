@@ -58,16 +58,6 @@ async fn staged_pos_delete_keeps_full_bounds_under_none_default() {
             .copied()
             .collect::<HashSet<i32>>(),
         staged
-            .value_counts()
-            .keys()
-            .copied()
-            .collect::<HashSet<i32>>(),
-        staged
-            .null_value_counts()
-            .keys()
-            .copied()
-            .collect::<HashSet<i32>>(),
-        staged
             .lower_bounds()
             .keys()
             .copied()
@@ -80,6 +70,8 @@ async fn staged_pos_delete_keeps_full_bounds_under_none_default() {
     ] {
         assert_eq!(keys, reserved);
     }
+    assert!(staged.value_counts().is_empty());
+    assert!(staged.null_value_counts().is_empty());
     assert!(staged.nan_value_counts().is_empty());
     let bound = staged
         .lower_bounds()
