@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod commit;
+pub mod commit_order;
 pub(crate) mod conform;
 pub(crate) mod cow_affected;
 #[cfg(test)]
@@ -49,5 +50,6 @@ pub(crate) mod write;
 pub(crate) const DATA_FILES_COL_NAME: &str = "data_files";
 pub(crate) const WRITE_PARTITION_INDEX_COL_NAME: &str = "write_partition_index";
 
+pub use commit_order::DataFileCommitOrder;
 pub use project::project_with_partition;
 pub use scan::{IcebergScanOptions, IcebergTableScan, ensure_iceberg_scan_options};
