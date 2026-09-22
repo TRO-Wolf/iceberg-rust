@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, ArrayRef, BooleanArray, Int64Builder, RecordBatch};
@@ -37,11 +38,11 @@ use iceberg::spec::{
 };
 use iceberg::table::Table;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::AnyFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, TableLocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::file_writer::{ParquetWriterBuilder, parquet_compression_from_properties};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use super::sort::{WriteSort, write_sort_plan};
@@ -208,10 +209,10 @@ fn lineage_arrow_field(name: &'static str, field_id: i32) -> Field {
 }
 
 type DmlDataFileWriterBuilder =
-    DataFileWriterBuilder<ParquetWriterBuilder, TableLocationGenerator, DefaultFileNameGenerator>;
+    DataFileWriterBuilder<AnyFileWriterBuilder, TableLocationGenerator, DefaultFileNameGenerator>;
 
 type DmlRollingBuilder = RollingFileWriterBuilder<
-    ParquetWriterBuilder,
+    AnyFileWriterBuilder,
     TableLocationGenerator,
     DefaultFileNameGenerator,
 >;
@@ -237,25 +238,24 @@ impl StreamingDataFileWriter {
         let table_field_count = table_schema.as_struct().fields().len();
         let schema = table_write_schema(table)?;
 
-        let compression = parquet_compression_from_properties(table.metadata().properties())
+        let table_props = table
+            .metadata()
+            .table_properties()
             .map_err(to_datafusion_error)?;
-        let parquet_builder = ParquetWriterBuilder::new_with_match_mode(
-            parquet::file::properties::WriterProperties::builder()
-                .set_compression(compression)
-                .build(),
+        let file_format = DataFileFormat::from_str(&table_props.write_format_default)
+            .map_err(to_datafusion_error)?;
+        let file_writer_builder = AnyFileWriterBuilder::for_format(
+            file_format,
             schema.clone(),
+            table.metadata().properties(),
+            MetricsConfig::for_table(table.metadata()).map_err(to_datafusion_error)?,
             FieldMatchMode::Name,
         )
-        .with_metrics_config(
-            MetricsConfig::for_table(table.metadata()).map_err(to_datafusion_error)?,
-        );
+        .map_err(to_datafusion_error)?;
         let location_gen =
             TableLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
-        let file_name_gen = DefaultFileNameGenerator::new(
-            uuid::Uuid::now_v7().to_string(),
-            None,
-            DataFileFormat::Parquet,
-        );
+        let file_name_gen =
+            DefaultFileNameGenerator::new(uuid::Uuid::now_v7().to_string(), None, file_format);
         let run_target = table
             .metadata()
             .properties()
@@ -272,7 +272,7 @@ impl StreamingDataFileWriter {
             .map(|target| usize::try_from(target).unwrap_or(usize::MAX))
             .unwrap_or(TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
         let rolling_builder = RollingFileWriterBuilder::new(
-            parquet_builder,
+            file_writer_builder,
             run_target,
             table.file_io().clone(),
             location_gen,

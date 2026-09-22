@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::assert_batches_eq;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
@@ -27,11 +28,17 @@ use iceberg::metadata_columns::{
     RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_COL_NAME_ROW_ID,
 };
 use iceberg::spec::{
-    FormatVersion, NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+    DataContentType, DataFile, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema,
+    TableProperties, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{
+    Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
+};
 use iceberg_datafusion::IcebergCatalogProvider;
+use parquet::basic::Encoding;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use tempfile::TempDir;
 
 fn leak_temp_path() -> String {
@@ -53,17 +60,41 @@ async fn catalog() -> MemoryCatalog {
 }
 
 async fn v3_cow_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
-    v3_cow_ctx_inner(ns, tbl, false).await
+    v3_cow_ctx_inner(ns, tbl, false, HashMap::new()).await
+}
+
+async fn v3_cow_ctx_with_format(
+    ns: &str,
+    tbl: &str,
+    format: &str,
+) -> (SessionContext, Arc<MemoryCatalog>) {
+    let prop = TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string();
+    v3_cow_ctx_inner(ns, tbl, false, HashMap::from([(prop, format.to_string())])).await
+}
+
+async fn v3_cow_ctx_with_dict(
+    ns: &str,
+    tbl: &str,
+    dict: &str,
+) -> (SessionContext, Arc<MemoryCatalog>) {
+    v3_cow_ctx_inner(
+        ns,
+        tbl,
+        false,
+        HashMap::from([("parquet.enable.dictionary".to_string(), dict.to_string())]),
+    )
+    .await
 }
 
 async fn v3_cow_partitioned_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
-    v3_cow_ctx_inner(ns, tbl, true).await
+    v3_cow_ctx_inner(ns, tbl, true, HashMap::new()).await
 }
 
 async fn v3_cow_ctx_inner(
     ns: &str,
     tbl: &str,
     partitioned: bool,
+    properties: HashMap<String, String>,
 ) -> (SessionContext, Arc<MemoryCatalog>) {
     let iceberg_catalog = catalog().await;
     let namespace = NamespaceIdent::new(ns.to_string());
@@ -100,6 +131,7 @@ async fn v3_cow_ctx_inner(
             .location(location)
             .schema(schema)
             .partition_spec(partition_spec)
+            .properties(properties)
             .format_version(FormatVersion::V3)
             .build()
     } else {
@@ -107,6 +139,7 @@ async fn v3_cow_ctx_inner(
             .name(tbl.to_string())
             .location(location)
             .schema(schema)
+            .properties(properties)
             .format_version(FormatVersion::V3)
             .build()
     };
@@ -659,4 +692,301 @@ async fn spark_three_single_row_inserts_then_delete_id_2_then_id_1() {
     .await;
     let table = client.load_table(&ident).await.expect("reload");
     assert_state(&table, &[(3, "c", 2, 3)], 3).await;
+}
+
+async fn live_data_files(table: &Table) -> Vec<DataFile> {
+    let snapshot = table.metadata().current_snapshot().expect("snapshot");
+    let list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("manifest list");
+    let mut files = Vec::new();
+    for manifest_file in list.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("manifest");
+        for entry in manifest.entries() {
+            if entry.is_alive() && entry.content_type() == DataContentType::Data {
+                files.push(entry.data_file().clone());
+            }
+        }
+    }
+    files
+}
+
+async fn assert_rewrite_format(ns: &str, format: DataFileFormat, check_bytes: impl Fn(&[u8])) {
+    let tbl = "t";
+    let name = format.to_string();
+    let (ctx, client) = v3_cow_ctx_with_format(ns, tbl, &name).await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("reload");
+    let files = live_data_files(&table).await;
+    assert!(!files.is_empty(), "delete leaves live data files");
+    for file in &files {
+        assert_eq!(file.content_type(), DataContentType::Data);
+        assert_eq!(file.file_format(), format, "rewritten file keeps {name}");
+        let path = file.file_path();
+        let expected = format!(".{format}");
+        assert!(
+            path.ends_with(&expected),
+            "rewritten file path {path} ends with {expected}"
+        );
+        if format != DataFileFormat::Parquet {
+            assert!(
+                !path.ends_with(".parquet"),
+                "non-parquet rewritten path {path} keeps its own suffix"
+            );
+        }
+        let bytes = table
+            .file_io()
+            .new_input(file.file_path())
+            .expect("input")
+            .read()
+            .await
+            .expect("read");
+        check_bytes(&bytes);
+    }
+    let df = ctx
+        .sql(&format!(
+            "SELECT id, val FROM catalog.{ns}.{tbl} ORDER BY id"
+        ))
+        .await
+        .expect("select")
+        .collect()
+        .await
+        .expect("collect");
+    assert_batches_eq!(
+        &[
+            "+----+-----+",
+            "| id | val |",
+            "+----+-----+",
+            "| 1  | a   |",
+            "| 3  | c   |",
+            "+----+-----+",
+        ],
+        &df
+    );
+}
+
+#[tokio::test]
+async fn cow_delete_rewrites_orc_as_orc() {
+    assert_rewrite_format("lineage_cow_rewrite_orc", DataFileFormat::Orc, |bytes| {
+        assert!(
+            bytes.len() > 4 && &bytes[bytes.len() - 4..bytes.len() - 1] == b"ORC",
+            "orc tail magic"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cow_delete_rewrites_avro_as_avro() {
+    assert_rewrite_format("lineage_cow_rewrite_avro", DataFileFormat::Avro, |bytes| {
+        assert!(bytes.starts_with(b"Obj\x01"), "avro OCF header");
+    })
+    .await;
+}
+
+fn parquet_columns_use_dictionary(bytes: bytes::Bytes) -> Vec<bool> {
+    let reader = SerializedFileReader::new(bytes).expect("read the parquet footer");
+    let metadata = reader.metadata();
+    assert!(
+        metadata.num_row_groups() > 0,
+        "the rewritten file must hold a row group"
+    );
+    let mut flags = Vec::new();
+    for row_group in metadata.row_groups() {
+        for column in row_group.columns() {
+            flags.push(column.encodings().any(|encoding| {
+                matches!(
+                    encoding,
+                    Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                )
+            }));
+        }
+    }
+    assert!(
+        !flags.is_empty(),
+        "the rewritten file must hold column chunks"
+    );
+    flags
+}
+
+async fn cow_rewritten_parquet_dictionary(ns: &str, dict: Option<&str>) -> Vec<bool> {
+    let tbl = "t";
+    let (ctx, client) = match dict {
+        None => v3_cow_ctx(ns, tbl).await,
+        Some(value) => v3_cow_ctx_with_dict(ns, tbl, value).await,
+    };
+    let values = (1..=300)
+        .map(|id| format!("({id}, 'v{}')", id % 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES {values}"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 1"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("reload");
+    let files = live_data_files(&table).await;
+    assert_eq!(files.len(), 1, "one delete rewrites one data file");
+    assert_eq!(files[0].file_format(), DataFileFormat::Parquet);
+    let bytes = table
+        .file_io()
+        .new_input(files[0].file_path())
+        .expect("input")
+        .read()
+        .await
+        .expect("read");
+    parquet_columns_use_dictionary(bytes)
+}
+
+#[tokio::test]
+async fn cow_delete_rewrite_honors_metrics_default_none() {
+    let ns = "lineage_cow_metrics_none";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx_inner(
+        ns,
+        tbl,
+        false,
+        HashMap::from([(
+            "write.metadata.metrics.default".to_string(),
+            "none".to_string(),
+        )]),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("reload");
+    let files = live_data_files(&table).await;
+    assert_eq!(files.len(), 1, "one delete rewrites one data file");
+    assert!(
+        files[0].column_sizes().is_empty(),
+        "metrics.default=none must write no column_sizes"
+    );
+    assert!(
+        files[0].value_counts().is_empty(),
+        "metrics.default=none must write no value_counts"
+    );
+    assert!(
+        files[0].null_value_counts().is_empty(),
+        "metrics.default=none must write no null_value_counts"
+    );
+    assert!(
+        files[0].nan_value_counts().is_empty(),
+        "metrics.default=none must write no nan_value_counts"
+    );
+    assert!(
+        files[0].lower_bounds().is_empty(),
+        "metrics.default=none must write no lower_bounds"
+    );
+    assert!(
+        files[0].upper_bounds().is_empty(),
+        "metrics.default=none must write no upper_bounds"
+    );
+}
+
+#[tokio::test]
+async fn cow_delete_rewrite_parquet_defaults_dictionary_off() {
+    let flags = cow_rewritten_parquet_dictionary("lineage_cow_dict_off", None).await;
+    assert!(
+        flags.iter().all(|flag| !flag),
+        "a default rewrite leaves no dictionary encoding"
+    );
+}
+
+#[tokio::test]
+async fn cow_delete_rewrite_parquet_property_enables_dictionary() {
+    let flags = cow_rewritten_parquet_dictionary("lineage_cow_dict_on", Some("true")).await;
+    assert!(
+        flags.iter().all(|flag| *flag),
+        "a property rewrite keeps dictionary encoding"
+    );
+}
+
+async fn cow_delete_refusal(ns: &str, key: &str, value: &str) -> DataFusionError {
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx(ns, tbl).await;
+    let planted = format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    run_sql(&ctx, &planted).await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load planted table");
+    let tx = Transaction::new(&table);
+    tx.update_table_properties()
+        .set(key.to_string(), value.to_string())
+        .apply(tx)
+        .expect("stage property update")
+        .commit(client.as_ref())
+        .await
+        .expect("commit property update");
+    let delete = format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2");
+    let Err(err) = ctx.sql(&delete).await.expect("plan delete").collect().await else {
+        panic!("delete over {key}={value} must refuse the rewrite");
+    };
+    err
+}
+
+#[tokio::test]
+async fn cow_delete_refuses_csv_format_at_rewrite() {
+    let err = cow_delete_refusal(
+        "lineage_cow_refuse_csv",
+        TableProperties::PROPERTY_DEFAULT_FILE_FORMAT,
+        "csv",
+    )
+    .await;
+    let DataFusionError::External(inner) = err else {
+        panic!("csv rewrite must surface the iceberg refusal, got {err}");
+    };
+    let iceberg_err = inner
+        .downcast_ref::<Error>()
+        .expect("external wraps iceberg Error");
+    assert_eq!(iceberg_err.kind(), ErrorKind::DataInvalid);
+    assert_eq!(iceberg_err.message(), "Unsupported data file format: csv");
+}
+
+#[tokio::test]
+async fn cow_delete_refuses_puffin_format_at_rewrite() {
+    let err = cow_delete_refusal(
+        "lineage_cow_refuse_puffin",
+        TableProperties::PROPERTY_DEFAULT_FILE_FORMAT,
+        "puffin",
+    )
+    .await;
+    let DataFusionError::External(inner) = err else {
+        panic!("puffin rewrite must surface the iceberg refusal, got {err}");
+    };
+    let iceberg_err = inner
+        .downcast_ref::<Error>()
+        .expect("external wraps iceberg Error");
+    assert_eq!(iceberg_err.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        iceberg_err.message(),
+        "Cannot build a data-file writer for format puffin: a sidecar is never a data file"
+    );
 }
