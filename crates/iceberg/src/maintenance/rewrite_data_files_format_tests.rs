@@ -783,6 +783,218 @@ async fn sort_rewrite_on_an_orc_table_writes_orc_and_cleans_its_spills() {
 }
 
 #[tokio::test]
+async fn legacy_sorted_run_arm_writes_orc_and_stamps_the_table_order() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let schema = three_long_schema();
+    let spec = PartitionSpec::builder(schema.clone())
+        .with_spec_id(0)
+        .add_partition_field("x", "x", Transform::Identity)
+        .expect("add the partition field")
+        .build()
+        .expect("build the spec");
+    let order = SortOrder {
+        order_id: 1,
+        fields: vec![SortField {
+            source_id: 2,
+            transform: Transform::Identity,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::First,
+        }],
+    };
+    let namespace = NamespaceIdent::new(format!("ns-{}", uuid::Uuid::new_v4()));
+    catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .expect("create namespace");
+    let creation = TableCreation {
+        name: "t".to_string(),
+        location: None,
+        schema,
+        partition_spec: Some(spec.into_unbound()),
+        sort_order: Some(order),
+        properties: HashMap::from([("write.format.default".to_string(), "orc".to_string())]),
+        format_version: FormatVersion::V2,
+    };
+    let table = catalog
+        .create_table(&namespace, creation)
+        .await
+        .expect("create the sorted orc table");
+    let mut files = Vec::new();
+    for file in 0..6i64 {
+        let rows: Vec<(i64, i64, i64)> = scattered_ids(4)
+            .into_iter()
+            .map(|id| (0, id + file * 100, id))
+            .collect();
+        files.push(
+            write_data_file_in_format(
+                &table,
+                &format!("unsorted-{file}.orc"),
+                0,
+                &rows,
+                DataFileFormat::Orc,
+            )
+            .await,
+        );
+    }
+    let table = append_files(&catalog, &table, files).await;
+    let rows_before = scan_rows(&table).await;
+    assert_eq!(rows_before.len(), 24, "fixture: twenty-four rows");
+
+    let result = RewriteDataFiles::new(table.clone())
+        .target_file_size_bytes(1_000_000)
+        .execute(&catalog)
+        .await
+        .expect("compact the sorted orc table");
+    assert_eq!(result.rewritten_data_files_count, 6);
+    assert!(result.added_data_files_count >= 1);
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload the table");
+    let files = live_data_files(&table).await;
+    assert!(!files.is_empty(), "compaction must leave output files");
+    for file in &files {
+        assert_eq!(
+            file.file_format(),
+            DataFileFormat::Orc,
+            "the legacy sorted arm must honor the table format, got {}",
+            file.file_path()
+        );
+        assert!(
+            file.file_path().ends_with(".orc"),
+            "an orc output must carry the orc extension, got {}",
+            file.file_path()
+        );
+        assert_eq!(
+            file.sort_order_id(),
+            Some(1),
+            "the legacy sorted arm must stamp the table order id, got {}",
+            file.file_path()
+        );
+    }
+    assert_eq!(
+        scan_rows(&table).await,
+        rows_before,
+        "compaction must conserve every row"
+    );
+}
+
+#[tokio::test]
+async fn orc_compaction_rolls_every_output_file_through_the_format() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let table = create_format_table(&catalog, FormatVersion::V2, Some("orc")).await;
+    let mut files = Vec::new();
+    for file in 0..6i64 {
+        let rows: Vec<(i64, i64, i64)> =
+            (0..500i64).map(|row| (0, file * 500 + row, row)).collect();
+        files.push(
+            write_data_file_in_format(
+                &table,
+                &format!("roll-{file}.orc"),
+                0,
+                &rows,
+                DataFileFormat::Orc,
+            )
+            .await,
+        );
+    }
+    let table = append_files(&catalog, &table, files).await;
+    let rows_before = scan_rows(&table).await;
+    assert_eq!(rows_before.len(), 3000, "fixture: three thousand rows");
+
+    RewriteDataFiles::new(table.clone())
+        .target_file_size_bytes(8 * 1024)
+        .execute(&catalog)
+        .await
+        .expect("compact the orc table");
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload the table");
+    let files = live_data_files(&table).await;
+    assert!(
+        files.len() > 1,
+        "the tiny target must roll more than one output file, got {}",
+        files.len()
+    );
+    for file in &files {
+        assert_eq!(
+            file.file_format(),
+            DataFileFormat::Orc,
+            "every rolled file must stay orc, got {}",
+            file.file_path()
+        );
+        assert!(
+            file.file_path().ends_with(".orc"),
+            "every rolled file must carry the orc extension, got {}",
+            file.file_path()
+        );
+    }
+    assert_eq!(
+        scan_rows(&table).await,
+        rows_before,
+        "compaction must conserve every row"
+    );
+}
+
+#[tokio::test]
+async fn orc_table_with_parquet_inputs_compacts_to_orc() {
+    let (catalog, _guard) = local_fs_catalog().await;
+    let table = create_format_table(&catalog, FormatVersion::V2, Some("orc")).await;
+    let mut files = Vec::new();
+    for index in 0..6i64 {
+        files.push(
+            write_data_file(&table, &format!("mixed-{index}.parquet"), 0, &[(
+                0,
+                300 + index,
+                3000 + index,
+            )])
+            .await,
+        );
+    }
+    let table = append_files(&catalog, &table, files).await;
+    let rows_before = scan_rows(&table).await;
+    assert_eq!(rows_before.len(), 6, "fixture: six rows before compaction");
+
+    let result = RewriteDataFiles::new(table.clone())
+        .target_file_size_bytes(1_000_000)
+        .execute(&catalog)
+        .await
+        .expect("compact the mixed table");
+    assert_eq!(result.rewritten_data_files_count, 6);
+    assert!(result.added_data_files_count >= 1);
+
+    let table = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("reload the table");
+    let files = live_data_files(&table).await;
+    assert!(
+        !files.is_empty() && files.len() < 6,
+        "compaction must leave fewer files, got {}",
+        files.len()
+    );
+    for file in &files {
+        assert_eq!(
+            file.file_format(),
+            DataFileFormat::Orc,
+            "parquet inputs under an orc default must compact to orc, got {}",
+            file.file_path()
+        );
+        assert!(
+            file.file_path().ends_with(".orc"),
+            "an orc output must carry the orc extension, got {}",
+            file.file_path()
+        );
+    }
+    assert_eq!(
+        scan_rows(&table).await,
+        rows_before,
+        "compaction must conserve every row"
+    );
+}
+
+#[tokio::test]
 async fn garbage_write_format_default_is_refused_with_the_typed_message() {
     let (catalog, _guard) = local_fs_catalog().await;
     let table = create_format_table(&catalog, FormatVersion::V2, Some("csv")).await;
