@@ -716,6 +716,18 @@ async fn assert_rewrite_format(ns: &str, format: DataFileFormat, check_bytes: im
     for file in &files {
         assert_eq!(file.content_type(), DataContentType::Data);
         assert_eq!(file.file_format(), format, "rewritten file keeps {name}");
+        let path = file.file_path();
+        let expected = format!(".{format}");
+        assert!(
+            path.ends_with(&expected),
+            "rewritten file path {path} ends with {expected}"
+        );
+        if format != DataFileFormat::Parquet {
+            assert!(
+                !path.ends_with(".parquet"),
+                "non-parquet rewritten path {path} keeps its own suffix"
+            );
+        }
         let bytes = table
             .file_io()
             .new_input(file.file_path())

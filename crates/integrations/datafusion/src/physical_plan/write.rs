@@ -925,6 +925,18 @@ mod tests {
         let files = run_format_write(&table).await?;
         assert_eq!(files.len(), 1, "one write produces one data file");
         assert_eq!(files[0].file_format(), format);
+        let path = files[0].file_path();
+        let expected = format!(".{format}");
+        assert!(
+            path.ends_with(&expected),
+            "data file path {path} ends with {expected}"
+        );
+        if format != DataFileFormat::Parquet {
+            assert!(
+                !path.ends_with(".parquet"),
+                "non-parquet file path {path} keeps its own suffix"
+            );
+        }
         let bytes = table
             .file_io()
             .new_input(files[0].file_path())?
