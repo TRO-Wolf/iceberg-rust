@@ -123,14 +123,6 @@ async fn test_write_position_deletes_honors_metrics_default_none() {
             .keys()
             .copied()
             .collect::<HashSet<i32>>(),
-        file.value_counts()
-            .keys()
-            .copied()
-            .collect::<HashSet<i32>>(),
-        file.null_value_counts()
-            .keys()
-            .copied()
-            .collect::<HashSet<i32>>(),
         file.lower_bounds()
             .keys()
             .copied()
@@ -142,6 +134,8 @@ async fn test_write_position_deletes_honors_metrics_default_none() {
     ] {
         assert_eq!(keys, reserved);
     }
+    assert!(file.value_counts().is_empty());
+    assert!(file.null_value_counts().is_empty());
     assert!(file.nan_value_counts().is_empty());
     let bound = file
         .lower_bounds()
