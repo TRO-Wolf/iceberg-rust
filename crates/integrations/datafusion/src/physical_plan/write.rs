@@ -411,6 +411,8 @@ mod tests {
         TableCreation,
     };
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+    use parquet::basic::Encoding;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use tempfile::TempDir;
 
     use super::*;
@@ -819,14 +821,26 @@ mod tests {
     }
 
     async fn format_table(format: &str) -> Result<(MemoryCatalog, Table)> {
+        format_table_with_properties(format, format, HashMap::new()).await
+    }
+
+    async fn format_table_with_properties(
+        name: &str,
+        format: &str,
+        extra: HashMap<String, String>,
+    ) -> Result<(MemoryCatalog, Table)> {
         let catalog = get_iceberg_catalog().await;
         let namespace = NamespaceIdent::new("format_ns".to_string());
         catalog.create_namespace(&namespace, HashMap::new()).await?;
-        let prop = TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string();
+        let mut properties = HashMap::from([(
+            TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string(),
+            format.to_string(),
+        )]);
+        properties.extend(extra);
         let creation = TableCreation::builder()
             .location(temp_path())
-            .name(format!("format_{format}_table"))
-            .properties(HashMap::from([(prop, format.to_string())]))
+            .name(format!("format_{name}_table"))
+            .properties(properties)
             .schema(get_test_schema()?)
             .build();
         let table = catalog.create_table(&namespace, creation).await?;
@@ -988,6 +1002,68 @@ mod tests {
         assert_eq!(
             iceberg_err.message(),
             "Cannot build a data-file writer for format puffin: a sidecar is never a data file"
+        );
+        Ok(())
+    }
+
+    fn parquet_columns_use_dictionary(bytes: bytes::Bytes) -> Vec<bool> {
+        let reader = SerializedFileReader::new(bytes).expect("read the parquet footer");
+        let metadata = reader.metadata();
+        assert!(
+            metadata.num_row_groups() > 0,
+            "the written file must hold a row group"
+        );
+        let mut flags = Vec::new();
+        for row_group in metadata.row_groups() {
+            for column in row_group.columns() {
+                flags.push(column.encodings().any(|encoding| {
+                    matches!(
+                        encoding,
+                        Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                    )
+                }));
+            }
+        }
+        assert!(
+            !flags.is_empty(),
+            "the written file must hold column chunks"
+        );
+        flags
+    }
+
+    async fn written_parquet_dictionary(name: &str, dict: Option<&str>) -> Result<Vec<bool>> {
+        let extra = dict
+            .map(|value| {
+                HashMap::from([("parquet.enable.dictionary".to_string(), value.to_string())])
+            })
+            .unwrap_or_default();
+        let (_catalog, table) = format_table_with_properties(name, "parquet", extra).await?;
+        let files = run_format_write(&table).await?;
+        assert_eq!(files.len(), 1, "one write produces one data file");
+        let bytes = table
+            .file_io()
+            .new_input(files[0].file_path())?
+            .read()
+            .await?;
+        Ok(parquet_columns_use_dictionary(bytes))
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_parquet_defaults_dictionary_off() -> Result<()> {
+        let flags = written_parquet_dictionary("parquet_dict_off", None).await?;
+        assert!(
+            flags.iter().all(|flag| !flag),
+            "a default write leaves no dictionary encoding"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_write_exec_parquet_property_enables_dictionary() -> Result<()> {
+        let flags = written_parquet_dictionary("parquet_dict_on", Some("true")).await?;
+        assert!(
+            flags.iter().all(|flag| *flag),
+            "a property write keeps dictionary encoding"
         );
         Ok(())
     }
