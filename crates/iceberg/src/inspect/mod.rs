@@ -18,6 +18,7 @@
 //! Metadata table APIs.
 
 mod all_manifests;
+mod count_map;
 mod data_file;
 mod entries;
 mod files;
