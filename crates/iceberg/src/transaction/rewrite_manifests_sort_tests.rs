@@ -259,14 +259,14 @@ async fn sort_by_columns_compares_the_second_key() {
     let spec_id = table.metadata().default_partition_spec_id();
     assert_ne!(spec_id, 0, "evolution creates a new default spec");
     let table = append_files(&catalog, &table, vec![wide_file(
-        "test/sort-y0.parquet",
+        "test/sort-b.parquet",
         spec_id,
         0,
         0,
     )])
     .await;
     let table = append_files(&catalog, &table, vec![wide_file(
-        "test/sort-y1.parquet",
+        "test/sort-a.parquet",
         spec_id,
         0,
         1,
@@ -280,8 +280,8 @@ async fn sort_by_columns_compares_the_second_key() {
     assert_eq!(
         live_paths_in_order(&table, &after[0]).await,
         vec![
-            "test/sort-y0.parquet".to_string(),
-            "test/sort-y1.parquet".to_string(),
+            "test/sort-b.parquet".to_string(),
+            "test/sort-a.parquet".to_string(),
         ],
         "the second key orders entries the first key ties"
     );
