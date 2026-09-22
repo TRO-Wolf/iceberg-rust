@@ -219,10 +219,10 @@ DELETE-file-rewrite interop slices, not conflict validation; residual evaluation
 scan-metrics model + emission; views (memory + REST + SQL landed, interop'd I2 — Glue/S3Tables view
 ops are parity-correct-unsupported, NOT a gap — rows R126/R127); `variant` (binary read+write byte-exact
 both sides; shredded-parquet FILE I/O gated behind parquet's opt-in `variant_experimental` feature, not a version floor — see row R88); **ORC + Avro
-DATA-file READ** (landed + Java→Rust interop-proven — rows R118/R119; the WRITE half is the 🟡 residue).
+DATA-file READ** (landed + Java→Rust interop-proven — rows R118/R119; the WRITE half landed via PR-5 — the 🟡 residue is now the Direction-2 interop proof, see the matrix).
 Per-row status + residue: the matrix.
 
-**Missing ❌:** ORC/Avro DATA-file **write** (READ landed 🟡 — rows R118/R119), `geometry`/`geography`
+**Missing ❌:** `geometry`/`geography`
 types, encryption, `SessionCatalog` (assessed-deferred dead surface — row R128), the maintenance
 residue (`SnapshotTable`/`MigrateTable` only — they need external sources), and
 `commitTransaction(List<TableCommit>)` (REST multi-table commit, split out). *(No longer missing —
@@ -232,7 +232,7 @@ flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (row R136); `ComputePartiti
 `conflictDetectionFilter`-on-`DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not
 in Java 1.10.0. And flipped 2026-06-19: `BatchScan` ✅ (row R124); ORC+Avro DATA **read** 🟡
 (rows R118/R119); `RewriteTablePath` 🟡 built+interop (row R139); events/listeners ✅ (row R144);
-`LockManager` ❌→🟡 in-memory impl + tests (row R129). See GAP_MATRIX. Anchored 2026-07-01 — the
+`LockManager` ❌→🟡 in-memory impl + tests (row R129). And flipped 2026-09-22: ORC/Avro DATA-file **write** 🟡 (rows R118/R119 — ORC and Avro on all 4 D-4 doors call `for_format`, Parquet deletes + Parquet compaction keep the pre-existing `ParquetWriterBuilder` wrapped as `AnyFileWriterBuilder::Parquet`; residue is the Direction-2 interop proof). See GAP_MATRIX. Anchored 2026-07-01 — the
 bare parenthesized numbers had drifted stale, 10 of 11 resolving to the wrong row.)*
 
 **Row-by-row truth:** [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
@@ -457,7 +457,7 @@ format-sensitive work still leads; well-templated breadth follows.
    ❌: `SnapshotTable`/`MigrateTable` (need external sources); `RewriteTablePath` is 🟡 (built + interop — row R139).
 3. **Format & type breadth:** variant (incl. shredding — frontier; exact-byte class) and
    geometry/geography (`unknown` is ✅ at the metadata level — row R91); ORC + Avro data files
-   (READ landed 🟡 — rows R118/R119; the WRITE half remains; templated breadth → Opus).
+   (READ landed 🟡 — rows R118/R119; the WRITE half landed via PR-5, the Direction-2 interop proof remains; templated breadth → Opus).
 4. **Scan completion:** CDC-merge (row-level) is the remaining open slice; split planning (row R148),
    `BatchScan` (row R124), and incremental-scan interop (rows R122/R123) all LANDED ✅ 2026-06-17;
    strict-evaluator completion mostly templated → Opus.

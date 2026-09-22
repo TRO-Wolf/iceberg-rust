@@ -15,11 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::str::FromStr;
+
+use iceberg::arrow::FieldMatchMode;
+use iceberg::spec::TableProperties;
 use iceberg::writer::base_writer::position_delete_writer::position_delete_writer_properties_for;
+use iceberg::writer::file_writer::AnyFileWriterBuilder;
 
 use super::*;
 
-/// Writes Parquet position-delete files from sorted `(path, pos)` pairs and returns EVERY file the
 /// rolling writer produced; dropping one silently resurrects its rows. Each file is stamped with the
 /// `(spec_id, partition)` of the DATA file it deletes from, which the partitioned path reads from
 /// the snapshot's manifests. The commit validates that stamp against the spec.
@@ -138,23 +142,45 @@ async fn write_position_deletes_for_partition(
 ) -> DFResult<Vec<DataFile>> {
     let location_gen =
         TableLocationGenerator::new(table.metadata()).map_err(to_datafusion_error)?;
+    let table_props = table
+        .metadata()
+        .table_properties()
+        .map_err(to_datafusion_error)?;
+    let delete_format = DataFileFormat::from_str(
+        table
+            .metadata()
+            .properties()
+            .get(TableProperties::PROPERTY_DELETE_DEFAULT_FILE_FORMAT)
+            .map_or(table_props.write_format_default.as_str(), String::as_str),
+    )
+    .map_err(to_datafusion_error)?;
     let file_name_gen = DefaultFileNameGenerator::new(
         "pos-del".to_string(),
         Some(uuid::Uuid::now_v7().to_string()),
-        DataFileFormat::Parquet,
+        delete_format,
     );
-    // Keep the `file_path` and `pos` bounds FULL and EXACT: no parquet stats truncation, so
-    // min_is_exact/max_is_exact stay true and equal-bounds path routing works for long S3 URIs.
-    let parquet_builder = ParquetWriterBuilder::new(
-        position_delete_writer_properties_for(table.metadata().properties())
-            .map_err(to_datafusion_error)?,
-        config.schema().clone(),
-    )
-    .with_metrics_config(
-        MetricsConfig::for_position_delete_table(table.metadata()).map_err(to_datafusion_error)?,
-    );
+    let metrics_config =
+        MetricsConfig::for_position_delete_table(table.metadata()).map_err(to_datafusion_error)?;
+    let file_writer_builder = match delete_format {
+        DataFileFormat::Parquet => AnyFileWriterBuilder::Parquet(Box::new(
+            ParquetWriterBuilder::new(
+                position_delete_writer_properties_for(table.metadata().properties())
+                    .map_err(to_datafusion_error)?,
+                config.schema().clone(),
+            )
+            .with_metrics_config(metrics_config),
+        )),
+        other => AnyFileWriterBuilder::for_format(
+            other,
+            config.schema().clone(),
+            table.metadata().properties(),
+            metrics_config,
+            FieldMatchMode::Name,
+        )
+        .map_err(to_datafusion_error)?,
+    };
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
-        parquet_builder,
+        file_writer_builder,
         table.file_io().clone(),
         location_gen,
         file_name_gen,
