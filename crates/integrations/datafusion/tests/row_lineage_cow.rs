@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::assert_batches_eq;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use futures::TryStreamExt;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
@@ -31,7 +32,10 @@ use iceberg::spec::{
     TableProperties, Transform, Type, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{
+    Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
+};
 use iceberg_datafusion::IcebergCatalogProvider;
 use parquet::basic::Encoding;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -923,5 +927,66 @@ async fn cow_delete_rewrite_parquet_property_enables_dictionary() {
     assert!(
         flags.iter().all(|flag| *flag),
         "a property rewrite keeps dictionary encoding"
+    );
+}
+
+async fn cow_delete_refusal(ns: &str, key: &str, value: &str) -> DataFusionError {
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx(ns, tbl).await;
+    let planted = format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+    run_sql(&ctx, &planted).await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("load planted table");
+    let tx = Transaction::new(&table);
+    tx.update_table_properties()
+        .set(key.to_string(), value.to_string())
+        .apply(tx)
+        .expect("stage property update")
+        .commit(client.as_ref())
+        .await
+        .expect("commit property update");
+    let delete = format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2");
+    let Err(err) = ctx.sql(&delete).await.expect("plan delete").collect().await else {
+        panic!("delete over {key}={value} must refuse the rewrite");
+    };
+    err
+}
+
+#[tokio::test]
+async fn cow_delete_refuses_csv_format_at_rewrite() {
+    let err = cow_delete_refusal(
+        "lineage_cow_refuse_csv",
+        TableProperties::PROPERTY_DEFAULT_FILE_FORMAT,
+        "csv",
+    )
+    .await;
+    let DataFusionError::External(inner) = err else {
+        panic!("csv rewrite must surface the iceberg refusal, got {err}");
+    };
+    let iceberg_err = inner
+        .downcast_ref::<Error>()
+        .expect("external wraps iceberg Error");
+    assert_eq!(iceberg_err.kind(), ErrorKind::DataInvalid);
+    assert_eq!(iceberg_err.message(), "Unsupported data file format: csv");
+}
+
+#[tokio::test]
+async fn cow_delete_refuses_puffin_format_at_rewrite() {
+    let err = cow_delete_refusal(
+        "lineage_cow_refuse_puffin",
+        TableProperties::PROPERTY_DEFAULT_FILE_FORMAT,
+        "puffin",
+    )
+    .await;
+    let DataFusionError::External(inner) = err else {
+        panic!("puffin rewrite must surface the iceberg refusal, got {err}");
+    };
+    let iceberg_err = inner
+        .downcast_ref::<Error>()
+        .expect("external wraps iceberg Error");
+    assert_eq!(iceberg_err.kind(), ErrorKind::DataInvalid);
+    assert_eq!(
+        iceberg_err.message(),
+        "Cannot build a data-file writer for format puffin: a sidecar is never a data file"
     );
 }
