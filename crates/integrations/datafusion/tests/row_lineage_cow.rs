@@ -33,6 +33,8 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_datafusion::IcebergCatalogProvider;
+use parquet::basic::Encoding;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use tempfile::TempDir;
 
 fn leak_temp_path() -> String {
@@ -64,6 +66,20 @@ async fn v3_cow_ctx_with_format(
 ) -> (SessionContext, Arc<MemoryCatalog>) {
     let prop = TableProperties::PROPERTY_DEFAULT_FILE_FORMAT.to_string();
     v3_cow_ctx_inner(ns, tbl, false, HashMap::from([(prop, format.to_string())])).await
+}
+
+async fn v3_cow_ctx_with_dict(
+    ns: &str,
+    tbl: &str,
+    dict: &str,
+) -> (SessionContext, Arc<MemoryCatalog>) {
+    v3_cow_ctx_inner(
+        ns,
+        tbl,
+        false,
+        HashMap::from([("parquet.enable.dictionary".to_string(), dict.to_string())]),
+    )
+    .await
 }
 
 async fn v3_cow_partitioned_ctx(ns: &str, tbl: &str) -> (SessionContext, Arc<MemoryCatalog>) {
@@ -776,4 +792,82 @@ async fn cow_delete_rewrites_avro_as_avro() {
         assert!(bytes.starts_with(b"Obj\x01"), "avro OCF header");
     })
     .await;
+}
+
+fn parquet_columns_use_dictionary(bytes: bytes::Bytes) -> Vec<bool> {
+    let reader = SerializedFileReader::new(bytes).expect("read the parquet footer");
+    let metadata = reader.metadata();
+    assert!(
+        metadata.num_row_groups() > 0,
+        "the rewritten file must hold a row group"
+    );
+    let mut flags = Vec::new();
+    for row_group in metadata.row_groups() {
+        for column in row_group.columns() {
+            flags.push(column.encodings().any(|encoding| {
+                matches!(
+                    encoding,
+                    Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
+                )
+            }));
+        }
+    }
+    assert!(
+        !flags.is_empty(),
+        "the rewritten file must hold column chunks"
+    );
+    flags
+}
+
+async fn cow_rewritten_parquet_dictionary(ns: &str, dict: Option<&str>) -> Vec<bool> {
+    let tbl = "t";
+    let (ctx, client) = match dict {
+        None => v3_cow_ctx(ns, tbl).await,
+        Some(value) => v3_cow_ctx_with_dict(ns, tbl, value).await,
+    };
+    let values = (1..=300)
+        .map(|id| format!("({id}, 'v{}')", id % 4))
+        .collect::<Vec<_>>()
+        .join(", ");
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES {values}"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 1"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("reload");
+    let files = live_data_files(&table).await;
+    assert_eq!(files.len(), 1, "one delete rewrites one data file");
+    assert_eq!(files[0].file_format(), DataFileFormat::Parquet);
+    let bytes = table
+        .file_io()
+        .new_input(files[0].file_path())
+        .expect("input")
+        .read()
+        .await
+        .expect("read");
+    parquet_columns_use_dictionary(bytes)
+}
+
+#[tokio::test]
+async fn cow_delete_rewrite_parquet_defaults_dictionary_off() {
+    let flags = cow_rewritten_parquet_dictionary("lineage_cow_dict_off", None).await;
+    assert!(
+        flags.iter().all(|flag| !flag),
+        "a default rewrite leaves no dictionary encoding"
+    );
+}
+
+#[tokio::test]
+async fn cow_delete_rewrite_parquet_property_enables_dictionary() {
+    let flags = cow_rewritten_parquet_dictionary("lineage_cow_dict_on", Some("true")).await;
+    assert!(
+        flags.iter().all(|flag| *flag),
+        "a property rewrite keeps dictionary encoding"
+    );
 }
