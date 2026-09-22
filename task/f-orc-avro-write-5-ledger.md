@@ -118,8 +118,10 @@ first, so the magic assertions always execute).
 
 ## D-4. Docs flip (STALE-PROSE sweep, same class as R118)
 
-Row R118: 🟡 held, residue narrowed — WRITE lands via PR-5 (all 4 D-4 doors route
-through `for_format`); remaining residue is the Direction-2 Java-reads-Rust interop
+Row R118: 🟡 held, residue narrowed — WRITE lands via PR-5 (ORC and Avro on all 4 D-4
+doors call `for_format`; Parquet deletes + compaction keep the pre-existing
+`ParquetWriterBuilder` wrapped as `AnyFileWriterBuilder::Parquet`); remaining residue
+is the Direction-2 Java-reads-Rust interop
 proof + footer-codec + nested/V3. Roadmap: the Missing-list ORC/Avro write item is
 gone with a dated flip note, and both WRITE-half clauses say the half landed.
 This ledger ships in the same docs commit as the two flipped doc files.

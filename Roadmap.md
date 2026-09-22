@@ -232,7 +232,7 @@ flipped 2026-06-17: `RewritePositionDeleteFiles` ✅ (row R136); `ComputePartiti
 `conflictDetectionFilter`-on-`DeleteFiles`/`ReplacePartitions` items are VOID — `javap`-proven not
 in Java 1.10.0. And flipped 2026-06-19: `BatchScan` ✅ (row R124); ORC+Avro DATA **read** 🟡
 (rows R118/R119); `RewriteTablePath` 🟡 built+interop (row R139); events/listeners ✅ (row R144);
-`LockManager` ❌→🟡 in-memory impl + tests (row R129). And flipped 2026-09-22: ORC/Avro DATA-file **write** 🟡 (rows R118/R119 — all 4 D-4 doors route through `for_format`; residue is the Direction-2 interop proof). See GAP_MATRIX. Anchored 2026-07-01 — the
+`LockManager` ❌→🟡 in-memory impl + tests (row R129). And flipped 2026-09-22: ORC/Avro DATA-file **write** 🟡 (rows R118/R119 — ORC and Avro on all 4 D-4 doors call `for_format`, Parquet deletes + Parquet compaction keep the pre-existing `ParquetWriterBuilder` wrapped as `AnyFileWriterBuilder::Parquet`; residue is the Direction-2 interop proof). See GAP_MATRIX. Anchored 2026-07-01 — the
 bare parenthesized numbers had drifted stale, 10 of 11 resolving to the wrong row.)*
 
 **Row-by-row truth:** [docs/parity/GAP_MATRIX.md](docs/parity/GAP_MATRIX.md).
