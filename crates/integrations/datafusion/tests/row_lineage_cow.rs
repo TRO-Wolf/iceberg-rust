@@ -855,6 +855,60 @@ async fn cow_rewritten_parquet_dictionary(ns: &str, dict: Option<&str>) -> Vec<b
 }
 
 #[tokio::test]
+async fn cow_delete_rewrite_honors_metrics_default_none() {
+    let ns = "lineage_cow_metrics_none";
+    let tbl = "t";
+    let (ctx, client) = v3_cow_ctx_inner(
+        ns,
+        tbl,
+        false,
+        HashMap::from([(
+            "write.metadata.metrics.default".to_string(),
+            "none".to_string(),
+        )]),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("INSERT INTO catalog.{ns}.{tbl} VALUES (1, 'a'), (2, 'b'), (3, 'c')"),
+    )
+    .await;
+    run_sql(
+        &ctx,
+        &format!("DELETE FROM catalog.{ns}.{tbl} WHERE id = 2"),
+    )
+    .await;
+    let ident = TableIdent::new(NamespaceIdent::new(ns.to_string()), tbl.to_string());
+    let table = client.load_table(&ident).await.expect("reload");
+    let files = live_data_files(&table).await;
+    assert_eq!(files.len(), 1, "one delete rewrites one data file");
+    assert!(
+        files[0].column_sizes().is_empty(),
+        "metrics.default=none must write no column_sizes"
+    );
+    assert!(
+        files[0].value_counts().is_empty(),
+        "metrics.default=none must write no value_counts"
+    );
+    assert!(
+        files[0].null_value_counts().is_empty(),
+        "metrics.default=none must write no null_value_counts"
+    );
+    assert!(
+        files[0].nan_value_counts().is_empty(),
+        "metrics.default=none must write no nan_value_counts"
+    );
+    assert!(
+        files[0].lower_bounds().is_empty(),
+        "metrics.default=none must write no lower_bounds"
+    );
+    assert!(
+        files[0].upper_bounds().is_empty(),
+        "metrics.default=none must write no upper_bounds"
+    );
+}
+
+#[tokio::test]
 async fn cow_delete_rewrite_parquet_defaults_dictionary_off() {
     let flags = cow_rewritten_parquet_dictionary("lineage_cow_dict_off", None).await;
     assert!(
