@@ -80,24 +80,36 @@ The four lane rulings, all measured from the packet + the sites 1+2+3 diffs:
 
 ## D-3. Site-4 pins and their mutation arithmetic
 
-`crates/iceberg/src/maintenance/rewrite_data_files_format_tests.rs` (890 lines,
-`2af82cbdc`): 10 tests, each run green 5x. ORC end to end
-(`test_compaction_keeps_table_format`, the packet §6 name), Avro end to end, two
-Parquet-construction pins (dictionary stays on for the constant + low-cardinality
-columns, which `for_format`'s Parquet arm would switch off; the dictionary fallback
-still switches the unique column off), three spill pins (spill bytes stay parquet
-`PAR1` and vanish on success; they vanish when the sink fails; the sorted arm on an
-ORC table writes ORC and cleans its spills), garbage + puffin typed refusals, and V3
-ORC lineage carry. One-knob mutations, each on the current tree (population 10):
+`crates/iceberg/src/maintenance/rewrite_data_files_format_tests.rs` (976 lines,
+`2af82cbdc` + gap pins `b85381ea3`, fixture-sharing shrink `4e0c55dab`): 13 tests,
+each run green 5x. ORC end to end (`test_compaction_keeps_table_format`, the packet
+§6 name), Avro end to end, two Parquet-construction pins (dictionary stays on for
+the constant + low-cardinality columns, which `for_format`'s Parquet arm would
+switch off; the dictionary fallback still switches the unique column off), three
+spill pins (spill bytes stay parquet `PAR1` and vanish on success; they vanish when
+the sink fails; the sorted arm on an ORC table writes ORC and cleans its spills),
+garbage + puffin typed refusals, V3 ORC lineage carry, and three HOLLOW-PIN sweep
+gap pins: the legacy run-sort arm on ORC (stamps the table order id), rollover
+(every rolled file stays ORC), and parquet inputs under an ORC default. One-knob
+mutations, each on the current tree (population 13):
 
-| Knob removed | Red / 10 | Tests that went red |
+| Knob removed | Red / 13 | Tests that went red |
 |---|---|---|
-| Format resolution hardcoded to Parquet (packet :464) | 6 | ORC, Avro, garbage, puffin, sort-ORC, V3-ORC |
-| Filename left Parquet while the builder resolves ORC (mutation-6) | 4 | ORC, Avro, V3-ORC, sort-ORC |
+| Format resolution hardcoded to Parquet (packet :464) | 9 | ORC, Avro, garbage, puffin, sort-ORC, V3-ORC, legacy, rollover, mixed |
+| Filename left Parquet while the builder resolves ORC (mutation-6) | 7 | ORC, Avro, V3-ORC, sort-ORC, legacy, rollover, mixed |
 | Parquet arm routed via `for_format` (dict default off) | 1 | dictionary-on |
 | Fallback loop dropped | 1 | dictionary-off |
 | Spill cleanup disabled (transient, restored) | 3 | both spill tests, sort-ORC |
 | Lineage carry dropped from the write schema (transient, restored) | 1 | V3-ORC |
+| Sort plan forced unsorted (transient, restored) | 1 | legacy (the stamp observes the arm) |
+
+Every test has at least one killing mutation. Two fixture notes: the legacy-arm
+fixture first showed 0 rewritten files — a 3-file group sits under the default
+`min_input_files` (5) and never qualifies, so all small-file fixtures use 6 files;
+and the gap pins pushed the file to 1102 lines, past the 1000-line ceiling, which
+the fixture-sharing shrink (`4e0c55dab`, helpers only, same 13 pins) brought back
+to 976 — the A/B kills were re-run after the shrink (9 and 7 red) to prove the
+shared assertion helper preserved killability.
 
 The spill pins guard pre-existing `rewrite_data_files_sort_run.rs` behavior (untouched):
 site 4 must not move the spill path, and the sorted arm must route through the same
