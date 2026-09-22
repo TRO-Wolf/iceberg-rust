@@ -32,6 +32,8 @@ mod metadata_table;
 mod partition_summary;
 pub(crate) mod partition_values;
 mod partitions;
+#[cfg(test)]
+mod pos_delete_counts_tests;
 mod position_deletes;
 #[cfg(test)]
 mod promoted_partition_tests;

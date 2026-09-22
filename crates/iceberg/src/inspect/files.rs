@@ -305,7 +305,7 @@ impl<'a> FilesTable<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -329,7 +329,7 @@ mod tests {
     /// (Added/Deleted/Existing across partitions 100/200/300), and one DELETE manifest with one
     /// Added position-delete file in partition 100. It drives only public crate APIs, so it does
     /// not depend on the scan fixture's private helpers.
-    async fn setup_data_and_delete_manifests(fixture: &TableTestFixture) {
+    pub(crate) async fn setup_data_and_delete_manifests(fixture: &TableTestFixture) {
         let metadata = fixture.table.metadata().clone();
         let current_snapshot = metadata.current_snapshot().unwrap();
         let parent_snapshot = current_snapshot.parent_snapshot(&metadata).unwrap();
@@ -694,7 +694,7 @@ mod tests {
     }
 
     /// Concatenates a files-table scan into a single batch.
-    async fn scan_single_batch(
+    pub(crate) async fn scan_single_batch(
         stream: crate::scan::ArrowRecordBatchStream,
     ) -> arrow_array::RecordBatch {
         let batches: Vec<_> = stream.try_collect().await.unwrap();
@@ -748,52 +748,6 @@ mod tests {
             "{}/delete-1.parquet",
             fixture.table_location
         )]);
-    }
-
-    #[tokio::test]
-    async fn test_pos_delete_row_renders_null_field_counts() {
-        let fixture = TableTestFixture::new();
-        setup_data_and_delete_manifests(&fixture).await;
-        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
-        let paths = batch
-            .column_by_name("file_path")
-            .unwrap()
-            .as_string::<i32>();
-        let mut by_suffix = HashMap::new();
-        for index in 0..paths.len() {
-            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
-            by_suffix.insert(suffix, index);
-        }
-        let delete_row = by_suffix["delete-1.parquet"];
-        for name in ["value_counts", "null_value_counts", "nan_value_counts"] {
-            let maps = batch.column_by_name(name).unwrap().as_map();
-            assert!(maps.is_null(delete_row));
-        }
-        let column_sizes = batch.column_by_name("column_sizes").unwrap().as_map();
-        assert!(!column_sizes.is_null(delete_row));
-        assert_eq!(column_sizes.value_length(delete_row), 0);
-    }
-
-    #[tokio::test]
-    async fn test_data_row_renders_empty_counts_as_empty_maps() {
-        let fixture = TableTestFixture::new();
-        setup_data_and_delete_manifests(&fixture).await;
-        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
-        let paths = batch
-            .column_by_name("file_path")
-            .unwrap()
-            .as_string::<i32>();
-        let mut by_suffix = HashMap::new();
-        for index in 0..paths.len() {
-            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
-            by_suffix.insert(suffix, index);
-        }
-        let data_row = by_suffix["3.parquet"];
-        for name in ["value_counts", "null_value_counts", "nan_value_counts"] {
-            let maps = batch.column_by_name(name).unwrap().as_map();
-            assert!(!maps.is_null(data_row));
-            assert_eq!(maps.value_length(data_row), 0);
-        }
     }
 
     #[tokio::test]
