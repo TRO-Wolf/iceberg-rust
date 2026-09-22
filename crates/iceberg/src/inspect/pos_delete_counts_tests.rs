@@ -17,8 +17,8 @@
 
 use std::collections::HashMap;
 
-use arrow_array::cast::AsArray;
 use arrow_array::Array;
+use arrow_array::cast::AsArray;
 
 use super::files::tests::{scan_single_batch, setup_data_and_delete_manifests};
 use crate::scan::tests::TableTestFixture;
