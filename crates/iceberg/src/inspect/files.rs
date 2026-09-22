@@ -305,7 +305,7 @@ impl<'a> FilesTable<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -329,7 +329,7 @@ mod tests {
     /// (Added/Deleted/Existing across partitions 100/200/300), and one DELETE manifest with one
     /// Added position-delete file in partition 100. It drives only public crate APIs, so it does
     /// not depend on the scan fixture's private helpers.
-    async fn setup_data_and_delete_manifests(fixture: &TableTestFixture) {
+    pub(crate) async fn setup_data_and_delete_manifests(fixture: &TableTestFixture) {
         let metadata = fixture.table.metadata().clone();
         let current_snapshot = metadata.current_snapshot().unwrap();
         let parent_snapshot = current_snapshot.parent_snapshot(&metadata).unwrap();
@@ -694,7 +694,7 @@ mod tests {
     }
 
     /// Concatenates a files-table scan into a single batch.
-    async fn scan_single_batch(
+    pub(crate) async fn scan_single_batch(
         stream: crate::scan::ArrowRecordBatchStream,
     ) -> arrow_array::RecordBatch {
         let batches: Vec<_> = stream.try_collect().await.unwrap();

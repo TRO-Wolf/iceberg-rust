@@ -45,10 +45,11 @@ use arrow_array::builder::{
 };
 use arrow_schema::Fields;
 
+use super::count_map::{append_count_map, append_count_map_or_null_for_pos_delete};
 use super::partition_values::append_partition;
 use crate::spec::{
-    Datum, ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType,
-    TableMetadata, Type, select_not,
+    DataContentType, Datum, ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema,
+    StructType, TableMetadata, Type, select_not,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -92,7 +93,7 @@ pub(super) fn partition_field_ids_by_spec(metadata: &TableMetadata) -> HashMap<i
 
 /// The boxed `MapBuilder` shape `StructBuilder::from_fields` produces for a `DataType::Map` child (its
 /// key/value field metadata is preserved by `make_builder`, so we only supply the values).
-type DynMapBuilder = MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>;
+pub(super) type DynMapBuilder = MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>;
 /// The boxed `ListBuilder` shape `StructBuilder::from_fields` produces for a `DataType::List` child.
 type DynListBuilder = ListBuilder<Box<dyn ArrayBuilder>>;
 
@@ -364,21 +365,25 @@ impl<'a> DataFileStructBuilder<'a> {
         struct_child::<Int64Builder>(b, i_file_size)?
             .append_value(data_file.file_size_in_bytes() as i64);
 
+        let is_pos_delete = data_file.content_type() == DataContentType::PositionDeletes;
         append_count_map(
             struct_child::<DynMapBuilder>(b, i_column_sizes)?,
             data_file.column_sizes(),
         )?;
-        append_count_map(
+        append_count_map_or_null_for_pos_delete(
             struct_child::<DynMapBuilder>(b, i_value_counts)?,
             data_file.value_counts(),
+            is_pos_delete,
         )?;
-        append_count_map(
+        append_count_map_or_null_for_pos_delete(
             struct_child::<DynMapBuilder>(b, i_null_value_counts)?,
             data_file.null_value_counts(),
+            is_pos_delete,
         )?;
-        append_count_map(
+        append_count_map_or_null_for_pos_delete(
             struct_child::<DynMapBuilder>(b, i_nan_value_counts)?,
             data_file.nan_value_counts(),
+            is_pos_delete,
         )?;
         append_bound_map(
             struct_child::<DynMapBuilder>(b, i_lower_bounds)?,
@@ -458,7 +463,7 @@ fn struct_child<T: arrow_array::builder::ArrayBuilder>(
 
 /// Downcasts a boxed (`Box<dyn ArrayBuilder>`) inner builder to a concrete type, erroring rather than
 /// panicking — a programming-error guard, since the builder shapes come from this module's field list.
-fn dyn_child<'a, T: ArrayBuilder>(
+pub(super) fn dyn_child<'a, T: ArrayBuilder>(
     builder: &'a mut Box<dyn ArrayBuilder>,
     what: &str,
 ) -> Result<&'a mut T> {
@@ -468,20 +473,6 @@ fn dyn_child<'a, T: ArrayBuilder>(
             format!("data_file {what} builder has an unexpected inner type"),
         )
     })
-}
-
-/// Appends a `map<int, long>` value (one of the metrics-count maps), keys sorted for determinism. The map
-/// builder is the boxed shape `make_builder` produces, so we downcast its key/value inner builders.
-fn append_count_map(builder: &mut DynMapBuilder, map: &HashMap<i32, u64>) -> Result<()> {
-    let mut keys: Vec<&i32> = map.keys().collect();
-    keys.sort_unstable();
-    for key in keys {
-        dyn_child::<Int32Builder>(builder.keys(), "count map key")?.append_value(*key);
-        dyn_child::<Int64Builder>(builder.values(), "count map value")?
-            .append_value(map[key] as i64);
-    }
-    builder.append(true)?;
-    Ok(())
 }
 
 /// Appends a `map<int, binary>` value (lower/upper bounds), keys sorted; values are the raw serialized

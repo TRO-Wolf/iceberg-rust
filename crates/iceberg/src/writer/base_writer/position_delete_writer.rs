@@ -27,7 +27,10 @@ use parquet::file::properties::WriterProperties;
 use parquet::schema::types::ColumnPath;
 
 use crate::arrow::schema_to_arrow_schema;
-use crate::metadata_columns::{delete_file_path_field, delete_file_pos_field};
+use crate::metadata_columns::{
+    RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS, delete_file_path_field,
+    delete_file_pos_field,
+};
 use crate::spec::{DataContentType, DataFile, PartitionKey, PartitionSpec, Schema, SchemaRef};
 use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
@@ -243,12 +246,21 @@ where
                     if let Some(pk) = self.partition_key.as_ref() {
                         res.partition(pk.data().clone());
                     }
-                    res.build().map_err(|e| {
+                    let mut data_file = res.build().map_err(|e| {
                         Error::new(
                             ErrorKind::DataInvalid,
                             format!("Failed to build position delete file: {e}"),
                         )
-                    })
+                    })?;
+                    for field_id in [
+                        RESERVED_FIELD_ID_DELETE_FILE_PATH,
+                        RESERVED_FIELD_ID_DELETE_FILE_POS,
+                    ] {
+                        data_file.value_counts.remove(&field_id);
+                        data_file.null_value_counts.remove(&field_id);
+                        data_file.nan_value_counts.remove(&field_id);
+                    }
+                    Ok(data_file)
                 })
                 .collect()
         } else {
@@ -673,6 +685,78 @@ mod test {
             err.to_string().contains("must carry its partition tuple"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_counts_empty_bounds_kept_single_file() -> Result<(), anyhow::Error>
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let mut writer = make_writer_builder(&file_io, &temp_dir)
+            .unpartitioned()
+            .build(None)
+            .await?;
+        writer
+            .write(pos_delete_batch(&[
+                ("s3://b/d/1.parquet", 0),
+                ("s3://b/d/1.parquet", 1),
+            ]))
+            .await?;
+        let data_files = writer.close().await?;
+        assert_eq!(data_files.len(), 1);
+        let data_file = &data_files[0];
+        assert_eq!(data_file.content, DataContentType::PositionDeletes);
+        assert!(data_file.value_counts().is_empty());
+        assert!(data_file.null_value_counts().is_empty());
+        assert!(data_file.nan_value_counts().is_empty());
+        for field_id in [
+            RESERVED_FIELD_ID_DELETE_FILE_PATH,
+            RESERVED_FIELD_ID_DELETE_FILE_POS,
+        ] {
+            assert!(!data_file.value_counts().contains_key(&field_id));
+            assert!(!data_file.null_value_counts().contains_key(&field_id));
+            assert!(!data_file.nan_value_counts().contains_key(&field_id));
+            assert!(data_file.lower_bounds().contains_key(&field_id));
+            assert!(data_file.upper_bounds().contains_key(&field_id));
+            assert!(data_file.column_sizes().contains_key(&field_id));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_counts_empty_bounds_kept_two_files() -> Result<(), anyhow::Error>
+    {
+        let temp_dir = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let mut writer = make_writer_builder(&file_io, &temp_dir)
+            .unpartitioned()
+            .build(None)
+            .await?;
+        writer
+            .write(pos_delete_batch(&[
+                ("s3://b/d/1.parquet", 0),
+                ("s3://b/d/2.parquet", 3),
+            ]))
+            .await?;
+        let data_files = writer.close().await?;
+        assert_eq!(data_files.len(), 1);
+        let data_file = &data_files[0];
+        assert_eq!(data_file.content, DataContentType::PositionDeletes);
+        assert!(data_file.value_counts().is_empty());
+        assert!(data_file.null_value_counts().is_empty());
+        assert!(data_file.nan_value_counts().is_empty());
+        for field_id in [
+            RESERVED_FIELD_ID_DELETE_FILE_PATH,
+            RESERVED_FIELD_ID_DELETE_FILE_POS,
+        ] {
+            assert!(!data_file.value_counts().contains_key(&field_id));
+            assert!(!data_file.null_value_counts().contains_key(&field_id));
+            assert!(!data_file.nan_value_counts().contains_key(&field_id));
+            assert!(data_file.lower_bounds().contains_key(&field_id));
+            assert!(data_file.upper_bounds().contains_key(&field_id));
+            assert!(data_file.column_sizes().contains_key(&field_id));
+        }
         Ok(())
     }
 }
