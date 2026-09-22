@@ -164,6 +164,8 @@ mod rewrite_data_files_branch;
 #[cfg(test)]
 mod rewrite_data_files_branch_tests;
 #[cfg(test)]
+mod rewrite_data_files_codec_tests;
+#[cfg(test)]
 mod rewrite_data_files_cow_bytes_tests;
 #[cfg(test)]
 mod rewrite_data_files_dangling_tests;
