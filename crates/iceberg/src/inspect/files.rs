@@ -751,6 +751,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pos_delete_row_renders_null_field_counts() {
+        let fixture = TableTestFixture::new();
+        setup_data_and_delete_manifests(&fixture).await;
+        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
+        let paths = batch
+            .column_by_name("file_path")
+            .unwrap()
+            .as_string::<i32>();
+        let mut by_suffix = HashMap::new();
+        for index in 0..paths.len() {
+            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
+            by_suffix.insert(suffix, index);
+        }
+        let delete_row = by_suffix["delete-1.parquet"];
+        for name in ["value_counts", "null_value_counts", "nan_value_counts"] {
+            let maps = batch.column_by_name(name).unwrap().as_map();
+            assert!(maps.is_null(delete_row));
+        }
+        let column_sizes = batch.column_by_name("column_sizes").unwrap().as_map();
+        assert!(!column_sizes.is_null(delete_row));
+        assert_eq!(column_sizes.value_length(delete_row), 0);
+    }
+
+    #[tokio::test]
+    async fn test_data_row_renders_empty_counts_as_empty_maps() {
+        let fixture = TableTestFixture::new();
+        setup_data_and_delete_manifests(&fixture).await;
+        let batch = scan_single_batch(fixture.table.inspect().files().scan().await.unwrap()).await;
+        let paths = batch
+            .column_by_name("file_path")
+            .unwrap()
+            .as_string::<i32>();
+        let mut by_suffix = HashMap::new();
+        for index in 0..paths.len() {
+            let suffix = paths.value(index).rsplit('/').next().unwrap().to_string();
+            by_suffix.insert(suffix, index);
+        }
+        let data_row = by_suffix["3.parquet"];
+        for name in ["value_counts", "null_value_counts", "nan_value_counts"] {
+            let maps = batch.column_by_name(name).unwrap().as_map();
+            assert!(!maps.is_null(data_row));
+            assert_eq!(maps.value_length(data_row), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn test_files_table_content_column_distinguishes_data_and_deletes() {
         // RISK: wrong `content` value — DATA files must report content 0, the position-delete file 1.
         let fixture = TableTestFixture::new();

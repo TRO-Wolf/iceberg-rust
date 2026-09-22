@@ -47,8 +47,8 @@ use arrow_schema::Fields;
 
 use super::partition_values::append_partition;
 use crate::spec::{
-    Datum, ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema, StructType,
-    TableMetadata, Type, select_not,
+    DataContentType, Datum, ListType, MapType, NestedField, NestedFieldRef, PrimitiveType, Schema,
+    StructType, TableMetadata, Type, select_not,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -364,21 +364,25 @@ impl<'a> DataFileStructBuilder<'a> {
         struct_child::<Int64Builder>(b, i_file_size)?
             .append_value(data_file.file_size_in_bytes() as i64);
 
+        let is_pos_delete = data_file.content_type() == DataContentType::PositionDeletes;
         append_count_map(
             struct_child::<DynMapBuilder>(b, i_column_sizes)?,
             data_file.column_sizes(),
         )?;
-        append_count_map(
+        append_count_map_or_null_for_pos_delete(
             struct_child::<DynMapBuilder>(b, i_value_counts)?,
             data_file.value_counts(),
+            is_pos_delete,
         )?;
-        append_count_map(
+        append_count_map_or_null_for_pos_delete(
             struct_child::<DynMapBuilder>(b, i_null_value_counts)?,
             data_file.null_value_counts(),
+            is_pos_delete,
         )?;
-        append_count_map(
+        append_count_map_or_null_for_pos_delete(
             struct_child::<DynMapBuilder>(b, i_nan_value_counts)?,
             data_file.nan_value_counts(),
+            is_pos_delete,
         )?;
         append_bound_map(
             struct_child::<DynMapBuilder>(b, i_lower_bounds)?,
@@ -482,6 +486,19 @@ fn append_count_map(builder: &mut DynMapBuilder, map: &HashMap<i32, u64>) -> Res
     }
     builder.append(true)?;
     Ok(())
+}
+
+fn append_count_map_or_null_for_pos_delete(
+    builder: &mut DynMapBuilder,
+    map: &HashMap<i32, u64>,
+    is_pos_delete: bool,
+) -> Result<()> {
+    if is_pos_delete && map.is_empty() {
+        builder.append(false)?;
+        Ok(())
+    } else {
+        append_count_map(builder, map)
+    }
 }
 
 /// Appends a `map<int, binary>` value (lower/upper bounds), keys sorted; values are the raw serialized
