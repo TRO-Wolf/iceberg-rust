@@ -25,8 +25,10 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+use iceberg::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
 use iceberg::spec::{
-    FormatVersion, NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec,
+    DataContentType, DataFile, Datum, FormatVersion, NestedField, PrimitiveType, Schema, Transform,
+    Type, UnboundPartitionSpec,
 };
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
@@ -253,6 +255,109 @@ fn chunk_uses_dictionary(column: &ColumnChunkMetaData) -> bool {
             Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY
         )
     })
+}
+
+async fn committed_position_deletes(
+    catalog: &Arc<MemoryCatalog>,
+    table_ident: &TableIdent,
+) -> Vec<DataFile> {
+    let table = catalog
+        .load_table(table_ident)
+        .await
+        .expect("load the table");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("a current snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("load the manifest list");
+    let mut deletes = Vec::new();
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("load the manifest");
+        for entry in manifest.entries() {
+            if entry.is_alive()
+                && entry.data_file().content_type() == DataContentType::PositionDeletes
+            {
+                deletes.push(entry.data_file().clone());
+            }
+        }
+    }
+    deletes.sort_by(|left, right| left.file_path().cmp(right.file_path()));
+    deletes
+}
+
+fn read_uvarint(rest: &[u8]) -> (u64, &[u8]) {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    let mut consumed = 0usize;
+    loop {
+        assert!(
+            shift < 70,
+            "the postscript holds a malformed varint past ten bytes"
+        );
+        let byte = *rest
+            .get(consumed)
+            .expect("the postscript ends inside a varint");
+        consumed += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            return (value, &rest[consumed..]);
+        }
+    }
+}
+
+fn orc_postscript_compression_kind(bytes: &[u8]) -> u64 {
+    assert!(
+        bytes.len() > 8,
+        "an orc file must hold a postscript, got {} bytes",
+        bytes.len()
+    );
+    assert_eq!(
+        &bytes[bytes.len() - 4..bytes.len() - 1],
+        b"ORC",
+        "the file must close with the ORC magic"
+    );
+    let ps_len = usize::from(bytes[bytes.len() - 1]);
+    assert!(
+        ps_len + 1 < bytes.len(),
+        "the postscript length must fit the file"
+    );
+    let mut rest = &bytes[bytes.len() - 1 - ps_len..bytes.len() - 1];
+    loop {
+        assert!(!rest.is_empty(), "the postscript must carry field 2");
+        let (tag, tail) = read_uvarint(rest);
+        rest = tail;
+        match tag & 7 {
+            0 => {
+                let (value, tail) = read_uvarint(rest);
+                rest = tail;
+                if tag >> 3 == 2 {
+                    return value;
+                }
+            }
+            2 => {
+                let (length, tail) = read_uvarint(rest);
+                let length =
+                    usize::try_from(length).expect("the postscript holds a length past usize");
+                assert!(
+                    tail.len() >= length,
+                    "the postscript ends inside a length-prefixed field"
+                );
+                rest = &tail[length..];
+            }
+            5 => {
+                assert!(rest.len() >= 4, "the postscript ends inside a fixed32");
+                rest = &rest[4..];
+            }
+            wire => panic!("the postscript carries unexpected wire type {wire}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -614,5 +719,162 @@ async fn test_mor_delete_parquet_keeps_full_exact_path_bounds() {
         surviving_ids(&context, &table_ident).await,
         vec![1, 3],
         "the delete applies and no row resurrects"
+    );
+}
+
+#[tokio::test]
+async fn test_mor_delete_committed_bounds_hold_the_full_data_path() {
+    let (context, catalog, table_ident, _warehouse) = create_fixture(
+        "mor_delete_format_committed_bounds",
+        "target",
+        mor_properties(&[]),
+        FormatVersion::V2,
+        false,
+        true,
+    )
+    .await;
+    insert_values(&context, &table_ident, "(1, 'a'), (2, 'b'), (3, 'c')").await;
+    delete_where(&context, &table_ident, "id = 2").await;
+
+    let rows = files_content_format(&context, &table_ident).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "one data file plus one delete file, got {rows:?}"
+    );
+    let data_path = rows[0].2.clone();
+    assert!(
+        data_path.len() > 16,
+        "the data path must exceed the 16-byte truncation window, got {data_path}"
+    );
+
+    let deletes = committed_position_deletes(&catalog, &table_ident).await;
+    assert_eq!(
+        deletes.len(),
+        1,
+        "one committed position delete, got {deletes:?}"
+    );
+    let expected = Datum::string(data_path.clone());
+    assert_eq!(
+        deletes[0]
+            .lower_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
+        Some(&expected),
+        "the committed lower bound is the full data path"
+    );
+    assert_eq!(
+        deletes[0]
+            .upper_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
+        Some(&expected),
+        "the committed upper bound is the full data path"
+    );
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![1, 3],
+        "the delete applies and no row resurrects"
+    );
+}
+
+#[tokio::test]
+async fn test_mor_delete_on_orc_keeps_full_committed_path_bounds() {
+    let (context, catalog, table_ident, _warehouse) = create_fixture(
+        "mor_delete_format_orc_bounds",
+        "target",
+        mor_properties(&[("write.format.default", "orc")]),
+        FormatVersion::V2,
+        false,
+        true,
+    )
+    .await;
+    insert_values(&context, &table_ident, "(1, 'a'), (2, 'b'), (3, 'c')").await;
+    delete_where(&context, &table_ident, "id = 2").await;
+
+    let rows = files_content_format(&context, &table_ident).await;
+    let content_format: Vec<(i32, String)> = rows
+        .iter()
+        .map(|(content, format, _)| (*content, format.clone()))
+        .collect();
+    assert_eq!(
+        content_format,
+        vec![(0, "ORC".to_string()), (1, "ORC".to_string())],
+        "an ORC table takes ORC data and ORC position deletes, got {rows:?}"
+    );
+    let data_path = rows[0].2.clone();
+    assert!(
+        data_path.len() > 16,
+        "the data path must exceed the 16-byte truncation window, got {data_path}"
+    );
+
+    let deletes = committed_position_deletes(&catalog, &table_ident).await;
+    assert_eq!(
+        deletes.len(),
+        1,
+        "one committed position delete, got {deletes:?}"
+    );
+    let expected = Datum::string(data_path.clone());
+    assert_eq!(
+        deletes[0]
+            .lower_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
+        Some(&expected),
+        "the committed lower bound is the full data path"
+    );
+    assert_eq!(
+        deletes[0]
+            .upper_bounds()
+            .get(&RESERVED_FIELD_ID_DELETE_FILE_PATH),
+        Some(&expected),
+        "the committed upper bound is the full data path"
+    );
+    assert_eq!(
+        files_content_format(&context, &table_ident).await.len(),
+        2,
+        "one data file plus one delete file after the commit"
+    );
+}
+
+#[tokio::test]
+async fn test_mor_delete_on_orc_honours_the_none_compression_codec() {
+    let (context, _catalog, table_ident, _warehouse) = create_fixture(
+        "mor_delete_format_orc_codec",
+        "target",
+        mor_properties(&[
+            ("write.format.default", "orc"),
+            ("write.orc.compression-codec", "none"),
+        ]),
+        FormatVersion::V2,
+        false,
+        false,
+    )
+    .await;
+    insert_values(&context, &table_ident, "(1, 'a'), (2, 'b'), (3, 'c')").await;
+    delete_where(&context, &table_ident, "id = 2").await;
+
+    let rows = files_content_format(&context, &table_ident).await;
+    let content_format: Vec<(i32, String)> = rows
+        .iter()
+        .map(|(content, format, _)| (*content, format.clone()))
+        .collect();
+    assert_eq!(
+        content_format,
+        vec![(0, "ORC".to_string()), (1, "ORC".to_string())],
+        "an ORC table takes ORC data and ORC position deletes, got {rows:?}"
+    );
+    let delete_path = &rows[1].2;
+    assert!(
+        delete_path.ends_with(".orc"),
+        "delete file {delete_path} keeps the ORC suffix"
+    );
+    let bytes = std::fs::read(local_fs_path(delete_path)).expect("read delete file bytes");
+    assert_eq!(
+        orc_postscript_compression_kind(&bytes),
+        0,
+        "the codec property must reach the delete postscript"
+    );
+    assert_eq!(
+        files_content_format(&context, &table_ident).await.len(),
+        2,
+        "one data file plus one delete file after the commit"
     );
 }
