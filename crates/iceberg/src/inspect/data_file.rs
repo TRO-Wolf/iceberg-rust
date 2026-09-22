@@ -306,23 +306,17 @@ impl<'a> DataFileStructBuilder<'a> {
         let i_file_format = field_index(&self.indices, "file_format")?;
         let i_spec_id = field_index(&self.indices, "spec_id")?;
         let i_partition = self.indices.get("partition").copied();
-
         let i_record_count = field_index(&self.indices, "record_count")?;
         let i_file_size = field_index(&self.indices, "file_size_in_bytes")?;
-
         let i_column_sizes = field_index(&self.indices, "column_sizes")?;
-
         let i_value_counts = field_index(&self.indices, "value_counts")?;
         let i_null_value_counts = field_index(&self.indices, "null_value_counts")?;
         let i_nan_value_counts = field_index(&self.indices, "nan_value_counts")?;
-
         let i_lower_bounds = field_index(&self.indices, "lower_bounds")?;
         let i_upper_bounds = field_index(&self.indices, "upper_bounds")?;
-
         let i_key_metadata = field_index(&self.indices, "key_metadata")?;
         let i_split_offsets = field_index(&self.indices, "split_offsets")?;
         let i_equality_ids = field_index(&self.indices, "equality_ids")?;
-
         let i_sort_order_id = field_index(&self.indices, "sort_order_id")?;
         let i_first_row_id = field_index(&self.indices, "first_row_id")?;
         let i_referenced_data_file = field_index(&self.indices, "referenced_data_file")?;
@@ -339,7 +333,6 @@ impl<'a> DataFileStructBuilder<'a> {
         // match Java exactly — the on-disk write path (Display/serde) is unchanged.
         struct_child::<StringBuilder>(b, i_file_format)?
             .append_value(data_file.file_format().to_string().to_uppercase());
-
         struct_child::<Int32Builder>(b, i_spec_id)?.append_value(data_file.partition_spec_id);
 
         if let Some(i_partition) = i_partition {
@@ -396,7 +389,6 @@ impl<'a> DataFileStructBuilder<'a> {
             struct_child::<DynMapBuilder>(b, i_lower_bounds)?,
             data_file.lower_bounds(),
         )?;
-
         append_bound_map(
             struct_child::<DynMapBuilder>(b, i_upper_bounds)?,
             data_file.upper_bounds(),
@@ -409,7 +401,6 @@ impl<'a> DataFileStructBuilder<'a> {
             struct_child::<DynListBuilder>(b, i_split_offsets)?,
             data_file.split_offsets(),
         )?;
-
         append_i32_list(
             struct_child::<DynListBuilder>(b, i_equality_ids)?,
             data_file.equality_ids().as_deref(),
