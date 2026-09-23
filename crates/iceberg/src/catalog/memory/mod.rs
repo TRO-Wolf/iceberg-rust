@@ -19,6 +19,8 @@
 
 mod caches;
 mod catalog;
+#[cfg(test)]
+mod hadoop_naming_tests;
 mod metadata_naming;
 mod namespace_state;
 #[cfg(test)]
