@@ -48,7 +48,8 @@ and keeps `metadata/version-hint.text` at the current version.
 | C-10 | A `v2` hint write that finishes after a later `v3` commit cannot leave the hint behind the pointer | `test_hadoop_hint_follows_pointer_when_older_hint_write_finishes_last` |
 | C-11 | Six commits raced from one base with conflict retry all land; pointer `v7`, hint = `7` | `test_hadoop_racing_commits_from_one_base_end_with_hint_at_pointer` |
 | C-12 | Default mode, registered `v3` pointer, one commit: `v4`, no hint file | `test_default_naming_register_vn_pointer_writes_no_hint` |
-| C-13 | Hadoop create whose hint write fails returns `Err` and registers nothing | `test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails` |
+| C-13 | Hadoop create whose hint write fails returns `Err`, registers nothing and leaves no `v1`; once the obstruction is gone the same create succeeds at `v1` with hint = `1` | `test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails` |
+| C-14 | `create_table(T)` raced against `register_table(T, v3)` at T's default location, 32 rounds on fresh tempdirs: exactly one wins; a hint, if present, equals the registered pointer's version; a losing create leaves no `v1`; each side wins at least once | `test_hadoop_create_racing_register_keeps_hint_at_registered_pointer` |
 
 Mutation check: skipping the post-commit hint write turns C-2 red; bypassing the relocation
 refusal turns C-6 red.
@@ -64,9 +65,17 @@ Round r2fix mutation checks (each restored, suite green after):
 | `self != Self::Hadoop` guard removed from `advance_version_hint` | C-12 |
 | Create ignores a failed hint write | C-13 |
 
-C-9 and C-10 use `SteppingStorage`, a test `MemoryStorage` wrapper that yields before every
+Round r3fix mutation checks (each restored, suite green after):
+
+| Mutation | Red |
+|---|---|
+| No `v1` delete after a failed create-time hint write | C-13 (at `!v1.exists()`; with that assertion removed, the retry fails `CatalogCommitConflicts` on the leftover `v1`) |
+| Hadoop create releases the lock between the name check and the insert (r2fix shape) | C-14 (round `delay_register true, yields 0`: hint `1`, pointer `v3`) |
+
+C-9, C-10 and C-14 use `SteppingStorage`, a test `MemoryStorage` wrapper that yields before every
 operation (and, for C-10, holds the `2` hint write for 200 ms), so the interleavings are
-deterministic on the current-thread test runtime.
+deterministic on the current-thread test runtime. C-14 wraps the local-fs storage, C-9 and C-10
+the in-memory storage.
 
 ## 3. Decisions
 
@@ -74,13 +83,20 @@ deterministic on the current-thread test runtime.
   `vN`-named. A default-mode catalog that registered a `vN` pointer (the F-ICE-HADOOP-VN-1 pins)
   keeps writing no hint, so default mode stays byte-for-byte unchanged.
 - D-2: a hint write failure after the pointer swap is logged with `tracing::warn!` and the commit
-  returns `Ok`; at create it is an error because nothing is registered yet.
+  returns `Ok`; at create it is an error because nothing is registered yet. Round r3fix (critic
+  V-008): that create error first deletes the `v1` the exclusive write just created, so a retry
+  is not blocked by it; a failed delete is logged with `tracing::warn!` and the hint error is
+  still returned.
 - D-3 (revised in round r2fix, critic V-001): in Hadoop mode create first checks the name is free
   under the catalog lock (`NamespaceState::ensure_table_name_free`, the same errors
   `insert_new_table` returns), then writes `v1` through the exclusive
   `TableMetadata::write_commit_metadata`. A duplicate create fails before writing; a racing
   create that passes the check fails at the exclusive write with `CatalogCommitConflicts` and
   registers nothing. Uuid mode still writes with `write_to`.
+- D-6 (round r3fix, critic V-007): in Hadoop mode `create_table` takes the `root_namespace_state`
+  lock once and holds it across the name check, the `v1` write, the hint write and the insert, so
+  no `register_table` or `create_table` can take the name in between. Same trade as D-5. Uuid mode
+  keeps its writes outside the lock.
 - D-5 (round r2fix, critic V-002): `update_table` writes `version-hint.text` before it drops the
   `root_namespace_state` lock that ordered the pointer swap, so hint writes land in pointer order.
   No second mutex. The trade: the hint write is inside the catalog-wide critical section.
@@ -113,3 +129,25 @@ Every deterministic-path write in `git diff origin/main...HEAD`:
 No other write in the diff targets a deterministic path. `register_table` writes nothing. Staged
 create stays uuid-named. Staged replace (`publish_replace_table`) writes its `vN` exclusively but no
 hint (residue above).
+
+## 6. Class sweep (round r3fix)
+
+Class: Hadoop create's durable writes are not atomic with registration, through a check-then-act
+across a lock release, or a fallible step after a durable write with no undo. Hadoop-mode paths in
+`git diff origin/main...HEAD`:
+
+| Path | Durable write | Later fallible step | (a) Under the pointer lock | (b) Undone or harmless on a later failure |
+|---|---|---|---|---|
+| `create_table` | `v1.metadata.json` (exclusive) | hint write | Yes (D-6) | Undone: `v1` deleted (D-2) |
+| `create_table` | `version-hint.text` = `1` | `insert_new_table` | Yes (D-6) | Harmless: the insert checks what `ensure_table_name_free` already checked under the same held lock, so it cannot fail |
+| `create_table` | none after insert | `table_builder().build()` | n/a | Harmless: every required field is set; code unchanged from `main` |
+| `update_table` | `version-hint.text` = `N` | none | Yes (D-5) | Last step; failure only warns (V-002 ruling) |
+| `register_table` | none | — | Insert under lock | Nothing to undo |
+| `rename_table` | none (pointer move only) | — | Yes | The hint lives in the table directory, which does not move |
+| staged create | `00000-<uuid>` (not deterministic) | — | — | Outside the class; not in this diff |
+| staged replace | none in this diff | — | — | Accepted residue: no hint |
+
+No other site of the class is in this PR's code. Pre-existing on `main`, not in this diff:
+`update_table` and staged replace write `v(N+1)` exclusively before the final pointer CAS, so a
+CAS failure leaves an orphan `v(N+1)`. R167 already records this: the next commit fails loud, and
+re-registering at the newest version recovers.
