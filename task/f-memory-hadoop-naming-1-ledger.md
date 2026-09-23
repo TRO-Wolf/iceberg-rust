@@ -28,7 +28,7 @@
 ## 1. Measured gap
 
 The Spark harness's `type=hadoop` catalog answers `v4.metadata.json` after CREATE TABLE plus three
-INSERTs. RePark maps `type=hadoop` to a fork `MemoryCatalog`, which answered
+INSERT statements. RePark maps `type=hadoop` to a fork `MemoryCatalog`, which answered
 `00003-<uuid>.metadata.json`. Java `HadoopTableOperations` names the first file `v1.metadata.json`
 and keeps `metadata/version-hint.text` at the current version.
 
