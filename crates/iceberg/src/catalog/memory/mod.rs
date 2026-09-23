@@ -21,6 +21,8 @@ mod caches;
 mod catalog;
 mod namespace_state;
 #[cfg(test)]
+mod pointer_cache_tests;
+#[cfg(test)]
 mod register_cache_tests;
 
 pub use catalog::*;
