@@ -53,6 +53,22 @@ impl MetadataNaming {
         }
     }
 
+    pub(crate) async fn write_first_metadata(
+        self,
+        file_io: &FileIO,
+        metadata: &TableMetadata,
+        location: &MetadataLocation,
+    ) -> Result<()> {
+        let path = location.to_string();
+        match self {
+            Self::Uuid => metadata.write_to(file_io, &path).await,
+            Self::Hadoop => {
+                metadata.write_commit_metadata(file_io, &path).await?;
+                write_version_hint(file_io, location).await
+            }
+        }
+    }
+
     pub(crate) async fn advance_version_hint(self, file_io: &FileIO, metadata_location: &str) {
         if self != Self::Hadoop {
             return;
@@ -70,10 +86,7 @@ impl MetadataNaming {
     }
 }
 
-pub(crate) async fn write_version_hint(
-    file_io: &FileIO,
-    location: &MetadataLocation,
-) -> Result<()> {
+async fn write_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Result<()> {
     let Some((path, version)) = location.hadoop_version_hint() else {
         return Ok(());
     };

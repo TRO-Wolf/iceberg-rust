@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use futures::lock::Mutex;
 use itertools::Itertools;
 
-use super::metadata_naming::{MetadataNaming, write_version_hint};
+use super::metadata_naming::MetadataNaming;
 use super::namespace_state::NamespaceState;
 use crate::arrow::ParquetFooterCache;
 use crate::catalog::table_metadata_cache::{
@@ -412,8 +412,13 @@ impl Catalog for MemoryCatalog {
             .metadata;
         let first_location = self.metadata_naming.first_location(&metadata)?;
         let metadata_location = first_location.to_string();
-        metadata.write_to(&self.file_io, &metadata_location).await?;
-        write_version_hint(&self.file_io, &first_location).await?;
+        if self.metadata_naming == MetadataNaming::Hadoop {
+            let root_namespace_state = self.root_namespace_state.lock().await;
+            root_namespace_state.ensure_table_name_free(&table_ident)?;
+        }
+        self.metadata_naming
+            .write_first_metadata(&self.file_io, &metadata, &first_location)
+            .await?;
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
@@ -596,10 +601,10 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
-        drop(root_namespace_state);
         self.metadata_naming
             .advance_version_hint(&self.file_io, &new_metadata_location)
             .await;
+        drop(root_namespace_state);
         if let Some(cache) = self.table_metadata_cache.as_ref()
             && stored_at_start != new_metadata_location
         {

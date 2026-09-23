@@ -296,6 +296,23 @@ impl NamespaceState {
         }
     }
 
+    pub(crate) fn ensure_table_name_free(&self, table_ident: &TableIdent) -> Result<()> {
+        let namespace = self.get_namespace(table_ident.namespace())?;
+        if namespace
+            .view_metadata_locations
+            .contains_key(table_ident.name())
+        {
+            return view_with_same_name_err(table_ident);
+        }
+        if namespace
+            .table_metadata_locations
+            .contains_key(table_ident.name())
+        {
+            return table_already_exists_err(table_ident);
+        }
+        Ok(())
+    }
+
     // Inserts the given table or returns an error if it already exists
     pub(crate) fn insert_new_table(
         &mut self,
