@@ -64,7 +64,17 @@ impl MetadataNaming {
             Self::Uuid => metadata.write_to(file_io, &path).await,
             Self::Hadoop => {
                 metadata.write_commit_metadata(file_io, &path).await?;
-                write_version_hint(file_io, location).await
+                let Err(error) = write_version_hint(file_io, location).await else {
+                    return Ok(());
+                };
+                if let Err(delete_error) = file_io.delete(&path).await {
+                    tracing::warn!(
+                        ?delete_error,
+                        metadata_location = path,
+                        "failed to remove Hadoop v1 metadata after version-hint.text write failed"
+                    );
+                }
+                Err(error)
             }
         }
     }

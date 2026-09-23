@@ -413,14 +413,16 @@ impl Catalog for MemoryCatalog {
         let first_location = self.metadata_naming.first_location(&metadata)?;
         let metadata_location = first_location.to_string();
         if self.metadata_naming == MetadataNaming::Hadoop {
-            let root_namespace_state = self.root_namespace_state.lock().await;
+            let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.ensure_table_name_free(&table_ident)?;
-        }
-        self.metadata_naming
-            .write_first_metadata(&self.file_io, &metadata, &first_location)
-            .await?;
-
-        {
+            self.metadata_naming
+                .write_first_metadata(&self.file_io, &metadata, &first_location)
+                .await?;
+            root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
+        } else {
+            self.metadata_naming
+                .write_first_metadata(&self.file_io, &metadata, &first_location)
+                .await?;
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
         }
