@@ -503,6 +503,12 @@ async fn test_hadoop_duplicate_create_keeps_registered_v1_bytes() {
 
 #[tokio::test]
 async fn test_hadoop_concurrent_create_registers_winner_bytes() {
+    for offset in 0..8 {
+        assert_concurrent_create_registers_winner_bytes(offset).await;
+    }
+}
+
+async fn assert_concurrent_create_registers_winner_bytes(offset: usize) {
     let catalog = stepping_catalog(None).await;
     let first = tokio::spawn({
         let catalog = catalog.clone();
@@ -510,7 +516,12 @@ async fn test_hadoop_concurrent_create_registers_winner_bytes() {
     });
     let second = tokio::spawn({
         let catalog = catalog.clone();
-        async move { create_with_schema(&catalog, wide_schema()).await }
+        async move {
+            for _ in 0..offset {
+                tokio::task::yield_now().await;
+            }
+            create_with_schema(&catalog, wide_schema()).await
+        }
     });
     let results = [
         first.await.expect("join first"),
@@ -518,7 +529,7 @@ async fn test_hadoop_concurrent_create_registers_winner_bytes() {
     ];
 
     let winners: Vec<&Table> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
-    assert_eq!(winners.len(), 1, "{results:?}");
+    assert_eq!(winners.len(), 1, "offset {offset}: {results:?}");
     let winner = winners[0];
     let loser = results
         .iter()
@@ -529,15 +540,19 @@ async fn test_hadoop_concurrent_create_registers_winner_bytes() {
             loser.kind(),
             ErrorKind::TableAlreadyExists | ErrorKind::CatalogCommitConflicts
         ),
-        "{loser}"
+        "offset {offset}: {loser}"
     );
 
     let loaded = catalog.load_table(&ident()).await.expect("load");
-    assert_eq!(location(&loaded), location(winner));
+    assert_eq!(location(&loaded), location(winner), "offset {offset}");
     let bytes = read_bytes(&catalog, &location(&loaded)).await;
     let stored: TableMetadata = serde_json::from_slice(&bytes).expect("parse");
-    assert_eq!(stored.uuid(), winner.metadata().uuid());
-    assert_eq!(stored.current_schema(), winner.metadata().current_schema());
+    assert_eq!(stored.uuid(), winner.metadata().uuid(), "offset {offset}");
+    assert_eq!(
+        stored.current_schema(),
+        winner.metadata().current_schema(),
+        "offset {offset}"
+    );
     assert_hint_matches_pointer(&catalog, "1").await;
 }
 
