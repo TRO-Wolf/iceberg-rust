@@ -42,7 +42,7 @@ use crate::{
 
 /// Memory catalog warehouse location
 pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
-#[doc = "Memory catalog metadata file naming: `uuid` (default) or `hadoop`."]
+#[allow(missing_docs)]
 pub const MEMORY_CATALOG_METADATA_NAMING: &str = "metadata-naming";
 
 /// namespace `location` property
