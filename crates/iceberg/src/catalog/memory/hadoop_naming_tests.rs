@@ -18,16 +18,24 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 use super::{
     MEMORY_CATALOG_METADATA_NAMING, MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder,
 };
-use crate::io::LocalFsStorageFactory;
+use crate::io::{
+    FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorageFactory, MemoryStorage,
+    OutputFile, Storage, StorageConfig, StorageFactory,
+};
 use crate::spec::{
-    NestedField, PrimitiveType, Schema, TableMetadataBuilder, TableProperties, Type,
+    NestedField, PrimitiveType, Schema, TableMetadata, TableMetadataBuilder, TableProperties, Type,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -39,10 +47,20 @@ use crate::{
 const UUID_REGEX_STR: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
 
 async fn load_catalog(warehouse: &TempDir, naming: Option<&str>) -> Result<MemoryCatalog> {
-    let mut props = HashMap::from([(
-        MEMORY_CATALOG_WAREHOUSE.to_string(),
-        warehouse.path().to_str().expect("utf8 path").to_string(),
-    )]);
+    load_catalog_with(
+        Arc::new(LocalFsStorageFactory),
+        warehouse.path().to_str().expect("utf8 path"),
+        naming,
+    )
+    .await
+}
+
+async fn load_catalog_with(
+    factory: Arc<dyn StorageFactory>,
+    warehouse: &str,
+    naming: Option<&str>,
+) -> Result<MemoryCatalog> {
+    let mut props = HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse.to_string())]);
     if let Some(naming) = naming {
         props.insert(
             MEMORY_CATALOG_METADATA_NAMING.to_string(),
@@ -50,7 +68,7 @@ async fn load_catalog(warehouse: &TempDir, naming: Option<&str>) -> Result<Memor
         );
     }
     MemoryCatalogBuilder::default()
-        .with_storage_factory(Arc::new(LocalFsStorageFactory))
+        .with_storage_factory(factory)
         .load("memory", props)
         .await
 }
@@ -285,4 +303,377 @@ async fn test_hadoop_register_uuid_location_stays_uuid() {
     let committed = commit_property(&catalog, "a").await;
     assert_uuid_named(&location(&committed), "00001");
     assert_eq!(hint(&committed), None);
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SteppingStorage {
+    #[serde(skip)]
+    inner: MemoryStorage,
+    #[serde(skip)]
+    delayed_hint: Option<Arc<Notify>>,
+}
+
+impl SteppingStorage {
+    async fn step(&self) {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for SteppingStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        self.step().await;
+        self.inner.exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        self.step().await;
+        self.inner.metadata(path).await
+    }
+
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        self.step().await;
+        self.inner.read(path).await
+    }
+
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        self.step().await;
+        self.inner.reader(path).await
+    }
+
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.step().await;
+        if let Some(entered) = &self.delayed_hint
+            && path.ends_with("/version-hint.text")
+            && bs.as_ref() == b"2"
+        {
+            entered.notify_one();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        self.inner.write(path, bs).await
+    }
+
+    async fn write_new(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.step().await;
+        self.inner.write_new(path, bs).await
+    }
+
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        self.step().await;
+        self.inner.writer(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.step().await;
+        self.inner.delete(path).await
+    }
+
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        self.step().await;
+        self.inner.delete_prefix(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
+        self.step().await;
+        self.inner.list(prefix).await
+    }
+
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SteppingStorageFactory {
+    #[serde(skip)]
+    storage: SteppingStorage,
+}
+
+#[typetag::serde]
+impl StorageFactory for SteppingStorageFactory {
+    fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(self.storage.clone()))
+    }
+}
+
+async fn stepping_catalog(delayed_hint: Option<Arc<Notify>>) -> Arc<MemoryCatalog> {
+    let factory = SteppingStorageFactory {
+        storage: SteppingStorage {
+            inner: MemoryStorage::default(),
+            delayed_hint,
+        },
+    };
+    let catalog = load_catalog_with(Arc::new(factory), "memory:///warehouse", Some("hadoop"))
+        .await
+        .expect("load");
+    catalog
+        .create_namespace(&ident().namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    Arc::new(catalog)
+}
+
+fn wide_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .expect("schema")
+}
+
+async fn create_with_schema(catalog: &MemoryCatalog, schema: Schema) -> Result<Table> {
+    catalog
+        .create_table(
+            &ident().namespace,
+            TableCreation::builder()
+                .name(ident().name().to_string())
+                .schema(schema)
+                .build(),
+        )
+        .await
+}
+
+async fn read_bytes(catalog: &MemoryCatalog, path: &str) -> Bytes {
+    catalog
+        .file_io
+        .new_input(path)
+        .expect("input")
+        .read()
+        .await
+        .expect("read")
+}
+
+fn pointer_version(location: &str) -> String {
+    Regex::new(r"/metadata/v(\d+)\.metadata\.json$")
+        .expect("regex")
+        .captures(location)
+        .unwrap_or_else(|| panic!("{location}"))[1]
+        .to_string()
+}
+
+async fn assert_hint_matches_pointer(catalog: &MemoryCatalog, expected_version: &str) -> Table {
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    let pointer = location(&loaded);
+    assert_eq!(pointer_version(&pointer), expected_version, "{pointer}");
+    let hint = read_bytes(
+        catalog,
+        &format!("{}/version-hint.text", metadata_dir(&loaded)),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8_lossy(&hint),
+        pointer_version(&pointer),
+        "{pointer}"
+    );
+    loaded
+}
+
+#[tokio::test]
+async fn test_hadoop_duplicate_create_keeps_registered_v1_bytes() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    let created = create(&catalog, HashMap::new()).await.expect("create");
+    let v1 = location(&created);
+    let original = std::fs::read(&v1).expect("read v1");
+
+    let err = create_with_schema(&catalog, wide_schema())
+        .await
+        .expect_err("duplicate");
+    assert_eq!(err.kind(), ErrorKind::TableAlreadyExists);
+    assert_eq!(std::fs::read(&v1).expect("reread v1"), original);
+    assert_eq!(hint(&created).as_deref(), Some("1"));
+
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    assert_eq!(location(&loaded), v1);
+    assert_eq!(
+        loaded.metadata().current_schema(),
+        created.metadata().current_schema()
+    );
+    assert_eq!(loaded.metadata().uuid(), created.metadata().uuid());
+}
+
+#[tokio::test]
+async fn test_hadoop_concurrent_create_registers_winner_bytes() {
+    let catalog = stepping_catalog(None).await;
+    let first = tokio::spawn({
+        let catalog = catalog.clone();
+        async move { create_with_schema(&catalog, schema()).await }
+    });
+    let second = tokio::spawn({
+        let catalog = catalog.clone();
+        async move { create_with_schema(&catalog, wide_schema()).await }
+    });
+    let results = [
+        first.await.expect("join first"),
+        second.await.expect("join second"),
+    ];
+
+    let winners: Vec<&Table> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+    assert_eq!(winners.len(), 1, "{results:?}");
+    let winner = winners[0];
+    let loser = results
+        .iter()
+        .find_map(|r| r.as_ref().err())
+        .expect("loser");
+    assert!(
+        matches!(
+            loser.kind(),
+            ErrorKind::TableAlreadyExists | ErrorKind::CatalogCommitConflicts
+        ),
+        "{loser}"
+    );
+
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    assert_eq!(location(&loaded), location(winner));
+    let bytes = read_bytes(&catalog, &location(&loaded)).await;
+    let stored: TableMetadata = serde_json::from_slice(&bytes).expect("parse");
+    assert_eq!(stored.uuid(), winner.metadata().uuid());
+    assert_eq!(stored.current_schema(), winner.metadata().current_schema());
+    assert_hint_matches_pointer(&catalog, "1").await;
+}
+
+#[tokio::test]
+async fn test_hadoop_hint_follows_pointer_when_older_hint_write_finishes_last() {
+    let entered = Arc::new(Notify::new());
+    let catalog = stepping_catalog(Some(entered.clone())).await;
+    create_with_schema(&catalog, schema())
+        .await
+        .expect("create");
+
+    let slow = tokio::spawn({
+        let catalog = catalog.clone();
+        async move { location(&commit_property(&catalog, "a").await) }
+    });
+    entered.notified().await;
+    let fast = commit_property(&catalog, "b").await;
+    let slow = slow.await.expect("join");
+
+    assert!(slow.ends_with("/metadata/v2.metadata.json"), "{slow}");
+    assert!(
+        location(&fast).ends_with("/metadata/v3.metadata.json"),
+        "{}",
+        location(&fast)
+    );
+    assert_hint_matches_pointer(&catalog, "3").await;
+}
+
+#[tokio::test]
+async fn test_hadoop_racing_commits_from_one_base_end_with_hint_at_pointer() {
+    let catalog = stepping_catalog(None).await;
+    let retry = HashMap::from([
+        ("commit.retry.num-retries".to_string(), "100".to_string()),
+        ("commit.retry.min-wait-ms".to_string(), "1".to_string()),
+        ("commit.retry.max-wait-ms".to_string(), "5".to_string()),
+    ]);
+    catalog
+        .create_table(
+            &ident().namespace,
+            TableCreation::builder()
+                .name(ident().name().to_string())
+                .schema(schema())
+                .properties(retry)
+                .build(),
+        )
+        .await
+        .expect("create");
+    let base = catalog.load_table(&ident()).await.expect("base");
+
+    let writers = 6;
+    let handles: Vec<_> = (0..writers)
+        .map(|writer| {
+            let catalog = catalog.clone();
+            let base = base.clone();
+            tokio::spawn(async move {
+                let tx = Transaction::new(&base);
+                tx.update_table_properties()
+                    .set(format!("writer-{writer}"), writer.to_string())
+                    .apply(tx)
+                    .expect("apply")
+                    .commit(catalog.as_ref())
+                    .await
+                    .expect("commit")
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.await.expect("join");
+    }
+
+    let loaded = assert_hint_matches_pointer(&catalog, &(writers + 1).to_string()).await;
+    for writer in 0..writers {
+        assert_eq!(
+            loaded
+                .metadata()
+                .properties()
+                .get(&format!("writer-{writer}"))
+                .map(String::as_str),
+            Some(writer.to_string().as_str())
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_default_naming_register_vn_pointer_writes_no_hint() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, None).await.expect("load");
+    catalog
+        .create_namespace(&ident().namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let table_location = warehouse.path().join("registered");
+    let metadata = TableMetadataBuilder::from_table_creation(
+        TableCreation::builder()
+            .name("t".to_string())
+            .location(table_location.to_str().expect("utf8").to_string())
+            .schema(schema())
+            .build(),
+    )
+    .expect("builder")
+    .build()
+    .expect("metadata")
+    .metadata;
+    let v3 = format!("{}/metadata/v3.metadata.json", metadata.location());
+    metadata
+        .write_to(&catalog.file_io, &v3)
+        .await
+        .expect("write");
+
+    let registered = catalog
+        .register_table(&ident(), v3.clone())
+        .await
+        .expect("register");
+    assert_eq!(location(&registered), v3);
+
+    let committed = commit_property(&catalog, "a").await;
+    assert!(
+        location(&committed).ends_with("/metadata/v4.metadata.json"),
+        "{}",
+        location(&committed)
+    );
+    assert!(!table_location.join("metadata/version-hint.text").exists());
+    assert_eq!(hint(&committed), None);
+}
+
+#[tokio::test]
+async fn test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    std::fs::create_dir_all(warehouse.path().join("ns/t/metadata/version-hint.text"))
+        .expect("hint dir");
+
+    create(&catalog, HashMap::new())
+        .await
+        .expect_err("hint write fails");
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
 }
