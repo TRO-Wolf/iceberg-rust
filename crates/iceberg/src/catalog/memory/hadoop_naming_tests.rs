@@ -305,12 +305,25 @@ async fn test_hadoop_register_uuid_location_stays_uuid() {
     assert_eq!(hint(&committed), None);
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SteppingStorage {
-    #[serde(skip)]
-    inner: MemoryStorage,
+    #[serde(skip, default = "memory_storage")]
+    inner: Arc<dyn Storage>,
     #[serde(skip)]
     delayed_hint: Option<Arc<Notify>>,
+}
+
+fn memory_storage() -> Arc<dyn Storage> {
+    Arc::new(MemoryStorage::default())
+}
+
+impl Default for SteppingStorage {
+    fn default() -> Self {
+        Self {
+            inner: memory_storage(),
+            delayed_hint: None,
+        }
+    }
 }
 
 impl SteppingStorage {
@@ -404,7 +417,7 @@ impl StorageFactory for SteppingStorageFactory {
 async fn stepping_catalog(delayed_hint: Option<Arc<Notify>>) -> Arc<MemoryCatalog> {
     let factory = SteppingStorageFactory {
         storage: SteppingStorage {
-            inner: MemoryStorage::default(),
+            inner: memory_storage(),
             delayed_hint,
         },
     };
@@ -687,8 +700,117 @@ async fn test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails() 
     std::fs::create_dir_all(warehouse.path().join("ns/t/metadata/version-hint.text"))
         .expect("hint dir");
 
+    let hint_dir = warehouse.path().join("ns/t/metadata/version-hint.text");
+    let v1 = warehouse.path().join("ns/t/metadata/v1.metadata.json");
+
     create(&catalog, HashMap::new())
         .await
         .expect_err("hint write fails");
     assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+    assert!(!v1.exists());
+
+    std::fs::remove_dir(&hint_dir).expect("remove hint dir");
+    let table = create(&catalog, HashMap::new()).await.expect("retry");
+    assert!(
+        location(&table).ends_with("/metadata/v1.metadata.json"),
+        "{}",
+        location(&table)
+    );
+    assert!(v1.is_file());
+    assert_eq!(hint(&table).as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn test_hadoop_create_racing_register_keeps_hint_at_registered_pointer() {
+    let mut create_wins = 0;
+    for round in 0..32 {
+        if assert_create_racing_register(round % 2 == 0, round / 2).await {
+            create_wins += 1;
+        }
+    }
+    assert!(
+        (1..32).contains(&create_wins),
+        "create won {create_wins} of 32"
+    );
+}
+
+async fn assert_create_racing_register(delay_register: bool, yields: usize) -> bool {
+    let warehouse = TempDir::new().expect("tempdir");
+    let factory = SteppingStorageFactory {
+        storage: SteppingStorage {
+            inner: LocalFsStorageFactory
+                .build(&StorageConfig::default())
+                .expect("local fs"),
+            delayed_hint: None,
+        },
+    };
+    let catalog = load_catalog_with(
+        Arc::new(factory),
+        warehouse.path().to_str().expect("utf8"),
+        Some("hadoop"),
+    )
+    .await
+    .expect("load");
+    catalog
+        .create_namespace(&ident().namespace, HashMap::new())
+        .await
+        .expect("namespace");
+    let table_dir = warehouse.path().join("ns/t");
+    let metadata = TableMetadataBuilder::from_table_creation(
+        TableCreation::builder()
+            .name("t".to_string())
+            .location(table_dir.to_str().expect("utf8").to_string())
+            .schema(wide_schema())
+            .build(),
+    )
+    .expect("builder")
+    .build()
+    .expect("metadata")
+    .metadata;
+    let v3 = format!("{}/metadata/v3.metadata.json", metadata.location());
+    metadata
+        .write_to(&catalog.file_io, &v3)
+        .await
+        .expect("write v3");
+
+    let catalog = Arc::new(catalog);
+    let pause = move |delayed: bool| async move {
+        if delayed {
+            for _ in 0..yields {
+                tokio::task::yield_now().await;
+            }
+        }
+    };
+    let created = tokio::spawn({
+        let catalog = catalog.clone();
+        async move {
+            pause(!delay_register).await;
+            create_with_schema(&catalog, schema()).await
+        }
+    });
+    let registered = tokio::spawn({
+        let catalog = catalog.clone();
+        let v3 = v3.clone();
+        async move {
+            pause(delay_register).await;
+            catalog.register_table(&ident(), v3).await
+        }
+    });
+    let created = created.await.expect("join create");
+    let registered = registered.await.expect("join register");
+    let context = format!("delay_register {delay_register} yields {yields}");
+
+    assert_ne!(created.is_ok(), registered.is_ok(), "{context}");
+    let pointer = location(&catalog.load_table(&ident()).await.expect("load"));
+    let metadata_dir = table_dir.join("metadata");
+    if let Ok(hint) = std::fs::read_to_string(metadata_dir.join("version-hint.text")) {
+        assert_eq!(hint, pointer_version(&pointer), "{context}: {pointer}");
+    }
+    if created.is_ok() {
+        assert!(pointer.ends_with("/metadata/v1.metadata.json"), "{context}");
+    } else {
+        assert_eq!(pointer, v3, "{context}");
+        assert!(!metadata_dir.join("v1.metadata.json").exists(), "{context}");
+    }
+    created.is_ok()
 }
