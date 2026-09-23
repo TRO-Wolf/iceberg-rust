@@ -19,6 +19,7 @@
 
 mod caches;
 mod catalog;
+mod metadata_naming;
 mod namespace_state;
 #[cfg(test)]
 mod pointer_cache_tests;

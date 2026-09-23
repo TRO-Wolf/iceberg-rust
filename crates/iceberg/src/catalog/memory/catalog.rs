@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use futures::lock::Mutex;
 use itertools::Itertools;
 
+use super::metadata_naming::{MetadataNaming, write_version_hint};
 use super::namespace_state::NamespaceState;
 use crate::arrow::ParquetFooterCache;
 use crate::catalog::table_metadata_cache::{
@@ -41,6 +42,8 @@ use crate::{
 
 /// Memory catalog warehouse location
 pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
+/// Memory catalog metadata file naming: `uuid` (default) or `hadoop`.
+pub const MEMORY_CATALOG_METADATA_NAMING: &str = "metadata-naming";
 
 /// namespace `location` property
 const LOCATION: &str = "location";
@@ -137,6 +140,7 @@ pub struct MemoryCatalog {
     pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
     pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
+    metadata_naming: MetadataNaming,
 }
 
 impl MemoryCatalog {
@@ -152,6 +156,7 @@ impl MemoryCatalog {
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
 
         let name = config.name.unwrap_or_default();
+        let metadata_naming = MetadataNaming::from_props(&config.props)?;
         let properties = config.props.clone();
         let cache_scope = CacheScope::for_catalog(
             format!("memory:{}", config.warehouse),
@@ -172,6 +177,7 @@ impl MemoryCatalog {
             cache_scope,
             shared_object_cache,
             shared_footer_cache,
+            metadata_naming,
         })
     }
 
@@ -404,9 +410,10 @@ impl Catalog for MemoryCatalog {
         let metadata = TableMetadataBuilder::from_table_creation(table_creation)?
             .build()?
             .metadata;
-        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
-
+        let first_location = self.metadata_naming.first_location(&metadata)?;
+        let metadata_location = first_location.to_string();
         metadata.write_to(&self.file_io, &metadata_location).await?;
+        write_version_hint(&self.file_io, &first_location).await?;
 
         {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
@@ -590,6 +597,9 @@ impl Catalog for MemoryCatalog {
         )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
         drop(root_namespace_state);
+        self.metadata_naming
+            .advance_version_hint(&self.file_io, &new_metadata_location)
+            .await;
         if let Some(cache) = self.table_metadata_cache.as_ref()
             && stored_at_start != new_metadata_location
         {
