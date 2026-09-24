@@ -173,7 +173,7 @@ the in-memory storage.
   non-purge drop. Since D-3 was revised, re-creating a table dropped at `v2` or later fails at
   create with `CatalogCommitConflicts` on the leftover `v1` (Java `HadoopCatalog.dropTable` removes
   the whole table directory). Filed by the orchestrator as a question; drop is out of scope
-  (HMETA-DROP). The same holds for `drop_namespace`, which removes a namespace together with its
+  (HMETA-DROP; fixed in [F-MEMORY-HADOOP-NAMING-2](f-memory-hadoop-naming-2-ledger.md)). The same holds for `drop_namespace`, which removes a namespace together with its
   table pointers and deletes no files; see section 8.
 - No reader consults `version-hint.text`; the catalog pointer stays authoritative.
 - A failed create-time or post-commit hint write (warn-only, D-2) can leave an empty or truncated
@@ -257,7 +257,7 @@ meets.
 | `create_table`, derived location | Writes `v1` and the hint at `<ns location or warehouse/ns>/<name>`; frees no name | A second create of the same location, under another name via an explicit location, fails `CatalogCommitConflicts` on `v1` |
 | `create_table`, explicit location `L` | Same files at `L` | A later create deriving `L` fails `CatalogCommitConflicts`. If `L` already holds `vK` files but no `v1` (below), the create succeeds beside them |
 | `rename_table` | Was: freed the old name, files stayed. Now refused (D-7) before any state change | Fixed |
-| `drop_table` | Deletes only the current file; earlier `vK` and the hint stay | A table dropped at `v2+` blocks re-create with `CatalogCommitConflicts` on `v1`. A table dropped at `v1` leaves only a hint, which the next create overwrites. Residue, HMETA-DROP |
+| `drop_table` | Deletes only the current file; earlier `vK` and the hint stay | A table dropped at `v2+` blocks re-create with `CatalogCommitConflicts` on `v1`. A table dropped at `v1` leaves only a hint, which the next create overwrites. Fixed in F-MEMORY-HADOOP-NAMING-2 |
 | purge (maintenance `DeleteReachableFiles`) | Deletes the current file, the `metadata_log` entries and the hint | A table with more history than `metadata_log` keeps (`write.metadata.previous-versions-max`) can keep `v1`, so re-create fails `CatalogCommitConflicts`. Residue, HMETA-DROP |
 | `drop_namespace` | Removes the namespace and every table pointer in it; deletes no files | Re-creating the namespace and a table of the same name at the same derived location fails `CatalogCommitConflicts` on `v1` (for a table that reached `v1`). Not changed in this round; reported |
 | `register_table(T, P)` | Writes nothing; binds `T` to `P`, whose table location can be any `L` | If `P` is `vK` with `K > 1` and `L` has no `v1`, a later create deriving `L` succeeds. It writes `v1`, overwrites the registered table's hint with `1`, and shares `metadata/` with it. Its commits then fail `CatalogCommitConflicts` on reaching `vK`. That is silent overwrite of a foreign hint and a shared directory, reported and not fixed |
