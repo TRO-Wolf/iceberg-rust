@@ -21,7 +21,7 @@
 
 **Ledger id:** `F-MEMORY-HADOOP-NAMING-2-2026-09-24`
 **Branch:** `feat/memory-catalog-hadoop-drop` (cut off fork `main` = `84f92593`, the #347 merge)
-**Scope:** work order hmeta-drop, owner ruling run29 route (a), 2026-09-23; round r2 (orchestrator ruling tick 47): the chain delete is bounded by a listing
+**Scope:** work order hmeta-drop, owner ruling run29 route (a), 2026-09-23; round r2 (orchestrator ruling tick 47): the chain delete is bounded by a listing; round r8 (HMETA-DROPNS): Hadoop-mode `drop_namespace` refuses a namespace that holds tables
 **Matrix rows touched:** R167 (cell note only)
 **Model:** Claude Opus 5.5
 
@@ -56,6 +56,13 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-15 | (r6) The hint delete fails at `v3`: the error propagates; the pointer is gone, a second drop is `TableNotFound`; `v1..v3` are gone; the hint still reads `3`; a re-create succeeds at `v1` and overwrites the hint with `1` | `hadoop_drop_hint_delete_error_leaves_only_the_hint` |
 | C-16 | (r6, critic V-002) A drop whose listing never completes, cancelled by a 100 ms timeout: the pointer is gone, a second drop is `TableNotFound`; `v3` is gone; `v1`, `v2` and the hint stay | `hadoop_drop_cancelled_at_listing_leaves_chain_without_pointer` |
 | C-17 | (r7) Default (uuid) mode, a registered `v3.metadata.json` pointer with hand-placed `v1`, `v2` and hint: drop deletes only `v3`; `v1`, `v2` and the hint keep their content | `uuid_mode_drop_of_registered_vn_pointer_deletes_only_the_pointer` |
+| C-18 | (r8, HMETA-DROPNS) Hadoop mode, namespace `db` with a table: `drop_namespace` fails `NamespaceNotEmpty` with the full message `Namespace db is not empty.`; `db` still exists, the table still loads at the same location, and its `v1.metadata.json` still exists. Red before the fix: `namespace holds a table: ()` | `hadoop_mode_drop_namespace_with_table_is_refused` |
+| C-19 | (r8) Hadoop mode, empty namespace: `drop_namespace` succeeds and the namespace is gone | `hadoop_mode_drop_of_empty_namespace_succeeds` |
+| C-20 | (r8) Hadoop mode, `a.b` holds a table: `drop_namespace(a)` fails `NamespaceNotEmpty` `Namespace a is not empty.`, `drop_namespace(a.b)` fails `Namespace a.b is not empty.`; both namespaces and the table remain | `hadoop_mode_drop_namespace_refuses_a_table_in_a_descendant` |
+| C-21 | (r8) Hadoop mode, `a` with only an empty child `a.b`: `drop_namespace(a)` succeeds and both are gone | `hadoop_mode_drop_namespace_with_only_an_empty_child_succeeds` |
+| C-22 | (r8) Hadoop mode, the namespace's only table dropped first: `drop_namespace` succeeds | `hadoop_mode_drop_namespace_after_its_table_was_dropped_succeeds` |
+| C-23 | (r8) Uuid mode, namespace with a table: `drop_namespace` succeeds as before; the namespace is gone, `load_table` fails `NamespaceNotFound`, and the metadata file stays on storage | `uuid_mode_drop_namespace_with_table_still_succeeds` |
+| C-24 | (r8) Hadoop mode, missing `missing` and `db.missing`: `NamespaceNotFound` with the same message as uuid mode, `No such namespace: <NamespaceIdent debug>` | `hadoop_mode_drop_of_missing_namespace_keeps_the_not_found_error` |
 
 Mutation check (measured, restored, suite green after): with the chain and hint deletes skipped in
 `MetadataNaming::drop_metadata_chain` (renamed `drop_metadata` in r3), C-1, C-2 and C-5 go red; C-3 and C-4 stay green (C-3's only
@@ -114,6 +121,19 @@ Round r5 mutation checks (each measured on `drop_metadata` / `chain_member`, the
 | (ff, r7) `storage_path` also strips any `<x>:` prefix | none: not discriminated by a drop test (see D-2) |
 | (o, r6) `MemoryCatalog::cache_invalidate` does nothing | `pointer_cache_tests::test_fk4_1_drop_table_evicts_cache_entry`, `register_cache_tests::l2_register_insert_failure_evicts_stale_entry` |
 
+Round r8 (HMETA-DROPNS) mutation checks on `NamespaceState::ensure_droppable` / `holds_tables`, one
+per run, each reverted with `git checkout`:
+
+| Mutation | Red |
+|---|---|
+| (ns-p1) the refusal never applies (`false &&` on the guard) | C-18 (`namespace holds a table: ()`), C-20 |
+| (ns-p2) the refusal also applies in uuid mode | C-23 (`drop namespace: NamespaceNotEmpty => Namespace db is not empty.`) |
+| (ns-p3) only direct tables count, not descendants | C-20 (`Namespace a is not empty.: ()`) |
+| (ns-p4) the namespace renders with `{:?}` | C-18, C-20 (`Namespace NamespaceIdent(["db"]) is not empty.`) |
+| (ns-p5) `holds_tables` always true | C-19, C-21, C-22 |
+| (ns-p6) a child namespace counts as a table | C-21 |
+| (ns-p7) Hadoop mode answers a missing namespace with its own message | C-24 |
+
 C-6 first awaited `tokio::time::timeout` directly on `drop_table`. Under the walk mutation that
 test hung rather than failing: `LocalFsStorage::delete` never yields, so the timer never ran. The
 drop now runs on its own thread and runtime, and the test awaits a oneshot under the timeout.
@@ -161,6 +181,16 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   `io/storage/local_fs.rs`, OpenDAL `storage_impl.rs`), and only the default trait body answers
   `FeatureUnsupported`, so this arm serves out-of-tree storages only. Java `HadoopCatalog` has no
   per-version walk either (external evidence). Any other list error propagates (C-9).
+- D-5 (r8, HMETA-DROPNS, owner ruling in run29 claims line 157, date fixed at line 158): in Hadoop
+  mode `drop_namespace` refuses a namespace that holds a table, directly or in any descendant
+  namespace, with `ErrorKind::NamespaceNotEmpty` and the message `Namespace <ns> is not empty.`,
+  where `<ns>` is the levels joined with `.` (C-18, C-20; ns-p1, ns-p3, ns-p4). The check is
+  `NamespaceState::ensure_droppable`, run under the same lock as the removal. `holds_tables` walks
+  the subtree with an explicit stack, not recursion. An empty namespace, one with only empty child
+  namespaces, and one whose tables were dropped are still removed (C-19, C-21, C-22; ns-p5, ns-p6).
+  A missing namespace falls through to `remove_existing_namespace` and keeps its error (C-24,
+  ns-p7). Uuid mode is unchanged (C-23, ns-p2). The message is the one the owner measured from
+  Java `HadoopCatalog.dropNamespace` (external evidence, not pinned by a Rust test).
 - D-3: a delete error propagates as the `drop_table` error, as the current-file delete already did
   (C-13 current file, C-14 chain entry, C-15 hint). The pointer is removed first, so the table is
   dropped either way (C-13 to C-16 assert `table_exists` false and a `TableNotFound` retry).
@@ -184,5 +214,6 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   that completes before the cancel is observed cannot be told apart from one that does not.
 - Purge through maintenance `DeleteReachableFiles` is unchanged (ledger 1, section 8); this PR does
   not touch that path and does not pin it.
-- `drop_namespace` still removes pointers without deleting files (ledger 1, section 8); this PR does
-  not touch that path and does not pin it.
+- (r8) Uuid-mode `drop_namespace` still removes a namespace with its table pointers and deletes no
+  files (C-23). Hadoop mode now refuses instead (D-5). Views are not counted: a Hadoop-mode
+  namespace that holds only views is still dropped with them; this is not pinned.
