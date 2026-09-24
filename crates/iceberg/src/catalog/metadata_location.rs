@@ -125,13 +125,6 @@ impl MetadataLocation {
         })
     }
 
-    pub(crate) fn hadoop_chain(&self) -> Option<impl Iterator<Item = String> + '_> {
-        self.is_hadoop_convention().then(|| {
-            (1..=self.version)
-                .map(|version| format!("{}/v{version}.metadata.json", self.metadata_dir))
-        })
-    }
-
     pub(crate) fn hadoop_version(&self) -> Option<i32> {
         self.is_hadoop_convention().then_some(self.version)
     }

@@ -124,11 +124,7 @@ impl MetadataNaming {
                     file_io.delete(&file.location).await?;
                 }
             }
-            Err(error) if error.kind() == ErrorKind::FeatureUnsupported => {
-                for path in location.hadoop_chain().into_iter().flatten() {
-                    file_io.delete(path).await?;
-                }
-            }
+            Err(error) if error.kind() == ErrorKind::FeatureUnsupported => {}
             Err(error) => return Err(error),
         }
         file_io.delete(hint).await
