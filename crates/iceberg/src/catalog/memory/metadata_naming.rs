@@ -143,13 +143,22 @@ fn chain_member(metadata_dir: &str, version: i32, listed: &str) -> bool {
 }
 
 fn storage_path(location: &str) -> &str {
-    let path = location
-        .split_once("://")
-        .map_or(location, |(_, path)| path);
+    let path = after_leading_scheme(location).unwrap_or(location);
     let path = path.strip_prefix("file:").unwrap_or(path);
     path.strip_prefix("memory:")
         .unwrap_or(path)
         .trim_start_matches('/')
+}
+
+fn after_leading_scheme(location: &str) -> Option<&str> {
+    let (scheme, rest) = location.split_once(':')?;
+    let rest = rest.strip_prefix("//")?;
+    let mut chars = scheme.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
 }
 
 async fn write_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Result<()> {

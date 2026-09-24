@@ -107,6 +107,8 @@ async fn hadoop_drop_then_recreate_over_every_accepted_warehouse_form() {
         "memory:/warehouse",
         "/warehouse",
         "warehouse",
+        "C:/warehouse",
+        "C:\\warehouse",
     ] {
         let catalog = load_catalog_with(Arc::new(MemoryStorageFactory), form, Some("hadoop"))
             .await
