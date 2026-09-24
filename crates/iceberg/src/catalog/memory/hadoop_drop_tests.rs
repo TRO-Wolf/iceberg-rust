@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::atomic::AtomicUsize;
+
 use super::*;
 use crate::io::MemoryStorageFactory;
 
@@ -285,17 +287,45 @@ async fn hadoop_drop_leaves_near_miss_names() {
     }
 }
 
+const DELETE_BUDGET: usize = 64;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ListMode {
+    #[default]
+    PassThrough,
+    Unsupported,
+    Failing,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Counters {
+    lists: Arc<AtomicUsize>,
+    deletes: Arc<AtomicUsize>,
+}
+
+impl Counters {
+    fn lists(&self) -> usize {
+        self.lists.load(Ordering::SeqCst)
+    }
+
+    fn deletes(&self) -> usize {
+        self.deletes.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ListFailingStorage {
+struct CountingStorage {
     #[serde(skip, default = "memory_storage")]
     inner: Arc<dyn Storage>,
     #[serde(skip)]
-    unsupported: bool,
+    mode: ListMode,
+    #[serde(skip)]
+    counters: Counters,
 }
 
 #[async_trait]
 #[typetag::serde]
-impl Storage for ListFailingStorage {
+impl Storage for CountingStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
         self.inner.exists(path).await
     }
@@ -325,6 +355,12 @@ impl Storage for ListFailingStorage {
     }
 
     async fn delete(&self, path: &str) -> Result<()> {
+        if self.counters.deletes.fetch_add(1, Ordering::SeqCst) >= DELETE_BUDGET {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("delete budget exceeded: {path}"),
+            ));
+        }
         self.inner.delete(path).await
     }
 
@@ -333,10 +369,11 @@ impl Storage for ListFailingStorage {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
-        let kind = if self.unsupported {
-            ErrorKind::FeatureUnsupported
-        } else {
-            ErrorKind::Unexpected
+        self.counters.lists.fetch_add(1, Ordering::SeqCst);
+        let kind = match self.mode {
+            ListMode::PassThrough => return self.inner.list(prefix).await,
+            ListMode::Unsupported => ErrorKind::FeatureUnsupported,
+            ListMode::Failing => ErrorKind::Unexpected,
         };
         Err(Error::new(kind, format!("injected list failure: {prefix}")))
     }
@@ -351,34 +388,43 @@ impl Storage for ListFailingStorage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ListFailingStorageFactory {
+struct CountingStorageFactory {
     #[serde(skip)]
-    unsupported: bool,
+    mode: ListMode,
+    #[serde(skip)]
+    counters: Counters,
 }
 
 #[typetag::serde]
-impl StorageFactory for ListFailingStorageFactory {
+impl StorageFactory for CountingStorageFactory {
     fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        Ok(Arc::new(ListFailingStorage {
+        Ok(Arc::new(CountingStorage {
             inner: memory_storage(),
-            unsupported: self.unsupported,
+            mode: self.mode,
+            counters: self.counters.clone(),
         }))
     }
 }
 
-async fn list_failing_catalog_at_v3(unsupported: bool) -> (MemoryCatalog, String) {
-    let catalog = load_catalog_with(
-        Arc::new(ListFailingStorageFactory { unsupported }),
-        "memory:///warehouse",
-        Some("hadoop"),
-    )
-    .await
-    .expect("load");
+async fn counting_catalog(mode: ListMode) -> (MemoryCatalog, Counters) {
+    let counters = Counters::default();
+    let factory = CountingStorageFactory {
+        mode,
+        counters: counters.clone(),
+    };
+    let catalog = load_catalog_with(Arc::new(factory), "memory:///warehouse", Some("hadoop"))
+        .await
+        .expect("load");
+    (catalog, counters)
+}
+
+async fn counting_catalog_at_v3(mode: ListMode) -> (MemoryCatalog, String, Counters) {
+    let (catalog, counters) = counting_catalog(mode).await;
     let table = create(&catalog, HashMap::new()).await.expect("create");
     commit_property(&catalog, "a").await;
     commit_property(&catalog, "b").await;
     let dir = metadata_dir(&table);
-    (catalog, dir)
+    (catalog, dir, counters)
 }
 
 async fn file_exists(catalog: &MemoryCatalog, dir: &str, name: &str) -> bool {
@@ -390,9 +436,12 @@ async fn file_exists(catalog: &MemoryCatalog, dir: &str, name: &str) -> bool {
 }
 
 #[tokio::test]
-async fn hadoop_drop_walks_versions_when_listing_is_unsupported() {
-    let (catalog, dir) = list_failing_catalog_at_v3(true).await;
+async fn hadoop_drop_lists_metadata_once() {
+    let (catalog, dir, counters) = counting_catalog_at_v3(ListMode::PassThrough).await;
+    let (lists, deletes) = (counters.lists(), counters.deletes());
     catalog.drop_table(&ident()).await.expect("drop");
+    assert_eq!(counters.lists() - lists, 1);
+    assert_eq!(counters.deletes() - deletes, 4);
     for name in [
         "v1.metadata.json",
         "v2.metadata.json",
@@ -406,8 +455,42 @@ async fn hadoop_drop_walks_versions_when_listing_is_unsupported() {
 }
 
 #[tokio::test]
+async fn hadoop_drop_without_listing_removes_only_current_file_and_hint() {
+    let (catalog, dir, _) = counting_catalog_at_v3(ListMode::Unsupported).await;
+    let v1 = format!("{dir}/v1.metadata.json");
+    let v2 = format!("{dir}/v2.metadata.json");
+    let v1_bytes = read_bytes(&catalog, &v1).await;
+    let v2_bytes = read_bytes(&catalog, &v2).await;
+
+    catalog.drop_table(&ident()).await.expect("drop");
+    assert!(!file_exists(&catalog, &dir, "v3.metadata.json").await);
+    assert!(!file_exists(&catalog, &dir, "version-hint.text").await);
+    assert_eq!(read_bytes(&catalog, &v1).await, v1_bytes);
+    assert_eq!(read_bytes(&catalog, &v2).await, v2_bytes);
+    let err = create(&catalog, HashMap::new())
+        .await
+        .expect_err("re-create meets the leftover v1");
+    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+    assert_eq!(read_bytes(&catalog, &v1).await, v1_bytes);
+}
+
+#[tokio::test]
+async fn hadoop_drop_of_huge_registered_version_without_listing_is_bounded() {
+    let (catalog, counters) = counting_catalog(ListMode::Unsupported).await;
+    let pointer = "v2000000000.metadata.json";
+    register_hand_placed(&catalog, Path::new("/warehouse/registered"), pointer).await;
+    let (lists, deletes) = (counters.lists(), counters.deletes());
+
+    catalog.drop_table(&ident()).await.expect("drop");
+    assert_eq!(counters.deletes() - deletes, 2);
+    assert_eq!(counters.lists() - lists, 1);
+    assert!(!file_exists(&catalog, "/warehouse/registered/metadata", pointer).await);
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+}
+
+#[tokio::test]
 async fn hadoop_drop_propagates_other_list_errors() {
-    let (catalog, dir) = list_failing_catalog_at_v3(false).await;
+    let (catalog, dir, _) = counting_catalog_at_v3(ListMode::Failing).await;
     let err = catalog.drop_table(&ident()).await.expect_err("list fails");
     assert_eq!(err.kind(), ErrorKind::Unexpected);
     assert!(err.message().starts_with("injected list failure"), "{err}");
