@@ -892,3 +892,108 @@ async fn test_hadoop_failed_create_keeps_pre_existing_hint_file() {
     assert!(!metadata_dir.join("v1.metadata.json").exists());
     assert!(metadata_dir.join("version-hint.text").is_file());
 }
+
+fn renamed() -> TableIdent {
+    TableIdent::new(ident().namespace, "u".to_string())
+}
+
+async fn create_named(catalog: &MemoryCatalog, table: &TableIdent) -> Result<Table> {
+    catalog
+        .create_table(
+            &table.namespace,
+            TableCreation::builder()
+                .name(table.name().to_string())
+                .schema(schema())
+                .build(),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn test_hadoop_rename_refused_without_state_change() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    create(&catalog, HashMap::new()).await.expect("create");
+
+    let err = catalog
+        .rename_table(&ident(), &renamed())
+        .await
+        .expect_err("refused");
+    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    assert_eq!(err.message(), "Cannot rename Hadoop tables");
+    assert!(catalog.table_exists(&ident()).await.expect("exists"));
+    assert!(!catalog.table_exists(&renamed()).await.expect("exists"));
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    assert!(
+        location(&loaded).ends_with("/metadata/v1.metadata.json"),
+        "{}",
+        location(&loaded)
+    );
+}
+
+#[tokio::test]
+async fn test_hadoop_create_at_target_name_after_refused_rename() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    let original = create(&catalog, HashMap::new()).await.expect("create");
+    catalog
+        .rename_table(&ident(), &renamed())
+        .await
+        .expect_err("refused");
+
+    let created = create_named(&catalog, &renamed()).await.expect("create u");
+    assert!(
+        location(&created).ends_with("/ns/u/metadata/v1.metadata.json"),
+        "{}",
+        location(&created)
+    );
+    assert_eq!(hint(&created).as_deref(), Some("1"));
+
+    let loaded = catalog.load_table(&ident()).await.expect("load t");
+    assert_eq!(location(&loaded), location(&original));
+    assert_eq!(loaded.metadata().uuid(), original.metadata().uuid());
+    assert_eq!(hint(&loaded).as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn test_uuid_rename_then_create_at_old_name_succeeds() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, None).await.expect("load");
+    let original = create(&catalog, HashMap::new()).await.expect("create");
+
+    catalog
+        .rename_table(&ident(), &renamed())
+        .await
+        .expect("rename");
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+    let moved = catalog.load_table(&renamed()).await.expect("load u");
+    assert_eq!(location(&moved), location(&original));
+
+    let recreated = create_named(&catalog, &ident()).await.expect("create t");
+    assert_uuid_named(&location(&recreated), "00000");
+    assert_ne!(location(&recreated), location(&original));
+}
+
+#[tokio::test]
+async fn test_hadoop_rename_of_missing_source_is_refused_first() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    catalog
+        .create_namespace(&ident().namespace, HashMap::new())
+        .await
+        .expect("namespace");
+
+    let err = catalog
+        .rename_table(&ident(), &renamed())
+        .await
+        .expect_err("refused");
+    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+    assert_eq!(err.message(), "Cannot rename Hadoop tables");
+    assert!(!catalog.table_exists(&renamed()).await.expect("exists"));
+}
