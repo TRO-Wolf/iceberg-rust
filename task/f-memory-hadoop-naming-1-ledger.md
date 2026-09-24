@@ -52,6 +52,10 @@ and keeps `metadata/version-hint.text` at the current version.
 | C-14 | `create_table(T)` raced against `register_table(T, v3)` at T's default location, 32 rounds on fresh tempdirs: exactly one wins; a hint, if present, equals the registered pointer's version; a losing create leaves no `v1`; each side wins at least once | `test_hadoop_create_racing_register_keeps_hint_at_registered_pointer` |
 | C-15 | A create-time hint write that puts `1` at the final hint path and then fails: `create_table` returns that error, registers nothing, and leaves neither `v1` nor `version-hint.text`; with the fault off, the same create succeeds at `v1` with hint = `1` | `test_hadoop_create_removes_partial_hint_and_v1_when_hint_write_fails_after_bytes` |
 | C-16 | The same failure with a `version-hint.text` already present: the file still exists afterwards; no `v1`, nothing registered | `test_hadoop_failed_create_keeps_pre_existing_hint_file` |
+| C-17 | Hadoop `rename_table(t, u)` fails `FeatureUnsupported` with the full message `Cannot rename Hadoop tables`; `t` still exists and loads at `v1`; `u` does not exist | `test_hadoop_rename_refused_without_state_change` |
+| C-18 | After the refused rename, `create_table(u)` succeeds at `ns/u/metadata/v1.metadata.json` with hint `1`; `t` keeps its pointer, uuid and hint | `test_hadoop_create_at_target_name_after_refused_rename` |
+| C-19 | Uuid mode, the near miss: rename `t -> u` succeeds, then `create_table(t)` succeeds with a fresh `00000-<uuid>` file | `test_uuid_rename_then_create_at_old_name_succeeds` |
+| C-20 | Hadoop rename with a missing source returns the refusal first, as Java does, not `NoSuchTable`; `u` does not exist | `test_hadoop_rename_of_missing_source_is_refused_first` |
 
 Mutation check: skipping the post-commit hint write turns C-2 red; bypassing the relocation
 refusal turns C-6 red.
@@ -73,6 +77,11 @@ Round r3fix mutation checks (each restored, suite green after):
 |---|---|
 | No `v1` delete after a failed create-time hint write | C-13 (at `!v1.exists()`; with that assertion removed, the retry fails `CatalogCommitConflicts` on the leftover `v1`) |
 | Hadoop create releases the lock between the name check and the insert (r2fix shape) | C-14 (round `delay_register true, yields 0`: hint `1`, pointer `v3`) |
+
+Round r5fix mutation check (restored, suite green after): with the Hadoop refusal in `rename_table`
+ignored, C-17, C-18 and C-20 go red. C-17 and C-18 fail because the rename succeeds. C-20 fails
+on the error kind, because the missing source then reaches the pointer move and its not-found
+error.
 
 Round r4fix mutation checks (each restored, suite green after):
 
@@ -110,6 +119,13 @@ the in-memory storage.
   `TableMetadata::write_commit_metadata`. A duplicate create fails before writing; a racing
   create that passes the check fails at the exclusive write with `CatalogCommitConflicts` and
   registers nothing. Uuid mode still writes with `write_to`.
+- D-7 (round r5fix, critic r5 V-001): in Hadoop mode `rename_table` returns
+  `FeatureUnsupported` "Cannot rename Hadoop tables" before it takes the catalog lock
+  (`MetadataNaming::ensure_rename_supported`). Java `HadoopCatalog.renameTable` throws
+  `UnsupportedOperationException("Cannot rename Hadoop tables")`; the orchestrator measured this
+  from the `HadoopCatalog.class` string table in iceberg-spark-runtime-4.1_2.13-1.11.0.jar. A
+  pointer-only rename left `v1.metadata.json` at the old name's derived location, so a later
+  create at that name failed `CatalogCommitConflicts`. Uuid mode rename is unchanged.
 - D-6 (round r3fix, critic V-007): in Hadoop mode `create_table` takes the `root_namespace_state`
   lock once and holds it across the name check, the `v1` write, the hint write and the insert, so
   no `register_table` or `create_table` can take the name in between. Same trade as D-5. Uuid mode
@@ -128,7 +144,9 @@ the in-memory storage.
 - `drop_table` deletes only the current metadata file, so earlier `vK` files and the hint survive a
   non-purge drop. Since D-3 was revised, re-creating a table dropped at `v2` or later fails at
   create with `CatalogCommitConflicts` on the leftover `v1` (Java `HadoopCatalog.dropTable` removes
-  the whole table directory). Filed by the orchestrator as a question; drop is out of scope.
+  the whole table directory). Filed by the orchestrator as a question; drop is out of scope
+  (HMETA-DROP). The same holds for `drop_namespace`, which removes a namespace together with its
+  table pointers and deletes no files; see section 8.
 - No reader consults `version-hint.text`; the catalog pointer stays authoritative.
 - A failed post-commit hint write (warn-only, D-2) can leave an empty or truncated
   `version-hint.text` on local fs, because `LocalFsStorage::write` is `fs::write`. A partial write
@@ -198,3 +216,22 @@ leaves bytes a later reader or retry can see. Hadoop-mode paths in `git diff ori
 | staged create / replace | not changed by this diff | — | Staged replace writes no hint (accepted residue) |
 
 No other site inside create has the class.
+
+## 8. Class sweep (round r5fix)
+
+Class: a Hadoop-mode catalog operation that frees or re-binds a table name while files stay at a
+location a later create derives, so the later create collides or reads foreign files. A later
+Hadoop create writes `v1` exclusively (D-3), so it cannot overwrite; the question is what else it
+meets.
+
+| Operation | Leaves files where a later Hadoop create derives a location | What happens then |
+|---|---|---|
+| `create_table`, derived location | Writes `v1` and the hint at `<ns location or warehouse/ns>/<name>`; frees no name | A second create of the same location, under another name via an explicit location, fails `CatalogCommitConflicts` on `v1` |
+| `create_table`, explicit location `L` | Same files at `L` | A later create deriving `L` fails `CatalogCommitConflicts`. If `L` already holds `vK` files but no `v1` (below), the create succeeds beside them |
+| `rename_table` | Was: freed the old name, files stayed. Now refused (D-7) before any state change | Fixed |
+| `drop_table` | Deletes only the current file; earlier `vK` and the hint stay | A table dropped at `v2+` blocks re-create with `CatalogCommitConflicts` on `v1`. A table dropped at `v1` leaves only a hint, which the next create overwrites. Residue, HMETA-DROP |
+| purge (maintenance `DeleteReachableFiles`) | Deletes the current file, the `metadata_log` entries and the hint | A table with more history than `metadata_log` keeps (`write.metadata.previous-versions-max`) can keep `v1`, so re-create fails `CatalogCommitConflicts`. Residue, HMETA-DROP |
+| `drop_namespace` | Removes the namespace and every table pointer in it; deletes no files | Re-creating the namespace and a table of the same name at the same derived location fails `CatalogCommitConflicts` on `v1` (for a table that reached `v1`). Not changed in this round; reported |
+| `register_table(T, P)` | Writes nothing; binds `T` to `P`, whose table location can be any `L` | If `P` is `vK` with `K > 1` and `L` has no `v1`, a later create deriving `L` succeeds. It writes `v1`, overwrites the registered table's hint with `1`, and shares `metadata/` with it. Its commits then fail `CatalogCommitConflicts` on reaching `vK`. That is silent overwrite of a foreign hint and a shared directory, reported and not fixed |
+| staged create | Writes `00000-<uuid>` (Hadoop mode keeps uuid for staged create) | No deterministic name to collide; a later Hadoop create at the same location succeeds beside it |
+| staged replace | Writes `v(N+1)` of the same table at its own location; frees no name | None |
