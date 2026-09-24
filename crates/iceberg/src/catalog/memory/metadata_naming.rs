@@ -107,16 +107,53 @@ impl MetadataNaming {
         let Ok(location) = MetadataLocation::from_file_path(metadata_location) else {
             return Ok(());
         };
-        let (Some(chain), Some((hint, _))) =
-            (location.hadoop_chain(), location.hadoop_version_hint())
-        else {
+        let (Some(version), Some((hint, _)), Some((metadata_dir, _))) = (
+            location.hadoop_version(),
+            location.hadoop_version_hint(),
+            metadata_location.rsplit_once('/'),
+        ) else {
             return Ok(());
         };
-        for path in chain {
-            file_io.delete(path).await?;
+        match file_io.list(metadata_dir).await {
+            Ok(files) => {
+                for path in files
+                    .iter()
+                    .filter_map(|file| chain_member(metadata_dir, version, &file.location))
+                {
+                    file_io.delete(path).await?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::FeatureUnsupported => {
+                for path in location.hadoop_chain().into_iter().flatten() {
+                    file_io.delete(path).await?;
+                }
+            }
+            Err(error) => return Err(error),
         }
         file_io.delete(hint).await
     }
+}
+
+fn chain_member(metadata_dir: &str, version: i32, listed: &str) -> Option<String> {
+    let (dir, file_name) = listed.rsplit_once('/')?;
+    if storage_path(dir) != storage_path(metadata_dir) {
+        return None;
+    }
+    let listed_version = MetadataLocation::from_file_path(listed)
+        .ok()?
+        .hadoop_version()?;
+    (1..=version)
+        .contains(&listed_version)
+        .then(|| format!("{metadata_dir}/{file_name}"))
+}
+
+fn storage_path(location: &str) -> &str {
+    let path = location
+        .split_once("://")
+        .map_or(location, |(_, path)| path);
+    path.strip_prefix("file:")
+        .unwrap_or(path)
+        .trim_start_matches('/')
 }
 
 async fn write_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Result<()> {

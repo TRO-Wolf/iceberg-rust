@@ -132,6 +132,10 @@ impl MetadataLocation {
         })
     }
 
+    pub(crate) fn hadoop_version(&self) -> Option<i32> {
+        self.is_hadoop_convention().then_some(self.version)
+    }
+
     pub(crate) fn hadoop_version_siblings(&self) -> Option<[String; 2]> {
         if !self.is_hadoop_convention() {
             return None;
