@@ -63,6 +63,16 @@ Round r2 mutation checks (each measured and restored; suite green after):
 | Directory match by exact string instead of scheme-insensitive | C-7 |
 | No directory match | C-5 (`metadata/sub/v1.metadata.json` deleted) |
 
+Round r5 mutation checks (each measured on `drop_metadata` / `chain_member`, then reverted with
+`git checkout`; suite green after):
+
+| Mutation | Red |
+|---|---|
+| (a) `file_io.list(metadata_dir)` called twice | C-10, C-11 (list count 2) |
+| (b) `chain_member` without the directory match | C-5 (`metadata/sub/v1.metadata.json` deleted) |
+| (c) `(1..=version)` widened to `(1..)` | C-5 (`v4.metadata.json` deleted) |
+| (d) the `FeatureUnsupported` arm walks `1..=version` again | C-8 (`v1` deleted), C-10 (delete budget exceeded) |
+
 C-6 first awaited `tokio::time::timeout` directly on `drop_table`. Under the walk mutation that
 test hung rather than failing: `LocalFsStorage::delete` never yields, so the timer never ran. The
 drop now runs on its own thread and runtime, and the test awaits a oneshot under the timeout.
