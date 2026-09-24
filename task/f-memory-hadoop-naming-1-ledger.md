@@ -39,22 +39,22 @@ and keeps `metadata/version-hint.text` at the current version.
 | C-1 | `metadata-naming=hadoop`: create writes `v1.metadata.json` and `version-hint.text` = `1` | `test_hadoop_create_writes_v1_and_hint` |
 | C-2 | Three commits reach `v4`; `v1`..`v4` exist; hint = `4` | `test_hadoop_three_commits_reach_v4_and_hint` |
 | C-3 | `load_table` returns the current `vN` location | `test_hadoop_load_round_trips_vn_location` |
-| C-4 | No property, or `uuid`: `00000-<uuid>` then `00001-<uuid>`, no hint file | `test_default_naming_is_uuid_without_hint`, `test_explicit_uuid_naming_matches_default` |
+| C-4 | No property, or `uuid`: `00000-<uuid>` then `00001-<uuid>`; no hint file right after create or after the commit (r8fix: absence by path) | `test_default_naming_is_uuid_without_hint`, `test_explicit_uuid_naming_matches_default` |
 | C-5 | `Hadoop`, `HADOOP`, `v`, empty string refused at load with `DataInvalid` naming property and value | `test_near_miss_naming_values_refused` |
 | C-6 | Hadoop mode plus `write.metadata.path` refused with the `rebased()` message, nothing written, nothing registered | `test_hadoop_refuses_write_metadata_path_before_writing` |
-| C-7 | A registered uuid pointer stays uuid-named after a commit; no hint | `test_hadoop_register_uuid_location_stays_uuid` |
+| C-7 | A registered uuid pointer stays uuid-named after a commit; no hint right after register or after the commit (r8fix: absence by path) | `test_hadoop_register_uuid_location_stays_uuid` |
 | C-8 | A rejected duplicate create returns `TableAlreadyExists` before writing; the registered `v1` bytes, hint and schema are unchanged | `test_hadoop_duplicate_create_keeps_registered_v1_bytes` |
 | C-9 | Two racing creates of one name: exactly one `Ok`; the registered `v1` bytes are the winner's (uuid, schema); hint = `1`; run at 8 scheduling offsets | `test_hadoop_concurrent_create_registers_winner_bytes` |
 | C-10 | A `v2` hint write that finishes after a later `v3` commit cannot leave the hint behind the pointer | `test_hadoop_hint_follows_pointer_when_older_hint_write_finishes_last` |
 | C-11 | Six commits raced from one base with conflict retry all land; pointer `v7`, hint = `7` | `test_hadoop_racing_commits_from_one_base_end_with_hint_at_pointer` |
-| C-12 | Default mode, registered `v3` pointer, one commit: `v4`, no hint file | `test_default_naming_register_vn_pointer_writes_no_hint` |
+| C-12 | Default mode, registered `v3` pointer, one commit: `v4`; no hint file right after register or after the commit (r8fix: absence by path) | `test_default_naming_register_vn_pointer_writes_no_hint` |
 | C-13 | (r6fix, replaces the r3/r4 Err rule) A Hadoop create whose hint write fails (hint path obstructed by a directory) returns `Ok`, registered at an existing `v1`; a second create of the name returns `TableAlreadyExists`; with the obstruction gone, the first commit reaches `v2` with hint = `2` | `test_hadoop_create_with_failed_hint_registers_v1_and_commits_on` |
 | C-14 | `create_table(T)` raced against `register_table(T, v3)` at T's default location, 32 rounds on fresh tempdirs: exactly one wins; a hint, if present, equals the registered pointer's version; a losing create leaves no `v1`; each side wins at least once | `test_hadoop_create_racing_register_keeps_hint_at_registered_pointer` |
 | C-15 | (r6fix) A hint write that puts `1` at the final hint path and then fails: `create_table` returns `Ok`, registered at an existing `v1`; the hint reads `1`, the bytes the storage left | `test_hadoop_create_succeeds_when_hint_write_fails_after_bytes` |
 | C-16 | (r6fix) The same failure over a pre-existing `version-hint.text` (`7`): `Ok`, registered at `v1`; the hint file still exists and reads `1` | `test_hadoop_create_succeeds_over_pre_existing_hint_when_hint_write_fails` |
 | C-17 | Hadoop `rename_table(t, u)` fails `FeatureUnsupported` with the full message `Cannot rename Hadoop tables`; `t` still exists and loads at `v1`; `u` does not exist | `test_hadoop_rename_refused_without_state_change` |
 | C-18 | After the refused rename, `create_table(u)` succeeds at `ns/u/metadata/v1.metadata.json` with hint `1`; `t` keeps its pointer, uuid and hint | `test_hadoop_create_at_target_name_after_refused_rename` |
-| C-19 | Uuid mode, the near miss: rename `t -> u` succeeds, then `create_table(t)` succeeds with a fresh `00000-<uuid>` file | `test_uuid_rename_then_create_at_old_name_succeeds` |
+| C-19 | Uuid mode, the near miss: rename `t -> u` succeeds, then `create_table(t)` succeeds with a fresh `00000-<uuid>` file; no hint after either create or after a commit (r8fix) | `test_uuid_rename_then_create_at_old_name_succeeds` |
 | C-20 | Hadoop rename with a missing source returns the refusal first, as Java does, not `NoSuchTable`; `u` does not exist | `test_hadoop_rename_of_missing_source_is_refused_first` |
 
 Mutation check: skipping the post-commit hint write turns C-2 red; bypassing the relocation
@@ -89,6 +89,14 @@ Round r4fix mutation checks (each restored, suite green after):
 |---|---|
 | No hint delete after a failed create-time hint write | C-15 (superseded in r6fix: the delete path is gone, D-2) |
 | Hint deleted even when it existed before the create | C-16 (superseded in r6fix: the delete path is gone, D-2) |
+
+Round r8fix (critic r8 V-001): the test helper `hint()` used to map every read error to `None`, so
+`hint(..) == None` could pass for an unreadable hint. Absence is now asserted with
+`symlink_metadata` returning `NotFound` (`assert_absent`, `assert_no_hint`, both
+`#[track_caller]`). A positive `hint()` read panics on a read error, and the race test reads an
+optional hint with `hint_if_present`, which returns `None` only on `NotFound`. Mutation, measured
+and reverted: a uuid-mode create that also writes `version-hint.text` makes C-4 (both tests) and
+C-19 go red, at the absence check right after create.
 
 Round r6fix mutation checks (each restored, suite green after):
 
