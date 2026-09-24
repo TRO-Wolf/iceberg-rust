@@ -40,10 +40,10 @@
             metadata.snapshots = [2, 3, 1]
                 .into_iter()
                 .map(|sequence_number| {
-                    let snapshot_id = sequence_number * 100;
+                    let snapshot_id = (4 - sequence_number) * 100;
                     let snapshot = Snapshot::builder()
                         .with_snapshot_id(snapshot_id)
-                        .with_timestamp_ms(metadata.last_updated_ms + sequence_number)
+                        .with_timestamp_ms(metadata.last_updated_ms + 4 - sequence_number)
                         .with_sequence_number(sequence_number)
                         .with_schema_id(0)
                         .with_manifest_list(format!(
@@ -68,7 +68,7 @@
                 .iter()
                 .map(|snapshot| snapshot["snapshot-id"].as_i64().expect("snapshot id"))
                 .collect::<Vec<_>>();
-            assert_eq!(snapshot_ids, [100, 200, 300]);
+            assert_eq!(snapshot_ids, [300, 200, 100]);
             if format_version != FormatVersion::V1 {
                 let sequence_numbers = snapshots
                     .iter()
