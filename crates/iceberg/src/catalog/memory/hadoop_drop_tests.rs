@@ -66,12 +66,12 @@ async fn hadoop_drop_then_recreate_starts_at_v1() {
     assert_eq!(hint(&committed), "2");
 }
 
-async fn assert_drop_then_recreate_at_v1(catalog: &MemoryCatalog) {
-    let created = create(catalog, HashMap::new()).await.expect("create");
+async fn assert_drop_then_recreate_at_v1(catalog: &MemoryCatalog, form: &str) {
+    let created = create(catalog, HashMap::new()).await.expect(form);
     commit_property(catalog, "a").await;
     commit_property(catalog, "b").await;
     let dir = metadata_dir(&created);
-    catalog.drop_table(&ident()).await.expect("drop");
+    catalog.drop_table(&ident()).await.expect(form);
     for name in [
         "v1.metadata.json",
         "v2.metadata.json",
@@ -80,38 +80,56 @@ async fn assert_drop_then_recreate_at_v1(catalog: &MemoryCatalog) {
     ] {
         let path = format!("{dir}/{name}");
         assert!(
-            !catalog.file_io.exists(&path).await.expect("exists"),
-            "{path}"
+            !catalog.file_io.exists(&path).await.expect(form),
+            "{form}: {path} must not exist"
         );
     }
 
-    let recreated = create(catalog, HashMap::new()).await.expect("recreate");
-    assert_eq!(location(&recreated), format!("{dir}/v1.metadata.json"));
+    let recreated = create(catalog, HashMap::new()).await.expect(form);
+    assert_eq!(
+        location(&recreated),
+        format!("{dir}/v1.metadata.json"),
+        "{form}"
+    );
     let committed = commit_property(catalog, "c").await;
-    assert_eq!(location(&committed), format!("{dir}/v2.metadata.json"));
+    assert_eq!(
+        location(&committed),
+        format!("{dir}/v2.metadata.json"),
+        "{form}"
+    );
 }
 
 #[tokio::test]
-async fn hadoop_drop_then_recreate_with_scheme_qualified_warehouses() {
-    let warehouse = TempDir::new().expect("tempdir");
-    let file_warehouse = format!("file://{}", warehouse.path().to_str().expect("utf8"));
-    let catalog = load_catalog_with(
-        Arc::new(LocalFsStorageFactory),
-        &file_warehouse,
-        Some("hadoop"),
-    )
-    .await
-    .expect("load");
-    assert_drop_then_recreate_at_v1(&catalog).await;
-
-    let catalog = load_catalog_with(
-        Arc::new(MemoryStorageFactory),
+async fn hadoop_drop_then_recreate_over_every_accepted_warehouse_form() {
+    for form in [
         "memory:///warehouse",
-        Some("hadoop"),
-    )
-    .await
-    .expect("load");
-    assert_drop_then_recreate_at_v1(&catalog).await;
+        "memory://warehouse",
+        "memory:/warehouse",
+        "/warehouse",
+        "warehouse",
+    ] {
+        let catalog = load_catalog_with(Arc::new(MemoryStorageFactory), form, Some("hadoop"))
+            .await
+            .expect(form);
+        assert_drop_then_recreate_at_v1(&catalog, form).await;
+    }
+
+    let warehouse = TempDir::new().expect("tempdir");
+    let absolute = warehouse.path().to_str().expect("utf8");
+    let relative = absolute.trim_start_matches('/');
+    for form in [
+        absolute.to_string(),
+        format!("file://{absolute}"),
+        format!("file://{relative}"),
+        format!("file:{absolute}"),
+        format!("file:{relative}"),
+    ] {
+        let _ = std::fs::remove_dir_all(warehouse.path().join("ns"));
+        let catalog = load_catalog_with(Arc::new(LocalFsStorageFactory), &form, Some("hadoop"))
+            .await
+            .expect(&form);
+        assert_drop_then_recreate_at_v1(&catalog, &form).await;
+    }
 }
 
 #[tokio::test]
