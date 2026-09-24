@@ -519,7 +519,7 @@ async fn hadoop_drop_lists_metadata_once() {
     catalog.drop_table(&ident()).await.expect("drop");
     assert_eq!(counters.lists() - lists, 1);
     assert_eq!(counters.deletes() - deletes, 4);
-    assert_eq!(counters.list_prefixes()[prefixes..], [dir.clone()]);
+    assert_eq!(counters.list_prefixes()[prefixes..], [dir.as_str()]);
     for name in [
         "v1.metadata.json",
         "v2.metadata.json",
