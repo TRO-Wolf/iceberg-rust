@@ -67,6 +67,15 @@ impl MetadataLocation {
         })
     }
 
+    pub(crate) fn for_hadoop_metadata(metadata: &TableMetadata) -> Result<Self> {
+        Self {
+            metadata_dir: format!("{}/metadata", metadata.location()),
+            version: 1,
+            id: None,
+        }
+        .rebased(metadata)
+    }
+
     /// Creates a new metadata location for an updated metadata file.
     ///
     /// A Hadoop pointer stays Hadoop: `vN` becomes `v(N+1)`. Hive/REST gets a new uuid.
@@ -104,6 +113,15 @@ impl MetadataLocation {
             metadata_dir,
             version: self.version,
             id: self.id,
+        })
+    }
+
+    pub(crate) fn hadoop_version_hint(&self) -> Option<(String, String)> {
+        self.is_hadoop_convention().then(|| {
+            (
+                format!("{}/version-hint.text", self.metadata_dir),
+                self.version.to_string(),
+            )
         })
     }
 

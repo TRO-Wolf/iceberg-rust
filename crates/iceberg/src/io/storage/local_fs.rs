@@ -362,6 +362,15 @@ fn staged_temp_path(dest: &std::path::Path) -> Result<PathBuf> {
 }
 
 fn stage_and_publish(temp: &std::path::Path, dest: &std::path::Path, bs: &[u8]) -> Result<()> {
+    stage_and_publish_with(temp, dest, bs, |temp| fs::remove_file(temp))
+}
+
+fn stage_and_publish_with(
+    temp: &std::path::Path,
+    dest: &std::path::Path,
+    bs: &[u8],
+    remove_published_temp: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> Result<()> {
     let staged = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -392,12 +401,14 @@ fn stage_and_publish(temp: &std::path::Path, dest: &std::path::Path, bs: &[u8]) 
             ));
         }
     }
-    fs::remove_file(temp).map_err(|io_err| {
-        Error::new(
-            ErrorKind::Unexpected,
-            format!("Failed to remove temp file {}: {io_err}", temp.display()),
-        )
-    })?;
+    if let Err(io_err) = remove_published_temp(temp) {
+        tracing::warn!(
+            temp = %temp.display(),
+            dest = %dest.display(),
+            error = %io_err,
+            "published file but failed to remove its temp link"
+        );
+    }
     Ok(())
 }
 

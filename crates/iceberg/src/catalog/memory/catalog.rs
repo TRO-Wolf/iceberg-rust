@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use futures::lock::Mutex;
 use itertools::Itertools;
 
+use super::metadata_naming::MetadataNaming;
 use super::namespace_state::NamespaceState;
 use crate::arrow::ParquetFooterCache;
 use crate::catalog::table_metadata_cache::{
@@ -41,6 +42,8 @@ use crate::{
 
 /// Memory catalog warehouse location
 pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
+#[allow(missing_docs)]
+pub const MEMORY_CATALOG_METADATA_NAMING: &str = "metadata-naming";
 
 /// namespace `location` property
 const LOCATION: &str = "location";
@@ -137,6 +140,7 @@ pub struct MemoryCatalog {
     pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
     pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
+    metadata_naming: MetadataNaming,
 }
 
 impl MemoryCatalog {
@@ -152,6 +156,7 @@ impl MemoryCatalog {
         let factory = storage_factory.unwrap_or_else(|| Arc::new(MemoryStorageFactory));
 
         let name = config.name.unwrap_or_default();
+        let metadata_naming = MetadataNaming::from_props(&config.props)?;
         let properties = config.props.clone();
         let cache_scope = CacheScope::for_catalog(
             format!("memory:{}", config.warehouse),
@@ -172,6 +177,7 @@ impl MemoryCatalog {
             cache_scope,
             shared_object_cache,
             shared_footer_cache,
+            metadata_naming,
         })
     }
 
@@ -404,11 +410,19 @@ impl Catalog for MemoryCatalog {
         let metadata = TableMetadataBuilder::from_table_creation(table_creation)?
             .build()?
             .metadata;
-        let metadata_location = MetadataLocation::for_metadata(&metadata)?.to_string();
-
-        metadata.write_to(&self.file_io, &metadata_location).await?;
-
-        {
+        let first_location = self.metadata_naming.first_location(&metadata)?;
+        let metadata_location = first_location.to_string();
+        if self.metadata_naming == MetadataNaming::Hadoop {
+            let mut root_namespace_state = self.root_namespace_state.lock().await;
+            let slot = root_namespace_state.vacant_table_slot(&table_ident)?;
+            self.metadata_naming
+                .write_first_metadata(&self.file_io, &metadata, &first_location)
+                .await?;
+            let _ = slot.insert(metadata_location.clone());
+        } else {
+            self.metadata_naming
+                .write_first_metadata(&self.file_io, &metadata, &first_location)
+                .await?;
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
         }
@@ -463,6 +477,7 @@ impl Catalog for MemoryCatalog {
         src_table_ident: &TableIdent,
         dst_table_ident: &TableIdent,
     ) -> Result<()> {
+        self.metadata_naming.ensure_rename_supported()?;
         let mut root_namespace_state = self.root_namespace_state.lock().await;
 
         let mut new_root_namespace_state = root_namespace_state.clone();
@@ -589,6 +604,9 @@ impl Catalog for MemoryCatalog {
             &new_metadata_location,
         )?;
         let updated_table = root_namespace_state.commit_table_update(staged_table)?;
+        self.metadata_naming
+            .advance_version_hint(&self.file_io, &new_metadata_location)
+            .await;
         drop(root_namespace_state);
         if let Some(cache) = self.table_metadata_cache.as_ref()
             && stored_at_start != new_metadata_location
@@ -775,7 +793,7 @@ pub(crate) mod tests {
     use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{TableUpdate, UNNAMED_CATALOG};
 
-    fn temp_path() -> String {
+    pub(crate) fn temp_path() -> String {
         let temp_dir = TempDir::new().unwrap();
         temp_dir.path().to_str().unwrap().to_string()
     }
@@ -836,7 +854,7 @@ pub(crate) mod tests {
         }
     }
 
-    async fn create_table_with_namespace<C: Catalog>(catalog: &C) -> Table {
+    pub(crate) async fn create_table_with_namespace<C: Catalog>(catalog: &C) -> Table {
         let namespace_ident = NamespaceIdent::new("abc".into());
         create_namespace(catalog, &namespace_ident).await;
 
@@ -3130,255 +3148,6 @@ pub(crate) mod tests {
         assert!(
             loaded.metadata_location().is_some(),
             "concurrent load must return a table with a metadata location"
-        );
-    }
-
-    async fn new_memory_catalog_with_cache(cache: Arc<TableMetadataCache>) -> MemoryCatalog {
-        let warehouse_location = temp_path();
-        MemoryCatalogBuilder::default()
-            .with_table_metadata_cache(cache)
-            .load(
-                "memory",
-                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_location)]),
-            )
-            .await
-            .expect("build memory catalog with table metadata cache")
-    }
-
-    /// Two loads of an unchanged pointer with the opt-in cache: create seeds the cache, so both
-    /// loads are hits and body_fetches stay 0. MUTATION: skip cache lookup on load → misses > 0
-    /// / body_fetches > 0 turns this RED.
-    #[tokio::test]
-    async fn test_fk4_1_two_loads_unchanged_pointer_zero_body_fetch() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let ident = table.identifier().clone();
-        let pointer = table.metadata_location().expect("pointer").to_string();
-
-        cache.reset_stats();
-        let first = catalog.load_table(&ident).await.expect("load 1");
-        let second = catalog.load_table(&ident).await.expect("load 2");
-
-        let stats = cache.stats();
-        assert_eq!(
-            stats.body_fetches, 0,
-            "unchanged pointer after create-seed must not body-GET on load"
-        );
-        assert_eq!(stats.hits, 2, "both loads must hit the pointer cache");
-        assert_eq!(stats.misses, 0);
-        assert_eq!(
-            first.metadata_location().unwrap(),
-            pointer.as_str(),
-            "load must surface the same catalog pointer"
-        );
-        assert_eq!(second.metadata_location().unwrap(), pointer.as_str());
-        assert!(
-            std::sync::Arc::ptr_eq(&first.metadata_ref(), &second.metadata_ref()),
-            "two loads must share the cached TableMetadata Arc"
-        );
-    }
-
-    /// Default OFF: builder without `with_table_metadata_cache` never records cache traffic and
-    /// still loads correctly. (No injected Arc ⇒ no global/thread-local fallback.)
-    #[tokio::test]
-    async fn test_fk4_1_default_off_loads_without_cache() {
-        let catalog = new_memory_catalog().await;
-        let table = create_table_with_namespace(&catalog).await;
-        let loaded = catalog
-            .load_table(table.identifier())
-            .await
-            .expect("load without cache");
-        assert_eq!(
-            loaded.metadata_location(),
-            table.metadata_location(),
-            "default-OFF path must still resolve the catalog pointer"
-        );
-    }
-
-    /// Commit advances the metadata location → new key → miss on next load (fail closed: never
-    /// serve the previous pointer's Arc under a new location). Create+update seed the new key so
-    /// the load after update is a hit on the *new* pointer; a second load is also a hit.
-    #[tokio::test]
-    async fn test_fk4_1_pointer_change_on_update_is_new_key() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let ident = table.identifier().clone();
-        let base_location = table.metadata_location().unwrap().to_string();
-
-        let commit = TableCommit::builder()
-            .ident(ident.clone())
-            .requirements(vec![])
-            .updates(vec![TableUpdate::SetProperties {
-                updates: HashMap::from([("fk4".to_string(), "1".to_string())]),
-            }])
-            .base_metadata_location(Some(base_location.clone()))
-            .build();
-        let updated = catalog.update_table(commit).await.expect("update");
-        let new_location = updated.metadata_location().unwrap().to_string();
-        assert_ne!(
-            new_location, base_location,
-            "commit must publish a new metadata pointer"
-        );
-
-        cache.reset_stats();
-        let loaded = catalog.load_table(&ident).await.expect("load after update");
-        assert_eq!(loaded.metadata_location().unwrap(), new_location.as_str());
-        assert_eq!(
-            loaded
-                .metadata()
-                .properties()
-                .get("fk4")
-                .map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(cache.stats().hits, 1);
-        assert_eq!(cache.stats().body_fetches, 0);
-        assert_eq!(cache.stats().misses, 0);
-    }
-
-    #[tokio::test]
-    async fn test_fk4_1_invalidate_table_evicts_pointer_entry() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let ident = table.identifier().clone();
-        let pointer = table.metadata_location().unwrap().to_string();
-
-        cache.reset_stats();
-        let _ = catalog.load_table(&ident).await.expect("warm");
-        assert_eq!(cache.stats().hits, 1);
-
-        catalog.invalidate_table(&ident).await.expect("invalidate");
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &pointer, None)
-                .await
-                .is_none(),
-            "invalidate_table must drop the location entry"
-        );
-
-        cache.reset_stats();
-        let _ = catalog
-            .load_table(&ident)
-            .await
-            .expect("reload after invalidate");
-        assert_eq!(
-            cache.stats().body_fetches,
-            1,
-            "load after invalidate must body-GET (fail closed)"
-        );
-        assert_eq!(cache.stats().misses, 1);
-    }
-
-    /// Commit-retry note (structural pin): a retryable conflict reloads via `load_table`. With the
-    /// cache, a reload of an *unchanged* pointer (loser still on base) is a hit — zero extra body
-    /// GET. When the winner advanced the pointer, location string inequality forces a miss (correct
-    /// fail-closed). This pin covers the unchanged-pointer leg only.
-    #[tokio::test]
-    async fn test_fk4_1_reload_same_pointer_is_cache_hit_commit_retry_leg() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let ident = table.identifier().clone();
-
-        cache.reset_stats();
-        let a = catalog.load_table(&ident).await.expect("retry load 1");
-        let b = catalog.load_table(&ident).await.expect("retry load 2");
-        assert_eq!(a.metadata_location(), b.metadata_location());
-        assert_eq!(cache.stats().hits, 2);
-        assert_eq!(
-            cache.stats().body_fetches,
-            0,
-            "commit-retry refresh of unchanged pointer must not re-GET body"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fk4_1_drop_table_evicts_cache_entry() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let ident = table.identifier().clone();
-        let pointer = table.metadata_location().unwrap().to_string();
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &pointer, None)
-                .await
-                .is_some()
-        );
-
-        catalog.drop_table(&ident).await.expect("drop");
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &pointer, None)
-                .await
-                .is_none(),
-            "drop_table must invalidate the metadata-location cache entry"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fk4_1_invalidate_missing_table_does_not_clear_session() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let pointer = table.metadata_location().unwrap().to_string();
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &pointer, None)
-                .await
-                .is_some(),
-            "create must seed the cache"
-        );
-
-        let missing = TableIdent::new(NamespaceIdent::new("nope".into()), "ghost".into());
-        catalog
-            .invalidate_table(&missing)
-            .await
-            .expect("missing invalidate is Ok");
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &pointer, None)
-                .await
-                .is_some(),
-            "invalidate of missing table must not clear sibling pointer entries"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fk4_1_update_evicts_prior_pointer() {
-        let cache = Arc::new(TableMetadataCache::new());
-        let catalog = new_memory_catalog_with_cache(cache.clone()).await;
-        let table = create_table_with_namespace(&catalog).await;
-        let ident = table.identifier().clone();
-        let base = table.metadata_location().unwrap().to_string();
-
-        let commit = TableCommit::builder()
-            .ident(ident.clone())
-            .requirements(vec![])
-            .updates(vec![TableUpdate::SetProperties {
-                updates: HashMap::from([("c6".to_string(), "1".to_string())]),
-            }])
-            .base_metadata_location(Some(base.clone()))
-            .build();
-        let updated = catalog.update_table(commit).await.expect("update");
-        let new_loc = updated.metadata_location().unwrap().to_string();
-        assert_ne!(base, new_loc);
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &base, None)
-                .await
-                .is_none(),
-            "prior pointer must be evicted after successful update"
-        );
-        assert!(
-            cache
-                .lookup(&catalog.cache_scope, &new_loc, None)
-                .await
-                .is_some(),
-            "new pointer must be seeded"
         );
     }
 }
