@@ -142,6 +142,7 @@ fn hint_if_present(path: &Path) -> Option<String> {
     }
 }
 
+#[track_caller]
 fn assert_absent(path: &Path) {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -149,6 +150,7 @@ fn assert_absent(path: &Path) {
     }
 }
 
+#[track_caller]
 fn assert_no_hint(table: &Table) {
     assert_absent(Path::new(&hint_path(table)));
 }
