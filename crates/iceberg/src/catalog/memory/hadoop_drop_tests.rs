@@ -740,3 +740,141 @@ async fn hadoop_mode_drop_namespace_with_table_is_refused() {
     assert!(location(&table).ends_with("/db/t/metadata/v1.metadata.json"));
     assert!(Path::new(&location(&table)).is_file());
 }
+
+async fn catalog_with_namespaces(
+    warehouse: &TempDir,
+    naming: Option<&str>,
+    namespaces: &[&[&str]],
+) -> MemoryCatalog {
+    let catalog = load_catalog(warehouse, naming).await.expect("load");
+    for parts in namespaces {
+        catalog
+            .create_namespace(&namespace(parts), HashMap::new())
+            .await
+            .expect("namespace");
+    }
+    catalog
+}
+
+#[tokio::test]
+async fn hadoop_mode_drop_of_empty_namespace_succeeds() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = catalog_with_namespaces(&warehouse, Some("hadoop"), &[&["db"]]).await;
+    catalog
+        .drop_namespace(&namespace(&["db"]))
+        .await
+        .expect("drop");
+    assert!(
+        !catalog
+            .namespace_exists(&namespace(&["db"]))
+            .await
+            .expect("exists")
+    );
+}
+
+#[tokio::test]
+async fn hadoop_mode_drop_namespace_refuses_a_table_in_a_descendant() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = catalog_with_namespaces(&warehouse, Some("hadoop"), &[&["a"], &["a", "b"]]).await;
+    create_table_in(&catalog, &namespace(&["a", "b"])).await;
+
+    for (parts, message) in [
+        (&["a"][..], "Namespace a is not empty."),
+        (&["a", "b"][..], "Namespace a.b is not empty."),
+    ] {
+        let err = catalog
+            .drop_namespace(&namespace(parts))
+            .await
+            .expect_err(message);
+        assert_eq!(err.kind(), ErrorKind::NamespaceNotEmpty);
+        assert_eq!(err.message(), message);
+    }
+    for parts in [&["a"][..], &["a", "b"][..]] {
+        assert!(
+            catalog
+                .namespace_exists(&namespace(parts))
+                .await
+                .expect("exists")
+        );
+    }
+    assert!(
+        catalog
+            .table_exists(&TableIdent::new(namespace(&["a", "b"]), "t".to_string()))
+            .await
+            .expect("table exists")
+    );
+}
+
+#[tokio::test]
+async fn hadoop_mode_drop_namespace_with_only_an_empty_child_succeeds() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = catalog_with_namespaces(&warehouse, Some("hadoop"), &[&["a"], &["a", "b"]]).await;
+    catalog
+        .drop_namespace(&namespace(&["a"]))
+        .await
+        .expect("drop");
+    for parts in [&["a"][..], &["a", "b"][..]] {
+        assert!(
+            !catalog
+                .namespace_exists(&namespace(parts))
+                .await
+                .expect("exists")
+        );
+    }
+}
+
+#[tokio::test]
+async fn hadoop_mode_drop_namespace_after_its_table_was_dropped_succeeds() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = catalog_with_namespaces(&warehouse, Some("hadoop"), &[&["db"]]).await;
+    let db = namespace(&["db"]);
+    create_table_in(&catalog, &db).await;
+    catalog
+        .drop_table(&TableIdent::new(db.clone(), "t".to_string()))
+        .await
+        .expect("drop table");
+    catalog.drop_namespace(&db).await.expect("drop namespace");
+    assert!(!catalog.namespace_exists(&db).await.expect("exists"));
+}
+
+#[tokio::test]
+async fn uuid_mode_drop_namespace_with_table_still_succeeds() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = catalog_with_namespaces(&warehouse, None, &[&["db"]]).await;
+    let db = namespace(&["db"]);
+    let table = create_table_in(&catalog, &db).await;
+
+    catalog.drop_namespace(&db).await.expect("drop namespace");
+    assert!(!catalog.namespace_exists(&db).await.expect("exists"));
+    let err = catalog
+        .load_table(&TableIdent::new(db.clone(), "t".to_string()))
+        .await
+        .expect_err("pointer gone with the namespace");
+    assert_eq!(err.kind(), ErrorKind::NamespaceNotFound);
+    assert!(Path::new(&location(&table)).is_file());
+}
+
+#[tokio::test]
+async fn hadoop_mode_drop_of_missing_namespace_keeps_the_not_found_error() {
+    for parts in [&["missing"][..], &["db", "missing"][..]] {
+        let hadoop_warehouse = TempDir::new().expect("tempdir");
+        let hadoop = catalog_with_namespaces(&hadoop_warehouse, Some("hadoop"), &[&["db"]]).await;
+        let uuid_warehouse = TempDir::new().expect("tempdir");
+        let uuid = catalog_with_namespaces(&uuid_warehouse, None, &[&["db"]]).await;
+
+        let err = hadoop
+            .drop_namespace(&namespace(parts))
+            .await
+            .expect_err("missing namespace");
+        let expected = uuid
+            .drop_namespace(&namespace(parts))
+            .await
+            .expect_err("missing namespace");
+        assert_eq!(err.kind(), ErrorKind::NamespaceNotFound);
+        assert_eq!(err.message(), expected.message());
+        assert_eq!(
+            err.message(),
+            format!("No such namespace: {:?}", namespace(parts))
+        );
+    }
+}
