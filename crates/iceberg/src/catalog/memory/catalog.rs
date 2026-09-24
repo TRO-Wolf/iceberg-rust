@@ -358,7 +358,7 @@ impl Catalog for MemoryCatalog {
     /// Drop a namespace from the catalog.
     async fn drop_namespace(&self, namespace_ident: &NamespaceIdent) -> Result<()> {
         let mut root_namespace_state = self.root_namespace_state.lock().await;
-
+        root_namespace_state.ensure_droppable(namespace_ident, self.metadata_naming)?;
         root_namespace_state.remove_existing_namespace(namespace_ident)
     }
 
