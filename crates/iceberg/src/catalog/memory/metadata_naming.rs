@@ -146,7 +146,8 @@ fn storage_path(location: &str) -> &str {
     let path = location
         .split_once("://")
         .map_or(location, |(_, path)| path);
-    path.strip_prefix("file:")
+    let path = path.strip_prefix("file:").unwrap_or(path);
+    path.strip_prefix("memory:")
         .unwrap_or(path)
         .trim_start_matches('/')
 }
