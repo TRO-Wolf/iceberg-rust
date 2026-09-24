@@ -56,7 +56,7 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    image: quay.io/minio/mc:RELEASE.2025-05-21T01-59-54Z@sha256:09f93f534cde415d192bb6084dd0e0ddd1715fb602f8a922ad121fd2bf0f8b44
+    image: quay.io/minio/mc:RELEASE.2025-05-21T01-59-54Z
     environment:
       - AWS_ACCESS_KEY_ID=admin
       - AWS_SECRET_ACCESS_KEY=password
