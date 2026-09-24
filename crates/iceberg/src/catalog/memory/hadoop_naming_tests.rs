@@ -994,3 +994,6 @@ async fn test_hadoop_rename_of_missing_source_is_refused_first() {
     assert_eq!(err.message(), "Cannot rename Hadoop tables");
     assert!(!catalog.table_exists(&renamed()).await.expect("exists"));
 }
+
+#[path = "hadoop_drop_tests.rs"]
+mod drop_tests;

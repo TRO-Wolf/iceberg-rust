@@ -358,7 +358,7 @@ impl Catalog for MemoryCatalog {
     /// Drop a namespace from the catalog.
     async fn drop_namespace(&self, namespace_ident: &NamespaceIdent) -> Result<()> {
         let mut root_namespace_state = self.root_namespace_state.lock().await;
-
+        root_namespace_state.ensure_droppable(namespace_ident, self.metadata_naming)?;
         root_namespace_state.remove_existing_namespace(namespace_ident)
     }
 
@@ -449,19 +449,17 @@ impl Catalog for MemoryCatalog {
 
     /// Drop a table from the catalog.
     ///
-    /// Removes the pointer under a short lock, then deletes the metadata file outside it.
     /// Evicts the opt-in pointer-cache entry for the dropped location (if a cache is injected).
     async fn drop_table(&self, table_ident: &TableIdent) -> Result<()> {
-        let metadata_location = {
-            let mut root_namespace_state = self.root_namespace_state.lock().await;
-            root_namespace_state.remove_existing_table(table_ident)?
-        };
-        if let Some(cache) = self.table_metadata_cache.as_ref() {
-            cache
-                .invalidate(&self.cache_scope, &metadata_location)
-                .await;
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+        let metadata_location = root_namespace_state.remove_existing_table(table_ident)?;
+        if self.metadata_naming != MetadataNaming::Hadoop {
+            drop(root_namespace_state);
         }
-        self.file_io.delete(&metadata_location).await
+        self.cache_invalidate(&metadata_location).await;
+        self.metadata_naming
+            .drop_metadata(&self.file_io, &metadata_location)
+            .await
     }
 
     /// Check if a table exists in the catalog.
@@ -505,11 +503,7 @@ impl Catalog for MemoryCatalog {
             root_namespace_state.insert_new_table(table_ident, metadata_location.clone())
         };
         if let Err(e) = insert_result {
-            if let Some(cache) = self.table_metadata_cache.as_ref() {
-                cache
-                    .invalidate(&self.cache_scope, &metadata_location)
-                    .await;
-            }
+            self.cache_invalidate(&metadata_location).await;
             return Err(e);
         }
 

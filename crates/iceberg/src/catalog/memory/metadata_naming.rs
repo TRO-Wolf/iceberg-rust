@@ -95,6 +95,70 @@ impl MetadataNaming {
             );
         }
     }
+
+    pub(crate) async fn drop_metadata(
+        self,
+        file_io: &FileIO,
+        metadata_location: &str,
+    ) -> Result<()> {
+        file_io.delete(metadata_location).await?;
+        if self != Self::Hadoop {
+            return Ok(());
+        }
+        let Ok(location) = MetadataLocation::from_file_path(metadata_location) else {
+            return Ok(());
+        };
+        let (Some(version), Some((hint, _)), Some((metadata_dir, _))) = (
+            location.hadoop_version(),
+            location.hadoop_version_hint(),
+            metadata_location.rsplit_once('/'),
+        ) else {
+            return Ok(());
+        };
+        match file_io.list(metadata_dir).await {
+            Ok(files) => {
+                for file in files
+                    .iter()
+                    .filter(|file| chain_member(metadata_dir, version, &file.location))
+                {
+                    file_io.delete(&file.location).await?;
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::FeatureUnsupported => {}
+            Err(error) => return Err(error),
+        }
+        file_io.delete(hint).await
+    }
+}
+
+fn chain_member(metadata_dir: &str, version: i32, listed: &str) -> bool {
+    let Some((dir, _)) = listed.rsplit_once('/') else {
+        return false;
+    };
+    storage_path(dir) == storage_path(metadata_dir)
+        && MetadataLocation::from_file_path(listed)
+            .ok()
+            .and_then(|location| location.hadoop_version())
+            .is_some_and(|listed_version| (1..=version).contains(&listed_version))
+}
+
+fn storage_path(location: &str) -> &str {
+    let path = after_leading_scheme(location).unwrap_or(location);
+    let path = path.strip_prefix("file:").unwrap_or(path);
+    path.strip_prefix("memory:")
+        .unwrap_or(path)
+        .trim_start_matches('/')
+}
+
+fn after_leading_scheme(location: &str) -> Option<&str> {
+    let (scheme, rest) = location.split_once(':')?;
+    let rest = rest.strip_prefix("//")?;
+    let mut chars = scheme.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(rest)
 }
 
 async fn write_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Result<()> {

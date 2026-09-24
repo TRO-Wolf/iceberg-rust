@@ -19,6 +19,7 @@ use std::collections::{HashMap, hash_map};
 
 use itertools::Itertools;
 
+use super::metadata_naming::MetadataNaming;
 use crate::table::Table;
 use crate::{Error, ErrorKind, NamespaceIdent, Result, TableIdent};
 
@@ -231,6 +232,35 @@ impl NamespaceState {
             None => no_such_namespace_err(namespace_ident),
             Some(_) => Ok(()),
         }
+    }
+
+    pub(crate) fn ensure_droppable(
+        &self,
+        namespace_ident: &NamespaceIdent,
+        naming: MetadataNaming,
+    ) -> Result<()> {
+        match self.get_namespace(namespace_ident) {
+            Ok(namespace_state)
+                if naming == MetadataNaming::Hadoop && namespace_state.holds_tables() =>
+            {
+                Err(Error::new(
+                    ErrorKind::NamespaceNotEmpty,
+                    format!("Namespace {} is not empty.", namespace_ident.join(".")),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn holds_tables(&self) -> bool {
+        let mut pending = vec![self];
+        while let Some(namespace_state) = pending.pop() {
+            if !namespace_state.table_metadata_locations.is_empty() {
+                return true;
+            }
+            pending.extend(namespace_state.namespaces.values());
+        }
+        false
     }
 
     // Returns the properties of the given namespace or an error if doesn't exist
