@@ -49,7 +49,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/arrow/schema.rs": 3711,
     "crates/iceberg/src/arrow/value.rs": 1119,
     "crates/iceberg/src/avro/schema.rs": 2055,
-    "crates/iceberg/src/catalog/memory/catalog.rs": 3156,
+    "crates/iceberg/src/catalog/memory/catalog.rs": 3153,
     "crates/iceberg/src/catalog/mod.rs": 3074,
     "crates/iceberg/src/delete_file_index.rs": 2229,
     "crates/iceberg/src/delete_vector.rs": 1476,
