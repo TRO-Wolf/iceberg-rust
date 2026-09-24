@@ -110,3 +110,19 @@
             .collect();
         assert_eq!(serialized_snapshot_ids(&metadata), [400, 500, 100]);
     }
+
+    #[test]
+    fn sort_snapshots_breaks_equal_sequence_and_timestamp_by_id() {
+        let base = 1_700_000_000_000;
+        let ordered = [(1, 10, 500), (1, 10, 400), (2, 20, 100)]
+            .into_iter()
+            .map(|(sequence_number, offset, id)| {
+                snapshot_order_snapshot(base, sequence_number, offset, id).1
+            })
+            .collect::<Vec<_>>();
+        let sorted = super::_serde::sort_snapshots(ordered)
+            .iter()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect::<Vec<_>>();
+        assert_eq!(sorted, [400, 500, 100]);
+    }

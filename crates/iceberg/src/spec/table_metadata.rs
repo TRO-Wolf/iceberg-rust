@@ -1393,7 +1393,9 @@ pub(super) mod _serde {
         }
     }
 
-    fn sort_snapshots(snapshots: impl IntoIterator<Item = Arc<Snapshot>>) -> Vec<Arc<Snapshot>> {
+    pub(super) fn sort_snapshots(
+        snapshots: impl IntoIterator<Item = Arc<Snapshot>>,
+    ) -> Vec<Arc<Snapshot>> {
         let mut snapshots = snapshots.into_iter().collect::<Vec<_>>();
         snapshots.sort_by_key(|s| (s.sequence_number(), s.timestamp_ms(), s.snapshot_id()));
         snapshots
