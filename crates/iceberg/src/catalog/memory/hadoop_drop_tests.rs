@@ -327,6 +327,7 @@ struct Counters {
     lists: Arc<AtomicUsize>,
     deletes: Arc<AtomicUsize>,
     failing_delete: Arc<Mutex<Option<&'static str>>>,
+    list_prefixes: Arc<Mutex<Vec<String>>>,
 }
 
 impl Counters {
@@ -336,6 +337,10 @@ impl Counters {
 
     fn deletes(&self) -> usize {
         self.deletes.load(Ordering::SeqCst)
+    }
+
+    fn list_prefixes(&self) -> Vec<String> {
+        self.list_prefixes.lock().expect("lock").clone()
     }
 
     fn fail_delete_of(&self, name: &'static str) {
@@ -409,6 +414,11 @@ impl Storage for CountingStorage {
 
     async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
         self.counters.lists.fetch_add(1, Ordering::SeqCst);
+        self.counters
+            .list_prefixes
+            .lock()
+            .expect("lock")
+            .push(prefix.to_string());
         let kind = match self.mode {
             ListMode::PassThrough => return self.inner.list(prefix).await,
             ListMode::Pending => return std::future::pending().await,
@@ -479,9 +489,11 @@ async fn file_exists(catalog: &MemoryCatalog, dir: &str, name: &str) -> bool {
 async fn hadoop_drop_lists_metadata_once() {
     let (catalog, dir, counters) = counting_catalog_at_v3(ListMode::PassThrough).await;
     let (lists, deletes) = (counters.lists(), counters.deletes());
+    let prefixes = counters.list_prefixes().len();
     catalog.drop_table(&ident()).await.expect("drop");
     assert_eq!(counters.lists() - lists, 1);
     assert_eq!(counters.deletes() - deletes, 4);
+    assert_eq!(counters.list_prefixes()[prefixes..], [dir.clone()]);
     for name in [
         "v1.metadata.json",
         "v2.metadata.json",
