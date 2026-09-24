@@ -37,7 +37,7 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 
 ## 2. Clauses
 
-| Clause | Statement | Proven by (`catalog/memory/hadoop_naming_tests.rs`) |
+| Clause | Statement | Proven by (`catalog/memory/hadoop_drop_tests.rs`, module `hadoop_naming_tests::drop_tests`) |
 |---|---|---|
 | C-1 | Hadoop: create, two commits (`v3`), drop, create the same ident: `v1`, loads, hint `1`; one commit reaches `v2` with hint `2` | `hadoop_drop_then_recreate_starts_at_v1` |
 | C-2 | Hadoop drop at `v3`: no `vK.metadata.json` and no `version-hint.text` left in `metadata/`; a data file under `data/` and a manifest list in `metadata/` survive; the table and metadata directories survive | `hadoop_drop_removes_chain_and_hint_keeps_data` |
