@@ -116,11 +116,11 @@ impl MetadataNaming {
         };
         match file_io.list(metadata_dir).await {
             Ok(files) => {
-                for path in files
+                for file in files
                     .iter()
-                    .filter_map(|file| chain_member(metadata_dir, version, &file.location))
+                    .filter(|file| chain_member(metadata_dir, version, &file.location))
                 {
-                    file_io.delete(path).await?;
+                    file_io.delete(&file.location).await?;
                 }
             }
             Err(error) if error.kind() == ErrorKind::FeatureUnsupported => {
@@ -134,17 +134,15 @@ impl MetadataNaming {
     }
 }
 
-fn chain_member(metadata_dir: &str, version: i32, listed: &str) -> Option<String> {
-    let (dir, file_name) = listed.rsplit_once('/')?;
-    if storage_path(dir) != storage_path(metadata_dir) {
-        return None;
-    }
-    let listed_version = MetadataLocation::from_file_path(listed)
-        .ok()?
-        .hadoop_version()?;
-    (1..=version)
-        .contains(&listed_version)
-        .then(|| format!("{metadata_dir}/{file_name}"))
+fn chain_member(metadata_dir: &str, version: i32, listed: &str) -> bool {
+    let Some((dir, _)) = listed.rsplit_once('/') else {
+        return false;
+    };
+    storage_path(dir) == storage_path(metadata_dir)
+        && MetadataLocation::from_file_path(listed)
+            .ok()
+            .and_then(|location| location.hadoop_version())
+            .is_some_and(|listed_version| (1..=version).contains(&listed_version))
 }
 
 fn storage_path(location: &str) -> &str {
