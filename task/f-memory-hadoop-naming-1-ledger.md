@@ -50,6 +50,8 @@ and keeps `metadata/version-hint.text` at the current version.
 | C-12 | Default mode, registered `v3` pointer, one commit: `v4`, no hint file | `test_default_naming_register_vn_pointer_writes_no_hint` |
 | C-13 | Hadoop create whose hint write fails returns `Err`, registers nothing and leaves no `v1`; once the obstruction is gone the same create succeeds at `v1` with hint = `1` | `test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails` |
 | C-14 | `create_table(T)` raced against `register_table(T, v3)` at T's default location, 32 rounds on fresh tempdirs: exactly one wins; a hint, if present, equals the registered pointer's version; a losing create leaves no `v1`; each side wins at least once | `test_hadoop_create_racing_register_keeps_hint_at_registered_pointer` |
+| C-15 | A create-time hint write that puts `1` at the final hint path and then fails: `create_table` returns that error, registers nothing, and leaves neither `v1` nor `version-hint.text`; with the fault off, the same create succeeds at `v1` with hint = `1` | `test_hadoop_create_removes_partial_hint_and_v1_when_hint_write_fails_after_bytes` |
+| C-16 | The same failure with a `version-hint.text` already present: the file still exists afterwards; no `v1`, nothing registered | `test_hadoop_failed_create_keeps_pre_existing_hint_file` |
 
 Mutation check: skipping the post-commit hint write turns C-2 red; bypassing the relocation
 refusal turns C-6 red.
@@ -72,6 +74,16 @@ Round r3fix mutation checks (each restored, suite green after):
 | No `v1` delete after a failed create-time hint write | C-13 (at `!v1.exists()`; with that assertion removed, the retry fails `CatalogCommitConflicts` on the leftover `v1`) |
 | Hadoop create releases the lock between the name check and the insert (r2fix shape) | C-14 (round `delay_register true, yields 0`: hint `1`, pointer `v3`) |
 
+Round r4fix mutation checks (each restored, suite green after):
+
+| Mutation | Red |
+|---|---|
+| No hint delete after a failed create-time hint write | C-15 (at `!version-hint.text.exists()`) |
+| Hint deleted even when it existed before the create | none before C-16 was added; C-16 red after (at `version-hint.text.is_file()`) |
+
+C-15 and C-16 use `SteppingStorage` with `failing_hint` set: it writes the hint bytes through the
+local-fs storage, then returns an error.
+
 C-9, C-10 and C-14 use `SteppingStorage`, a test `MemoryStorage` wrapper that yields before every
 operation (and, for C-10, holds the `2` hint write for 200 ms), so the interleavings are
 deterministic on the current-thread test runtime. C-14 wraps the local-fs storage, C-9 and C-10
@@ -86,7 +98,12 @@ the in-memory storage.
   returns `Ok`; at create it is an error because nothing is registered yet. Round r3fix (critic
   V-008): that create error first deletes the `v1` the exclusive write just created, so a retry
   is not blocked by it; a failed delete is logged with `tracing::warn!` and the hint error is
-  still returned.
+  still returned. Round r4fix (critic r4 V-001): before the hint write, create records whether
+  `version-hint.text` exists. If the write fails, a hint that did not exist before is deleted
+  first (a failed delete only warns), then `v1`, and the original hint error returns. A hint
+  that existed before is left alone, because it belongs to a dropped table (HMETA-DROP scope). If
+  the existence check itself fails, `v1` is deleted and that error returns before any hint write.
+  FileIO has no rename, so a temp-file-and-rename publish is not available.
 - D-3 (revised in round r2fix, critic V-001): in Hadoop mode create first checks the name is free
   under the catalog lock (`NamespaceState::ensure_table_name_free`, the same errors
   `insert_new_table` returns), then writes `v1` through the exclusive
@@ -113,6 +130,18 @@ the in-memory storage.
   create with `CatalogCommitConflicts` on the leftover `v1` (Java `HadoopCatalog.dropTable` removes
   the whole table directory). Filed by the orchestrator as a question; drop is out of scope.
 - No reader consults `version-hint.text`; the catalog pointer stays authoritative.
+- A failed post-commit hint write (warn-only, D-2) can leave an empty or truncated
+  `version-hint.text` on local fs, because `LocalFsStorage::write` is `fs::write`. A partial write
+  is a prefix of the decimal digits, so it is empty or parses to a smaller version. Java
+  `HadoopTableOperations` 1.10.0 was checked locally from `javap` bytecode only, not by running
+  Java against a Rust-written table. `findVersion` catches any `Exception` from the hint read and
+  parse; an empty hint throws there, so it falls back to listing `metadata/` and taking the
+  highest `vN` whose file exists. For a smaller parsed version `K`, `refresh` loads `vK`, then
+  walks forward while `v(K+1)` exists. The Rust crate never deletes older `vK` files, so both
+  cases reach the newest contiguous version. If `vK` is missing, Java throws `ValidationException`
+  "Metadata file for version K is missing". This cannot happen for a hint MemoryCatalog wrote,
+  unless something outside the crate deletes `vK`. Other Java versions and non-local backends
+  were not checked; object-store PUTs do not leave partial objects.
 
 ## 5. Class sweep (round r2fix)
 
@@ -151,3 +180,21 @@ No other site of the class is in this PR's code. Pre-existing on `main`, not in 
 `update_table` and staged replace write `v(N+1)` exclusively before the final pointer CAS, so a
 CAS failure leaves an orphan `v(N+1)`. R167 already records this: the next commit fails loud, and
 re-registering at the newest version recovers.
+
+## 7. Class sweep (round r4fix)
+
+Class: a durable write in a Hadoop path whose failure, including a partial write of that same file,
+leaves bytes a later reader or retry can see. Hadoop-mode paths in `git diff origin/main...HEAD`:
+
+| Path | Durable write | (a) Partial bytes at the final path | (b) Undone or harmless |
+|---|---|---|---|
+| `create_table` | `v1.metadata.json` via `write_commit_metadata` | No on local fs (temp file plus `hard_link`; the temp is removed on failure), no on memory (single lock), no on OpenDAL object stores (atomic PUT) | A failed exclusive write leaves nothing of ours; a conflict leaves the other writer's file, which must not be deleted |
+| `create_table` | `version-hint.text` = `1` (the write that fails) | Yes on local fs (`fs::write` truncates, then writes) | Undone (r4fix): a hint the create newly wrote is deleted, then `v1`; a pre-existing hint is kept (HMETA-DROP) |
+| `create_table` | cleanup deletes | n/a | A failed delete only warns; the original error returns; C-15 proves the successful path |
+| `update_table` | `vN.metadata.json` via the seam | Same as `v1` | Pre-existing on `main`; not in this diff |
+| `update_table` | `version-hint.text` = `N` (`advance_version_hint`) | Yes on local fs | Not undone, by ruling (warn-only). Harmless for a Java 1.10.0 reader (residue line above) |
+| `register_table` | none | — | — |
+| `rename_table` | none | — | — |
+| staged create / replace | not changed by this diff | — | Staged replace writes no hint (accepted residue) |
+
+No other site inside create has the class.
