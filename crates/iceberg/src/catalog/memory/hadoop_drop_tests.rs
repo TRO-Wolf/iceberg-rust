@@ -898,6 +898,9 @@ async fn hadoop_drop_keeps_nested_keys_holding_a_scheme_separator() {
         format!("{dir}/x://{bare}/v1.metadata.json"),
         format!("{dir}/s3://b/v1.metadata.json"),
         format!("{dir}/x:/{bare}/v1.metadata.json"),
+        format!("{dir}/v1.metadata.json/v1.metadata.json"),
+        format!("{dir}/metadata/v1.metadata.json"),
+        format!("{dir}//v1.metadata.json"),
     ];
     for path in &nested {
         catalog
