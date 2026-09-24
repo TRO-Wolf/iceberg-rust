@@ -933,3 +933,6 @@ async fn hadoop_drop_keeps_nested_keys_holding_a_scheme_separator() {
         );
     }
 }
+
+#[path = "hadoop_drop_race_tests.rs"]
+mod race_tests;
