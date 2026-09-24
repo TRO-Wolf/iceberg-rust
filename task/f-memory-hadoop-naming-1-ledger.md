@@ -280,4 +280,3 @@ Residue, not fixed: an OpenDAL object-store conditional put (`if_not_exists`) ca
 its response after the server committed. The caller sees `Err` with the file already published,
 and a retry meets `PreconditionFailed` / `CatalogCommitConflicts`. The same applies to the
 exists-then-write fallback backends. This belongs to the storage seam, not to this PR.
-
