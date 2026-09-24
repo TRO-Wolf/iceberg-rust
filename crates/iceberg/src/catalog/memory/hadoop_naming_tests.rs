@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,8 +41,8 @@ use crate::spec::{
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
 use crate::{
-    Catalog, CatalogBuilder, ErrorKind, MetadataLocation, NamespaceIdent, Result, TableCreation,
-    TableIdent,
+    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, NamespaceIdent, Result,
+    TableCreation, TableIdent,
 };
 
 const UUID_REGEX_STR: &str = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
@@ -305,12 +306,16 @@ async fn test_hadoop_register_uuid_location_stays_uuid() {
     assert_eq!(hint(&committed), None);
 }
 
+const INJECTED_HINT_FAILURE: &str = "injected failure after writing version-hint.text";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SteppingStorage {
     #[serde(skip, default = "memory_storage")]
     inner: Arc<dyn Storage>,
     #[serde(skip)]
     delayed_hint: Option<Arc<Notify>>,
+    #[serde(skip)]
+    failing_hint: Option<Arc<AtomicBool>>,
 }
 
 fn memory_storage() -> Arc<dyn Storage> {
@@ -322,6 +327,7 @@ impl Default for SteppingStorage {
         Self {
             inner: memory_storage(),
             delayed_hint: None,
+            failing_hint: None,
         }
     }
 }
@@ -363,6 +369,13 @@ impl Storage for SteppingStorage {
         {
             entered.notify_one();
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if let Some(failing) = &self.failing_hint
+            && failing.load(Ordering::SeqCst)
+            && path.ends_with("/metadata/version-hint.text")
+        {
+            self.inner.write(path, bs).await?;
+            return Err(Error::new(ErrorKind::Unexpected, INJECTED_HINT_FAILURE));
         }
         self.inner.write(path, bs).await
     }
@@ -419,6 +432,7 @@ async fn stepping_catalog(delayed_hint: Option<Arc<Notify>>) -> Arc<MemoryCatalo
         storage: SteppingStorage {
             inner: memory_storage(),
             delayed_hint,
+            failing_hint: None,
         },
     };
     let catalog = load_catalog_with(Arc::new(factory), "memory:///warehouse", Some("hadoop"))
@@ -742,6 +756,7 @@ async fn assert_create_racing_register(delay_register: bool, yields: usize) -> b
                 .build(&StorageConfig::default())
                 .expect("local fs"),
             delayed_hint: None,
+            failing_hint: None,
         },
     };
     let catalog = load_catalog_with(
@@ -813,4 +828,49 @@ async fn assert_create_racing_register(delay_register: bool, yields: usize) -> b
         assert!(!metadata_dir.join("v1.metadata.json").exists(), "{context}");
     }
     created.is_ok()
+}
+
+async fn failing_hint_catalog(warehouse: &TempDir, failing: Arc<AtomicBool>) -> MemoryCatalog {
+    let factory = SteppingStorageFactory {
+        storage: SteppingStorage {
+            inner: LocalFsStorageFactory
+                .build(&StorageConfig::default())
+                .expect("local fs"),
+            delayed_hint: None,
+            failing_hint: Some(failing),
+        },
+    };
+    load_catalog_with(
+        Arc::new(factory),
+        warehouse.path().to_str().expect("utf8"),
+        Some("hadoop"),
+    )
+    .await
+    .expect("load")
+}
+
+#[tokio::test]
+async fn test_hadoop_create_removes_partial_hint_and_v1_when_hint_write_fails_after_bytes() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let failing = Arc::new(AtomicBool::new(true));
+    let catalog = failing_hint_catalog(&warehouse, failing.clone()).await;
+    let metadata_dir = warehouse.path().join("ns/t/metadata");
+
+    let err = create(&catalog, HashMap::new())
+        .await
+        .expect_err("hint write fails");
+    assert_eq!(err.kind(), ErrorKind::Unexpected);
+    assert_eq!(err.message(), INJECTED_HINT_FAILURE);
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+    assert!(!metadata_dir.join("v1.metadata.json").exists());
+    assert!(!metadata_dir.join("version-hint.text").exists());
+
+    failing.store(false, Ordering::SeqCst);
+    let table = create(&catalog, HashMap::new()).await.expect("retry");
+    assert!(
+        location(&table).ends_with("/metadata/v1.metadata.json"),
+        "{}",
+        location(&table)
+    );
+    assert_eq!(hint(&table).as_deref(), Some("1"));
 }
