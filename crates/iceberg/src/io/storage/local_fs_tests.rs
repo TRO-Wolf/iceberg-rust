@@ -643,3 +643,29 @@ fn test_stage_and_publish_body_failure_leaves_no_dest() {
     super::stage_and_publish(&temp, &dest, b"loser").expect_err("body write fails");
     assert!(!dest.exists(), "no partial final file remains");
 }
+
+#[test]
+fn test_stage_and_publish_temp_removal_failure_after_link_is_ok() {
+    let tmp_dir = TempDir::new().expect("tempdir");
+    let dest = tmp_dir.path().join("v1.metadata.json");
+    let temp = tmp_dir.path().join("staged.tmp");
+    super::stage_and_publish_with(&temp, &dest, b"winner", |_| {
+        Err(std::io::Error::other("injected temp removal failure"))
+    })
+    .expect("published file is a success");
+    assert_eq!(std::fs::read(&dest).expect("read dest"), b"winner");
+}
+
+#[test]
+fn test_stage_and_publish_collision_with_failing_temp_removal_still_conflicts() {
+    let tmp_dir = TempDir::new().expect("tempdir");
+    let dest = tmp_dir.path().join("v1.metadata.json");
+    let temp = tmp_dir.path().join("staged.tmp");
+    std::fs::write(&dest, b"winner").expect("seed dest");
+    let err = super::stage_and_publish_with(&temp, &dest, b"loser", |_| {
+        Err(std::io::Error::other("injected temp removal failure"))
+    })
+    .expect_err("collision fails");
+    assert_eq!(err.kind(), ErrorKind::PreconditionFailed);
+    assert_eq!(std::fs::read(&dest).expect("dest intact"), b"winner");
+}
