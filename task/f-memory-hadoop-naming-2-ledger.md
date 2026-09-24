@@ -43,7 +43,7 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-2 | Hadoop drop at `v3`: `v1`, `v2`, `v3` `.metadata.json` and `version-hint.text` are each absent by name; a data file under `data/` and a manifest list in `metadata/` survive; the table and metadata directories survive | `hadoop_drop_removes_chain_and_hint_keeps_data` |
 | C-3 | Hadoop register of an external `v5` (`v1..v4` and the hint absent by name), then drop: `Ok`, `v5` and the hint absent by name, table directory kept | `hadoop_drop_after_register_of_vn` |
 | C-4 | Uuid mode drop: the current file goes, the earlier `00000-<uuid>` file, a hand-placed `v1.metadata.json` and `version-hint.text` stay | `uuid_drop_leaves_hand_placed_hadoop_files` |
-| C-5 | (r2) Hadoop drop of a `v3` table: `v1..v3` and the hint absent by name; these survive with their content, each by name: `v0.metadata.json` (parses, K = 0), `V1.metadata.json` (parse error), `v1.metadata.json.bak` (parse error), `v4.metadata.json` (K > N), `00001-<uuid>.metadata.json` (uuid convention), `metadata/sub/v1.metadata.json` (not the pointer's directory), `other.metadata.json` (parse error). Measured parser accepts, so deleted as K <= N: `v01.metadata.json` (K = 1) and `v2.gz.metadata.json` (K = 2) | `hadoop_drop_leaves_near_miss_names` |
+| C-5 | (r2) Hadoop drop of a `v3` table: `v1..v3` and the hint absent by name; these survive with their content, each by name: `v0.metadata.json` (parses, K = 0), `V1.metadata.json` (parse error), `v1.metadata.json.bak` (parse error), `v4.metadata.json` (K > N), `00001-<uuid>.metadata.json` (uuid convention), `metadata/sub/v1.metadata.json` (not the pointer's directory), `other.metadata.json` (parse error). Measured parser accepts, so deleted as K <= N, each absent by name (r6 adds the last two): `v01.metadata.json` (K = 1), `v2.gz.metadata.json` (K = 2), `v1.metadata.json.gz` (K = 1) and `v+1.metadata.json` (K = 1) | `hadoop_drop_leaves_near_miss_names` |
 | C-6 | (r2) Register a hand-placed `v2000000000.metadata.json` with a hand-placed hint and `v1`, then drop on its own thread and runtime under a 10 s `tokio::time::timeout` on the result: it completes; the pointer, the hint and `v1` are absent | `hadoop_drop_of_registered_huge_version_completes` |
 | C-7 | (r2) The listing returns storage-native locations (`LocalFsStorage` without `file://`, `MemoryStorage` without `memory://`); a `file://` warehouse on local fs and a `memory:///warehouse` on memory storage both drop `v1..v3` and the hint and re-create at `v1`, then commit `v2` | `hadoop_drop_then_recreate_with_scheme_qualified_warehouses` |
 | C-8 | (r5, replaces the r2 walk clause) A storage whose `list` fails `FeatureUnsupported`, drop at `v3`: `v3` and the hint absent; `v1` and `v2` still hold their pre-drop bytes (read back); a re-create at the same location fails `CatalogCommitConflicts` on the leftover `v1` | `hadoop_drop_without_listing_removes_only_current_file_and_hint` |
@@ -72,6 +72,10 @@ Round r5 mutation checks (each measured on `drop_metadata` / `chain_member`, the
 | (b) `chain_member` without the directory match | C-5 (`metadata/sub/v1.metadata.json` deleted) |
 | (c) `(1..=version)` widened to `(1..)` | C-5 (`v4.metadata.json` deleted) |
 | (d) the `FeatureUnsupported` arm walks `1..=version` again | C-8 (`v1` deleted), C-10 (delete budget exceeded) |
+| (e, r6) `chain_member` also requires `!listed.ends_with(".metadata.json.gz")` | C-5 (`v1.metadata.json.gz` must not exist) |
+| (f, r6) `chain_member` also requires `!listed.ends_with(".gz.metadata.json")` | C-5 (`v2.gz.metadata.json` must not exist) |
+| (g, r6) `chain_member` rejects file names starting `v+` | C-5 (`v+1.metadata.json` must not exist) |
+| (h, r6) `chain_member` rejects file names starting `v0` | C-5 (`v01.metadata.json` must not exist); `v0.metadata.json` survives either way (K = 0) |
 
 C-6 first awaited `tokio::time::timeout` directly on `drop_table`. Under the walk mutation that
 test hung rather than failing: `LocalFsStorage::delete` never yields, so the timer never ran. The
@@ -93,7 +97,9 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   is storage-native, so local fs and memory storage list without the scheme the catalog wrote.
   Then it deletes `version-hint.text`. `FileIO::delete` treats a missing file as success. The
   parser accepts gzip siblings (`vK.gz.metadata.json`, `vK.metadata.json.gz`), leading zeros
-  (`v01`) and a leading `+` (`v+1`, measured, not pinned), so these go when K <= N. Data files,
+  (`v01`) and a leading `+` (`v+1`), so these go when K <= N; all four forms are pinned by name in C-5
+  (r6 ruling: Java `Integer.parseInt` accepts a leading `+`, and `HadoopTableOperations` reads both
+  gzip suffixes). Data files,
   manifests, other names and the directories stay. r1 walked `1..=N` without listing, so a
   registered `v2000000000` never finished.
 - D-4 (r5 ruling, replaces the r2 walk fallback): when `list` fails with `FeatureUnsupported`,
