@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
 use super::*;
@@ -300,12 +301,14 @@ enum ListMode {
     PassThrough,
     Unsupported,
     Failing,
+    Pending,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Counters {
     lists: Arc<AtomicUsize>,
     deletes: Arc<AtomicUsize>,
+    failing_delete: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl Counters {
@@ -315,6 +318,10 @@ impl Counters {
 
     fn deletes(&self) -> usize {
         self.deletes.load(Ordering::SeqCst)
+    }
+
+    fn fail_delete_of(&self, name: &'static str) {
+        *self.failing_delete.lock().expect("lock") = Some(name);
     }
 }
 
@@ -366,6 +373,15 @@ impl Storage for CountingStorage {
                 format!("delete budget exceeded: {path}"),
             ));
         }
+        let failing = *self.counters.failing_delete.lock().expect("lock");
+        if let Some(name) = failing
+            && path.ends_with(&format!("/{name}"))
+        {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("injected delete failure: {path}"),
+            ));
+        }
         self.inner.delete(path).await
     }
 
@@ -377,6 +393,7 @@ impl Storage for CountingStorage {
         self.counters.lists.fetch_add(1, Ordering::SeqCst);
         let kind = match self.mode {
             ListMode::PassThrough => return self.inner.list(prefix).await,
+            ListMode::Pending => return std::future::pending().await,
             ListMode::Unsupported => ErrorKind::FeatureUnsupported,
             ListMode::Failing => ErrorKind::Unexpected,
         };
@@ -503,5 +520,121 @@ async fn hadoop_drop_propagates_other_list_errors() {
     assert!(!file_exists(&catalog, &dir, "v3.metadata.json").await);
     for name in ["v1.metadata.json", "v2.metadata.json", "version-hint.text"] {
         assert!(file_exists(&catalog, &dir, name).await, "{name}");
+    }
+    assert_recreate_conflicts(&catalog).await;
+}
+
+async fn assert_recreate_conflicts(catalog: &MemoryCatalog) {
+    let err = create(catalog, HashMap::new())
+        .await
+        .expect_err("re-create meets the leftover v1");
+    assert_eq!(err.kind(), ErrorKind::CatalogCommitConflicts);
+}
+
+async fn drop_with_failing_delete_of(name: &'static str) -> (MemoryCatalog, String) {
+    let (catalog, dir, counters) = counting_catalog_at_v3(ListMode::PassThrough).await;
+    counters.fail_delete_of(name);
+    let err = catalog
+        .drop_table(&ident())
+        .await
+        .expect_err("delete fails");
+    assert_eq!(err.kind(), ErrorKind::Unexpected);
+    assert!(
+        err.message().starts_with("injected delete failure: ")
+            && err.message().ends_with(&format!("ns/t/metadata/{name}")),
+        "{err}"
+    );
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+    let retry = catalog.drop_table(&ident()).await.expect_err("no pointer");
+    assert_eq!(retry.kind(), ErrorKind::TableNotFound);
+    (catalog, dir)
+}
+
+#[tokio::test]
+async fn hadoop_drop_current_file_delete_error_leaves_chain_and_hint() {
+    let (catalog, dir) = drop_with_failing_delete_of("v3.metadata.json").await;
+    for name in [
+        "v1.metadata.json",
+        "v2.metadata.json",
+        "v3.metadata.json",
+        "version-hint.text",
+    ] {
+        assert!(file_exists(&catalog, &dir, name).await, "{name}");
+    }
+    assert_recreate_conflicts(&catalog).await;
+}
+
+#[tokio::test]
+async fn hadoop_drop_chain_delete_error_leaves_rest_of_chain_and_hint() {
+    let (catalog, dir) = drop_with_failing_delete_of("v1.metadata.json").await;
+    assert!(!file_exists(&catalog, &dir, "v3.metadata.json").await);
+    for name in ["v1.metadata.json", "version-hint.text"] {
+        assert!(file_exists(&catalog, &dir, name).await, "{name}");
+    }
+    assert_recreate_conflicts(&catalog).await;
+}
+
+#[tokio::test]
+async fn hadoop_drop_hint_delete_error_leaves_only_the_hint() {
+    let (catalog, dir) = drop_with_failing_delete_of("version-hint.text").await;
+    for name in ["v1.metadata.json", "v2.metadata.json", "v3.metadata.json"] {
+        assert!(!file_exists(&catalog, &dir, name).await, "{name}");
+    }
+    assert_eq!(
+        read_bytes(&catalog, &format!("{dir}/version-hint.text")).await,
+        Bytes::from("3")
+    );
+    let recreated = create(&catalog, HashMap::new()).await.expect("recreate");
+    assert_eq!(location(&recreated), format!("{dir}/v1.metadata.json"));
+    assert_eq!(
+        read_bytes(&catalog, &format!("{dir}/version-hint.text")).await,
+        Bytes::from("1")
+    );
+}
+
+#[tokio::test]
+async fn hadoop_drop_cancelled_at_listing_leaves_chain_without_pointer() {
+    let (catalog, dir, _) = counting_catalog_at_v3(ListMode::Pending).await;
+    let outcome =
+        tokio::time::timeout(Duration::from_millis(100), catalog.drop_table(&ident())).await;
+    assert!(outcome.is_err(), "drop must still wait on the listing");
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+    assert!(!file_exists(&catalog, &dir, "v3.metadata.json").await);
+    for name in ["v1.metadata.json", "v2.metadata.json", "version-hint.text"] {
+        assert!(file_exists(&catalog, &dir, name).await, "{name}");
+    }
+    let retry = catalog.drop_table(&ident()).await.expect_err("no pointer");
+    assert_eq!(retry.kind(), ErrorKind::TableNotFound);
+}
+
+#[tokio::test]
+async fn hadoop_drop_of_uuid_or_unparsable_pointer_deletes_only_the_pointer() {
+    for (table, pointer) in [
+        (
+            "uuid",
+            "00001-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
+        ),
+        ("unparsable", "custom.json"),
+    ] {
+        let warehouse = TempDir::new().expect("tempdir");
+        let catalog = load_catalog(&warehouse, Some("hadoop"))
+            .await
+            .expect("load");
+        let table_location = warehouse.path().join(table);
+        register_hand_placed(&catalog, &table_location, pointer).await;
+        let metadata_dir = table_location.join("metadata");
+        std::fs::write(metadata_dir.join("v1.metadata.json"), "v1").expect("v1");
+        std::fs::write(metadata_dir.join("version-hint.text"), "1").expect("hint");
+
+        catalog.drop_table(&ident()).await.expect("drop");
+        assert_absent(&metadata_dir.join(pointer));
+        assert_eq!(
+            std::fs::read_to_string(metadata_dir.join("v1.metadata.json")).expect(table),
+            "v1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(metadata_dir.join("version-hint.text")).expect(table),
+            "1"
+        );
     }
 }
