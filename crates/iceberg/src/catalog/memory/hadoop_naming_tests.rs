@@ -874,3 +874,21 @@ async fn test_hadoop_create_removes_partial_hint_and_v1_when_hint_write_fails_af
     );
     assert_eq!(hint(&table).as_deref(), Some("1"));
 }
+
+#[tokio::test]
+async fn test_hadoop_failed_create_keeps_pre_existing_hint_file() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let failing = Arc::new(AtomicBool::new(true));
+    let catalog = failing_hint_catalog(&warehouse, failing).await;
+    let metadata_dir = warehouse.path().join("ns/t/metadata");
+    std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+    std::fs::write(metadata_dir.join("version-hint.text"), "7").expect("hint");
+
+    let err = create(&catalog, HashMap::new())
+        .await
+        .expect_err("hint write fails");
+    assert_eq!(err.message(), INJECTED_HINT_FAILURE);
+    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
+    assert!(!metadata_dir.join("v1.metadata.json").exists());
+    assert!(metadata_dir.join("version-hint.text").is_file());
+}
