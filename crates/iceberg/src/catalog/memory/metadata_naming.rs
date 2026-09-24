@@ -64,17 +64,11 @@ impl MetadataNaming {
             Self::Uuid => metadata.write_to(file_io, &path).await,
             Self::Hadoop => {
                 metadata.write_commit_metadata(file_io, &path).await?;
-                let Err(error) = write_version_hint(file_io, location).await else {
-                    return Ok(());
-                };
-                if let Err(delete_error) = file_io.delete(&path).await {
-                    tracing::warn!(
-                        ?delete_error,
-                        metadata_location = path,
-                        "failed to remove Hadoop v1 metadata after version-hint.text write failed"
-                    );
+                let result = publish_first_version_hint(file_io, location).await;
+                if result.is_err() {
+                    remove_after_failed_create(file_io, &path).await;
                 }
-                Err(error)
+                result
             }
         }
     }
@@ -101,4 +95,26 @@ async fn write_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Re
         return Ok(());
     };
     file_io.new_output(path)?.write(version.into()).await
+}
+
+async fn publish_first_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Result<()> {
+    let Some((path, version)) = location.hadoop_version_hint() else {
+        return Ok(());
+    };
+    let existed = file_io.exists(&path).await?;
+    let result = file_io.new_output(&path)?.write(version.into()).await;
+    if result.is_err() && !existed {
+        remove_after_failed_create(file_io, &path).await;
+    }
+    result
+}
+
+async fn remove_after_failed_create(file_io: &FileIO, path: &str) {
+    if let Err(delete_error) = file_io.delete(path).await {
+        tracing::warn!(
+            ?delete_error,
+            path,
+            "failed to remove a file written by a failed Hadoop create"
+        );
+    }
 }
