@@ -247,6 +247,32 @@ async fn hadoop_drop_of_registered_huge_version_completes() {
 }
 
 #[tokio::test]
+async fn uuid_mode_drop_of_registered_vn_pointer_deletes_only_the_pointer() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, None).await.expect("load");
+    let table_location = warehouse.path().join("registered");
+    register_hand_placed(&catalog, &table_location, "v3.metadata.json").await;
+    let metadata_dir = table_location.join("metadata");
+    let kept = [
+        ("v1.metadata.json", "v1"),
+        ("v2.metadata.json", "v2"),
+        ("version-hint.text", "3"),
+    ];
+    for (name, content) in kept {
+        std::fs::write(metadata_dir.join(name), content).expect(name);
+    }
+
+    catalog.drop_table(&ident()).await.expect("drop");
+    assert_absent(&metadata_dir.join("v3.metadata.json"));
+    for (name, content) in kept {
+        assert_eq!(
+            std::fs::read_to_string(metadata_dir.join(name)).expect(name),
+            content
+        );
+    }
+}
+
+#[tokio::test]
 async fn uuid_drop_leaves_hand_placed_hadoop_files() {
     let warehouse = TempDir::new().expect("tempdir");
     let catalog = load_catalog(&warehouse, None).await.expect("load");
