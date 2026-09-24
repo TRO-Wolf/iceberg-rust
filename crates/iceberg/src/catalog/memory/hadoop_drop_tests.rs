@@ -266,7 +266,12 @@ async fn hadoop_drop_leaves_near_miss_names() {
         "sub/v1.metadata.json",
         "other.metadata.json",
     ];
-    let parsed_as_chain = ["v01.metadata.json", "v2.gz.metadata.json"];
+    let parsed_as_chain = [
+        "v01.metadata.json",
+        "v2.gz.metadata.json",
+        "v1.metadata.json.gz",
+        "v+1.metadata.json",
+    ];
     for name in near_misses.iter().chain(&parsed_as_chain) {
         std::fs::write(metadata_dir.join(name), name).expect("hand-placed file");
     }
