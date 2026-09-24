@@ -1311,7 +1311,7 @@ pub(super) mod _serde {
                     None
                 } else {
                     Some(
-                        sort_snapshots(snapshots.into_values())
+                        sort_snapshots(snapshots.into_values().collect())
                             .into_iter()
                             .map(|s| SnapshotV3::try_from(Arc::unwrap_or_clone(s)))
                             .collect::<Result<_, _>>()?,
@@ -1330,7 +1330,7 @@ pub(super) mod _serde {
                 format_version: VersionNumber::<2>,
                 shared,
                 snapshots: (!snapshots.is_empty()).then(|| {
-                    sort_snapshots(snapshots.into_values())
+                    sort_snapshots(snapshots.into_values().collect())
                         .into_iter()
                         .map(|s| SnapshotV2::from(Arc::unwrap_or_clone(s)))
                         .collect()
@@ -1393,10 +1393,7 @@ pub(super) mod _serde {
         }
     }
 
-    pub(super) fn sort_snapshots(
-        snapshots: impl IntoIterator<Item = Arc<Snapshot>>,
-    ) -> Vec<Arc<Snapshot>> {
-        let mut snapshots = snapshots.into_iter().collect::<Vec<_>>();
+    pub(super) fn sort_snapshots(mut snapshots: Vec<Arc<Snapshot>>) -> Vec<Arc<Snapshot>> {
         snapshots.sort_by_key(|s| (s.sequence_number(), s.timestamp_ms(), s.snapshot_id()));
         snapshots
     }
@@ -1448,7 +1445,7 @@ pub(super) mod _serde {
                 },
                 current_snapshot_id: v.current_snapshot_id,
                 snapshots: (!v.snapshots.is_empty()).then(|| {
-                    sort_snapshots(v.snapshots.into_values())
+                    sort_snapshots(v.snapshots.into_values().collect())
                         .into_iter()
                         .map(|x| Snapshot::clone(&x).into())
                         .collect()
