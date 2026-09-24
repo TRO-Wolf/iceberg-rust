@@ -1048,7 +1048,6 @@ pub(crate) fn create_primitive_array_repeated(
             )
         }
         (DataType::Struct(fields), None) => {
-            // Create a StructArray filled with nulls
             let null_arrays: Vec<ArrayRef> = fields
                 .iter()
                 .map(|field| create_primitive_array_repeated(field.data_type(), &None, num_rows))
@@ -1080,8 +1079,8 @@ pub(crate) fn create_primitive_array_repeated(
         (DataType::FixedSizeBinary(size), Some(PrimitiveLiteral::UInt128(value))) => {
             Arc::new(fixed_size_binary_column(*size, &value.to_be_bytes(), num_rows)?)
         }
-        (DataType::FixedSizeBinary(size), None) => {
-            new_null_array(&DataType::FixedSizeBinary(*size), num_rows)
+        (DataType::FixedSizeBinary(_) | DataType::List(_) | DataType::Map(..), None) => {
+            new_null_array(data_type, num_rows)
         }
         (DataType::Null, _) => Arc::new(arrow_array::NullArray::new(num_rows)),
         (dt, _) => {
