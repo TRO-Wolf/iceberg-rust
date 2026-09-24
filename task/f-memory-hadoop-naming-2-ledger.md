@@ -143,9 +143,10 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   chain and the hint stay (C-14). Case 4: the hint delete fails and the hint stays; the next create
   overwrites it (C-15). In cases 1 to 3, a remaining `v1` makes a re-create fail
   `CatalogCommitConflicts` (C-13, C-9, C-14).
-- (critic V-002) A `drop_table` future cancelled at an await after the pointer is removed leaves the
-  remaining chain and the hint, with no pointer for a retry (same end state as cases 1–3; C-16
-  pins the cancellation at the listing await).
+- (critic V-002, narrowed in r7) A `drop_table` future cancelled during the listing await leaves
+  the chain below the current file and the hint, with no pointer for a retry (C-16). Cancellation
+  at a per-file delete await or at the hint delete await is not pinned: in this harness a delete
+  that completes before the cancel is observed cannot be told apart from one that does not.
 - Purge through maintenance `DeleteReachableFiles` is unchanged (ledger 1, section 8); this PR does
   not touch that path and does not pin it.
 - `drop_namespace` still removes pointers without deleting files (ledger 1, section 8); this PR does
