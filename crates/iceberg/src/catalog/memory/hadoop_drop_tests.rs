@@ -331,7 +331,7 @@ async fn hadoop_drop_leaves_near_miss_names() {
     assert_all_absent(&metadata_dir, &parsed_as_chain);
     for name in near_misses {
         assert_eq!(
-            std::fs::read_to_string(metadata_dir.join(name)).expect("near miss kept"),
+            std::fs::read_to_string(metadata_dir.join(name)).expect(name),
             name
         );
     }
