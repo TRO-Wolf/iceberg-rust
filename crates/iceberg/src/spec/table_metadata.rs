@@ -1311,8 +1311,8 @@ pub(super) mod _serde {
                     None
                 } else {
                     Some(
-                        snapshots
-                            .into_values()
+                        sort_snapshots(snapshots.into_values())
+                            .into_iter()
                             .map(|s| SnapshotV3::try_from(Arc::unwrap_or_clone(s)))
                             .collect::<Result<_, _>>()?,
                     )
@@ -1329,16 +1329,12 @@ pub(super) mod _serde {
             TableMetadataV2 {
                 format_version: VersionNumber::<2>,
                 shared,
-                snapshots: if snapshots.is_empty() {
-                    None
-                } else {
-                    Some(
-                        snapshots
-                            .into_values()
-                            .map(|s| SnapshotV2::from(Arc::unwrap_or_clone(s)))
-                            .collect(),
-                    )
-                },
+                snapshots: (!snapshots.is_empty()).then(|| {
+                    sort_snapshots(snapshots.into_values())
+                        .into_iter()
+                        .map(|s| SnapshotV2::from(Arc::unwrap_or_clone(s)))
+                        .collect()
+                }),
             }
         }
     }
@@ -1397,6 +1393,12 @@ pub(super) mod _serde {
         }
     }
 
+    fn sort_snapshots(snapshots: impl IntoIterator<Item = Arc<Snapshot>>) -> Vec<Arc<Snapshot>> {
+        let mut snapshots = snapshots.into_iter().collect::<Vec<_>>();
+        snapshots.sort_by_key(|s| (s.sequence_number(), s.snapshot_id()));
+        snapshots
+    }
+
     impl TryFrom<TableMetadata> for TableMetadataV1 {
         type Error = Error;
         fn try_from(v: TableMetadata) -> Result<Self, Error> {
@@ -1443,16 +1445,12 @@ pub(super) mod _serde {
                     Some(v.properties)
                 },
                 current_snapshot_id: v.current_snapshot_id,
-                snapshots: if v.snapshots.is_empty() {
-                    None
-                } else {
-                    Some(
-                        v.snapshots
-                            .into_values()
-                            .map(|x| Snapshot::clone(&x).into())
-                            .collect(),
-                    )
-                },
+                snapshots: (!v.snapshots.is_empty()).then(|| {
+                    sort_snapshots(v.snapshots.into_values())
+                        .into_iter()
+                        .map(|x| Snapshot::clone(&x).into())
+                        .collect()
+                }),
                 snapshot_log: if v.snapshot_log.is_empty() {
                     None
                 } else {
@@ -4244,6 +4242,8 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.message().contains("Invalid table properties"));
     }
+
+    include!("table_metadata_snapshot_order_test.rs");
 
     #[test]
     fn test_v2_to_v3_upgrade_preserves_existing_snapshots_without_row_lineage() {
