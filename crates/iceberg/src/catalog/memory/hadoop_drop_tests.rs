@@ -694,3 +694,49 @@ async fn hadoop_drop_of_uuid_or_unparsable_pointer_deletes_only_the_pointer() {
         );
     }
 }
+
+fn namespace(parts: &[&str]) -> NamespaceIdent {
+    NamespaceIdent::from_strs(parts).expect("namespace")
+}
+
+async fn create_table_in(catalog: &MemoryCatalog, namespace: &NamespaceIdent) -> Table {
+    catalog
+        .create_table(
+            namespace,
+            TableCreation::builder()
+                .name("t".to_string())
+                .schema(schema())
+                .build(),
+        )
+        .await
+        .expect("create table")
+}
+
+#[tokio::test]
+async fn hadoop_mode_drop_namespace_with_table_is_refused() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    let db = namespace(&["db"]);
+    catalog
+        .create_namespace(&db, HashMap::new())
+        .await
+        .expect("namespace");
+    let table = create_table_in(&catalog, &db).await;
+
+    let err = catalog
+        .drop_namespace(&db)
+        .await
+        .expect_err("namespace holds a table");
+    assert_eq!(err.kind(), ErrorKind::NamespaceNotEmpty);
+    assert_eq!(err.message(), "Namespace db is not empty.");
+    assert!(catalog.namespace_exists(&db).await.expect("exists"));
+    let loaded = catalog
+        .load_table(&TableIdent::new(db.clone(), "t".to_string()))
+        .await
+        .expect("table still loads");
+    assert_eq!(location(&loaded), location(&table));
+    assert!(location(&table).ends_with("/db/t/metadata/v1.metadata.json"));
+    assert!(Path::new(&location(&table)).is_file());
+}
