@@ -461,7 +461,10 @@ impl Catalog for MemoryCatalog {
                 .invalidate(&self.cache_scope, &metadata_location)
                 .await;
         }
-        self.file_io.delete(&metadata_location).await
+        self.file_io.delete(&metadata_location).await?;
+        self.metadata_naming
+            .drop_metadata_chain(&self.file_io, &metadata_location)
+            .await
     }
 
     /// Check if a table exists in the catalog.

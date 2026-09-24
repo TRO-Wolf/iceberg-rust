@@ -95,6 +95,28 @@ impl MetadataNaming {
             );
         }
     }
+
+    pub(crate) async fn drop_metadata_chain(
+        self,
+        file_io: &FileIO,
+        metadata_location: &str,
+    ) -> Result<()> {
+        if self != Self::Hadoop {
+            return Ok(());
+        }
+        let Ok(location) = MetadataLocation::from_file_path(metadata_location) else {
+            return Ok(());
+        };
+        let (Some(chain), Some((hint, _))) =
+            (location.hadoop_chain(), location.hadoop_version_hint())
+        else {
+            return Ok(());
+        };
+        for path in chain {
+            file_io.delete(path).await?;
+        }
+        file_io.delete(hint).await
+    }
 }
 
 async fn write_version_hint(file_io: &FileIO, location: &MetadataLocation) -> Result<()> {
