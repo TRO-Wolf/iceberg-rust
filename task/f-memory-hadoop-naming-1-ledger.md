@@ -48,10 +48,10 @@ and keeps `metadata/version-hint.text` at the current version.
 | C-10 | A `v2` hint write that finishes after a later `v3` commit cannot leave the hint behind the pointer | `test_hadoop_hint_follows_pointer_when_older_hint_write_finishes_last` |
 | C-11 | Six commits raced from one base with conflict retry all land; pointer `v7`, hint = `7` | `test_hadoop_racing_commits_from_one_base_end_with_hint_at_pointer` |
 | C-12 | Default mode, registered `v3` pointer, one commit: `v4`, no hint file | `test_default_naming_register_vn_pointer_writes_no_hint` |
-| C-13 | Hadoop create whose hint write fails returns `Err`, registers nothing and leaves no `v1`; once the obstruction is gone the same create succeeds at `v1` with hint = `1` | `test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails` |
+| C-13 | (r6fix, replaces the r3/r4 Err rule) A Hadoop create whose hint write fails (hint path obstructed by a directory) returns `Ok`, registered at an existing `v1`; a second create of the name returns `TableAlreadyExists`; with the obstruction gone, the first commit reaches `v2` with hint = `2` | `test_hadoop_create_with_failed_hint_registers_v1_and_commits_on` |
 | C-14 | `create_table(T)` raced against `register_table(T, v3)` at T's default location, 32 rounds on fresh tempdirs: exactly one wins; a hint, if present, equals the registered pointer's version; a losing create leaves no `v1`; each side wins at least once | `test_hadoop_create_racing_register_keeps_hint_at_registered_pointer` |
-| C-15 | A create-time hint write that puts `1` at the final hint path and then fails: `create_table` returns that error, registers nothing, and leaves neither `v1` nor `version-hint.text`; with the fault off, the same create succeeds at `v1` with hint = `1` | `test_hadoop_create_removes_partial_hint_and_v1_when_hint_write_fails_after_bytes` |
-| C-16 | The same failure with a `version-hint.text` already present: the file still exists afterwards; no `v1`, nothing registered | `test_hadoop_failed_create_keeps_pre_existing_hint_file` |
+| C-15 | (r6fix) A hint write that puts `1` at the final hint path and then fails: `create_table` returns `Ok`, registered at an existing `v1`; the hint reads `1`, the bytes the storage left | `test_hadoop_create_succeeds_when_hint_write_fails_after_bytes` |
+| C-16 | (r6fix) The same failure over a pre-existing `version-hint.text` (`7`): `Ok`, registered at `v1`; the hint file still exists and reads `1` | `test_hadoop_create_succeeds_over_pre_existing_hint_when_hint_write_fails` |
 | C-17 | Hadoop `rename_table(t, u)` fails `FeatureUnsupported` with the full message `Cannot rename Hadoop tables`; `t` still exists and loads at `v1`; `u` does not exist | `test_hadoop_rename_refused_without_state_change` |
 | C-18 | After the refused rename, `create_table(u)` succeeds at `ns/u/metadata/v1.metadata.json` with hint `1`; `t` keeps its pointer, uuid and hint | `test_hadoop_create_at_target_name_after_refused_rename` |
 | C-19 | Uuid mode, the near miss: rename `t -> u` succeeds, then `create_table(t)` succeeds with a fresh `00000-<uuid>` file | `test_uuid_rename_then_create_at_old_name_succeeds` |
@@ -69,13 +69,13 @@ Round r2fix mutation checks (each restored, suite green after):
 | Registered-name check kept, `v1` written with `write_to` | C-9 |
 | Hint written after `drop(root_namespace_state)` in `update_table` | C-10 |
 | `self != Self::Hadoop` guard removed from `advance_version_hint` | C-12 |
-| Create ignores a failed hint write | C-13 |
+| Create ignores a failed hint write | C-13 (superseded in r6fix: ignoring the failure is now the rule, D-2) |
 
 Round r3fix mutation checks (each restored, suite green after):
 
 | Mutation | Red |
 |---|---|
-| No `v1` delete after a failed create-time hint write | C-13 (at `!v1.exists()`; with that assertion removed, the retry fails `CatalogCommitConflicts` on the leftover `v1`) |
+| No `v1` delete after a failed create-time hint write | C-13 (superseded in r6fix: the delete path is gone, D-2) |
 | Hadoop create releases the lock between the name check and the insert (r2fix shape) | C-14 (round `delay_register true, yields 0`: hint `1`, pointer `v3`) |
 
 Round r5fix mutation check (restored, suite green after): with the Hadoop refusal in `rename_table`
@@ -87,8 +87,15 @@ Round r4fix mutation checks (each restored, suite green after):
 
 | Mutation | Red |
 |---|---|
-| No hint delete after a failed create-time hint write | C-15 (at `!version-hint.text.exists()`) |
-| Hint deleted even when it existed before the create | none before C-16 was added; C-16 red after (at `version-hint.text.is_file()`) |
+| No hint delete after a failed create-time hint write | C-15 (superseded in r6fix: the delete path is gone, D-2) |
+| Hint deleted even when it existed before the create | C-16 (superseded in r6fix: the delete path is gone, D-2) |
+
+Round r6fix mutation checks (each restored, suite green after):
+
+| Mutation | Red |
+|---|---|
+| (M-a) Create returns the hint write's error again | C-13, C-15, C-16 |
+| (M-b) `stage_and_publish` returns `Err` when the post-link temp removal fails | `test_stage_and_publish_temp_removal_failure_after_link_is_ok` |
 
 C-15 and C-16 use `SteppingStorage` with `failing_hint` set: it writes the hint bytes through the
 local-fs storage, then returns an error.
@@ -103,19 +110,32 @@ the in-memory storage.
 - D-1: the hint is written only when the catalog is in Hadoop mode AND the new location is
   `vN`-named. A default-mode catalog that registered a `vN` pointer (the F-ICE-HADOOP-VN-1 pins)
   keeps writing no hint, so default mode stays byte-for-byte unchanged.
-- D-2: a hint write failure after the pointer swap is logged with `tracing::warn!` and the commit
-  returns `Ok`; at create it is an error because nothing is registered yet. Round r3fix (critic
-  V-008): that create error first deletes the `v1` the exclusive write just created, so a retry
-  is not blocked by it; a failed delete is logged with `tracing::warn!` and the hint error is
-  still returned. Round r4fix (critic r4 V-001): before the hint write, create records whether
-  `version-hint.text` exists. If the write fails, a hint that did not exist before is deleted
-  first (a failed delete only warns), then `v1`, and the original hint error returns. A hint
-  that existed before is left alone, because it belongs to a dropped table (HMETA-DROP scope). If
-  the existence check itself fails, `v1` is deleted and that error returns before any hint write.
-  FileIO has no rename, so a temp-file-and-rename publish is not available.
+- D-2 (revised in round r6fix; replaces the r3fix and r4fix cleanup rules): in Hadoop mode a hint
+  write failure is warn-only at create, exactly as after a commit. Once `v1` is published, the
+  create registers the table at `v1` and returns `Ok`. `advance_version_hint` is the single hint
+  writer for both and logs the path and error with `tracing::warn!`. There is no delete of `v1`
+  or of the hint on any create path. Java evidence, measured by the orchestrator with javap of
+  `org/apache/iceberg/hadoop/HadoopTableOperations.class` in iceberg-spark-runtime-4.1_2.13-1.11.0.jar
+  (`/tmp/xo-xo-opus64/wo/jprobe/hto.javap`). Lines 270-300: `doCommit`, used for create and
+  commit, calls `renameToFinal`, then `writeVersionHint(nextVersion)`. Lines 465-506:
+  `writeVersionHint` writes a temp file, deletes the old hint, renames, catches `IOException`
+  and logs "Failed to update version hint". A Java Hadoop create whose hint write fails
+  succeeds. The r3fix/r4fix rule (fail the create, delete `v1` and a newly written hint) could
+  return `Err` with `v1` left behind whenever its best-effort delete failed, and the retry then
+  hit `CatalogCommitConflicts` (critic r6 V-002).
+- D-8 (round r6fix, critic r6 V-001): `LocalFsStorage` exclusive publish (`stage_and_publish`)
+  returns `Ok` once `hard_link` has placed the destination. A failure to remove the temp link
+  afterwards is logged with `tracing::warn!` (temp, destination, error) and is not an error. The
+  staging-failure and link-failure branches keep their errors (`AlreadyExists` stays
+  `PreconditionFailed`). The post-link removal goes through the private
+  `stage_and_publish_with(.., remove_published_temp)` so a test can inject the failure.
+- D-9 (round r6fix): the Hadoop create holds the name as a `hash_map::VacantEntry`
+  (`NamespaceState::vacant_table_slot`, which replaces `ensure_table_name_free` and returns the
+  same errors as `insert_new_table`) across the `v1` write, under the catalog lock. The
+  registration after a published `v1` is `VacantEntry::insert`, which cannot fail.
 - D-3 (revised in round r2fix, critic V-001): in Hadoop mode create first checks the name is free
   under the catalog lock (`NamespaceState::ensure_table_name_free`, the same errors
-  `insert_new_table` returns), then writes `v1` through the exclusive
+  `insert_new_table` returns; `vacant_table_slot` since r6fix, D-9), then writes `v1` through the exclusive
   `TableMetadata::write_commit_metadata`. A duplicate create fails before writing; a racing
   create that passes the check fails at the exclusive write with `CatalogCommitConflicts` and
   registers nothing. Uuid mode still writes with `write_to`.
@@ -148,7 +168,7 @@ the in-memory storage.
   (HMETA-DROP). The same holds for `drop_namespace`, which removes a namespace together with its
   table pointers and deletes no files; see section 8.
 - No reader consults `version-hint.text`; the catalog pointer stays authoritative.
-- A failed post-commit hint write (warn-only, D-2) can leave an empty or truncated
+- A failed create-time or post-commit hint write (warn-only, D-2) can leave an empty or truncated
   `version-hint.text` on local fs, because `LocalFsStorage::write` is `fs::write`. A partial write
   is a prefix of the decimal digits, so it is empty or parses to a smaller version. Java
   `HadoopTableOperations` 1.10.0 was checked locally from `javap` bytecode only, not by running
@@ -185,8 +205,8 @@ across a lock release, or a fallible step after a durable write with no undo. Ha
 
 | Path | Durable write | Later fallible step | (a) Under the pointer lock | (b) Undone or harmless on a later failure |
 |---|---|---|---|---|
-| `create_table` | `v1.metadata.json` (exclusive) | hint write | Yes (D-6) | Undone: `v1` deleted (D-2) |
-| `create_table` | `version-hint.text` = `1` | `insert_new_table` | Yes (D-6) | Harmless: the insert checks what `ensure_table_name_free` already checked under the same held lock, so it cannot fail |
+| `create_table` | `v1.metadata.json` (exclusive) | hint write | Yes (D-6) | Superseded in r6fix: the hint failure only warns and the create registers `v1` (D-2) |
+| `create_table` | `version-hint.text` = `1` | `insert_new_table` | Yes (D-6) | Harmless: the insert cannot fail (since r6fix it is `VacantEntry::insert`, D-9) |
 | `create_table` | none after insert | `table_builder().build()` | n/a | Harmless: every required field is set; code unchanged from `main` |
 | `update_table` | `version-hint.text` = `N` | none | Yes (D-5) | Last step; failure only warns (V-002 ruling) |
 | `register_table` | none | — | Insert under lock | Nothing to undo |
@@ -207,8 +227,8 @@ leaves bytes a later reader or retry can see. Hadoop-mode paths in `git diff ori
 | Path | Durable write | (a) Partial bytes at the final path | (b) Undone or harmless |
 |---|---|---|---|
 | `create_table` | `v1.metadata.json` via `write_commit_metadata` | No on local fs (temp file plus `hard_link`; the temp is removed on failure), no on memory (single lock), no on OpenDAL object stores (atomic PUT) | A failed exclusive write leaves nothing of ours; a conflict leaves the other writer's file, which must not be deleted |
-| `create_table` | `version-hint.text` = `1` (the write that fails) | Yes on local fs (`fs::write` truncates, then writes) | Undone (r4fix): a hint the create newly wrote is deleted, then `v1`; a pre-existing hint is kept (HMETA-DROP) |
-| `create_table` | cleanup deletes | n/a | A failed delete only warns; the original error returns; C-15 proves the successful path |
+| `create_table` | `version-hint.text` = `1` (the write that fails) | Yes on local fs (`fs::write` truncates, then writes) | Superseded in r6fix: not undone; the create succeeds at `v1` and the hint is warn-only, as after a commit (D-2); a partial hint is read as in the residue line above |
+| `create_table` | cleanup deletes | n/a | Removed in r6fix |
 | `update_table` | `vN.metadata.json` via the seam | Same as `v1` | Pre-existing on `main`; not in this diff |
 | `update_table` | `version-hint.text` = `N` (`advance_version_hint`) | Yes on local fs | Not undone, by ruling (warn-only). Harmless for a Java 1.10.0 reader (residue line above) |
 | `register_table` | none | — | — |
@@ -235,3 +255,29 @@ meets.
 | `register_table(T, P)` | Writes nothing; binds `T` to `P`, whose table location can be any `L` | If `P` is `vK` with `K > 1` and `L` has no `v1`, a later create deriving `L` succeeds. It writes `v1`, overwrites the registered table's hint with `1`, and shares `metadata/` with it. Its commits then fail `CatalogCommitConflicts` on reaching `vK`. That is silent overwrite of a foreign hint and a shared directory, reported and not fixed |
 | staged create | Writes `00000-<uuid>` (Hadoop mode keeps uuid for staged create) | No deterministic name to collide; a later Hadoop create at the same location succeeds beside it |
 | staged replace | Writes `v(N+1)` of the same table at its own location; frees no name | None |
+
+## 9. Class sweep (round r6fix)
+
+Class: an operation reports failure after its durable effect is already published, or undoes it
+best-effort, so the caller's retry collides with the leftover.
+
+| Path and step | Durable after | Can a later step still return `Err` | A retry then meets |
+|---|---|---|---|
+| Hadoop `create_table` (derived or explicit location): lock, `vacant_table_slot` | nothing | Yes, `TableAlreadyExists` / `ViewAlreadyExists` / `NoSuchNamespace`, before any write | nothing of ours |
+| ... `write_commit_metadata(v1)` | `v1` published | The write itself fails only before publication (local fs: staging or link error; `AlreadyExists` is someone else's `v1`); a post-link temp-removal failure is `Ok` (D-8) | nothing of ours, or the other writer's `v1` (`CatalogCommitConflicts`, correct) |
+| ... hint write | `v1` and maybe hint bytes | No, warn-only (D-2) | `TableAlreadyExists`: the name is registered |
+| ... `VacantEntry::insert`, `cache_put`, `table_builder().build()` | pointer registered | No: `insert` and `cache_put` cannot fail; `build` fails only on a missing `file_io`, `metadata` or `identifier`, and all three are set | — |
+| Hadoop `update_table` commit: `write_commit_metadata(vN)` outside the lock, then the lock, a CAS check, `commit_table_update`, then the hint | `vN` published before the final CAS | Yes: a CAS conflict after `vN` is published returns `CatalogCommitConflicts` and leaves an orphan `vN` | The next commit from the new base targets the same `vN`, finds it and fails loud; re-registering at the newest version recovers. Pre-existing on `main` (R167); residue, not in this diff |
+| `register_table` | nothing written; pointer insert under the lock | The insert can fail (`TableAlreadyExists`); nothing durable to leak | — |
+| staged create (`begin_create`) | `00000-<uuid>` written before the pointer publish | Yes, the publish can fail | A fresh uuid name, so no collision on retry; the orphan file is harmless. Not in this diff |
+| staged replace (`begin_replace`, `publish_replace_table`) | `v(N+1)` published before the pointer CAS | Yes, a CAS conflict leaves an orphan `v(N+1)` | As for `update_table`. Pre-existing on `main`; residue |
+| `stage_and_publish`: staging (`create_new` plus `write_all`) | nothing at `dest` | `Err` (Unexpected); the temp is removed best-effort | no `dest`; a stray temp at worst, never read |
+| `stage_and_publish`: `hard_link` `AlreadyExists` | nothing of ours at `dest` | `Err` (`PreconditionFailed`) | the other writer's `dest` (correct) |
+| `stage_and_publish`: `hard_link` other error | nothing at `dest` | `Err` (Unexpected) | no `dest` |
+| `stage_and_publish`: post-link temp removal | `dest` published | No since r6fix (D-8) | — |
+
+Residue, not fixed: an OpenDAL object-store conditional put (`if_not_exists`) can time out or lose
+its response after the server committed. The caller sees `Err` with the file already published,
+and a retry meets `PreconditionFailed` / `CatalogCommitConflicts`. The same applies to the
+exists-then-write fallback backends. This belongs to the storage seam, not to this PR.
+
