@@ -126,8 +126,45 @@ fn metadata_dir(table: &Table) -> String {
     format!("{}/metadata", table.metadata().location())
 }
 
-fn hint(table: &Table) -> Option<String> {
-    std::fs::read_to_string(format!("{}/version-hint.text", metadata_dir(table))).ok()
+fn hint_path(table: &Table) -> String {
+    format!("{}/version-hint.text", metadata_dir(table))
+}
+
+fn hint(table: &Table) -> String {
+    std::fs::read_to_string(hint_path(table)).expect("read version-hint.text")
+}
+
+fn hint_if_present(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(hint) => Some(hint),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("{}: {error}", path.display()),
+    }
+}
+
+fn assert_absent(path: &Path) {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        other => panic!("{} must not exist: {other:?}", path.display()),
+    }
+}
+
+fn assert_no_hint(table: &Table) {
+    assert_absent(Path::new(&hint_path(table)));
+}
+
+fn metadata_at(table_location: &Path, schema: Schema) -> TableMetadata {
+    TableMetadataBuilder::from_table_creation(
+        TableCreation::builder()
+            .name("t".to_string())
+            .location(table_location.to_str().expect("utf8").to_string())
+            .schema(schema)
+            .build(),
+    )
+    .expect("builder")
+    .build()
+    .expect("metadata")
+    .metadata
 }
 
 fn assert_uuid_named(location: &str, version: &str) {
@@ -152,7 +189,7 @@ async fn test_hadoop_create_writes_v1_and_hint() {
         "{location}"
     );
     assert!(Path::new(&location).is_file());
-    assert_eq!(hint(&table).as_deref(), Some("1"));
+    assert_eq!(hint(&table), "1");
 }
 
 #[tokio::test]
@@ -176,7 +213,7 @@ async fn test_hadoop_three_commits_reach_v4_and_hint() {
         let file = format!("{}/v{version}.metadata.json", metadata_dir(&last));
         assert!(Path::new(&file).is_file(), "{file}");
     }
-    assert_eq!(hint(&last).as_deref(), Some("4"));
+    assert_eq!(hint(&last), "4");
 }
 
 #[tokio::test]
@@ -205,10 +242,11 @@ async fn assert_uuid_mode(naming: Option<&str>) {
     let catalog = load_catalog(&warehouse, naming).await.expect("load");
     let table = create(&catalog, HashMap::new()).await.expect("create");
     assert_uuid_named(&location(&table), "00000");
+    assert_no_hint(&table);
 
     let committed = commit_property(&catalog, "a").await;
     assert_uuid_named(&location(&committed), "00001");
-    assert_eq!(hint(&committed), None);
+    assert_no_hint(&committed);
 }
 
 #[tokio::test]
@@ -261,8 +299,8 @@ async fn test_hadoop_refuses_write_metadata_path_before_writing() {
         "Hadoop path-based tables cannot relocate metadata"
     );
     assert!(!catalog.table_exists(&ident()).await.expect("exists"));
-    assert!(!warehouse.path().join("ns/t/metadata").exists());
-    assert!(!relocated.exists());
+    assert_absent(&warehouse.path().join("ns/t/metadata"));
+    assert_absent(&relocated);
 }
 
 #[tokio::test]
@@ -276,17 +314,7 @@ async fn test_hadoop_register_uuid_location_stays_uuid() {
         .await
         .expect("namespace");
     let table_location = warehouse.path().join("registered");
-    let metadata = TableMetadataBuilder::from_table_creation(
-        TableCreation::builder()
-            .name("t".to_string())
-            .location(table_location.to_str().expect("utf8").to_string())
-            .schema(schema())
-            .build(),
-    )
-    .expect("builder")
-    .build()
-    .expect("metadata")
-    .metadata;
+    let metadata = metadata_at(&table_location, schema());
     let uuid_location = MetadataLocation::for_metadata(&metadata)
         .expect("location")
         .to_string();
@@ -300,10 +328,11 @@ async fn test_hadoop_register_uuid_location_stays_uuid() {
         .await
         .expect("register");
     assert_eq!(location(&registered), uuid_location);
+    assert_no_hint(&registered);
 
     let committed = commit_property(&catalog, "a").await;
     assert_uuid_named(&location(&committed), "00001");
-    assert_eq!(hint(&committed), None);
+    assert_no_hint(&committed);
 }
 
 const INJECTED_HINT_FAILURE: &str = "injected failure after writing version-hint.text";
@@ -517,7 +546,7 @@ async fn test_hadoop_duplicate_create_keeps_registered_v1_bytes() {
         .expect_err("duplicate");
     assert_eq!(err.kind(), ErrorKind::TableAlreadyExists);
     assert_eq!(std::fs::read(&v1).expect("reread v1"), original);
-    assert_eq!(hint(&created).as_deref(), Some("1"));
+    assert_eq!(hint(&created), "1");
 
     let loaded = catalog.load_table(&ident()).await.expect("load");
     assert_eq!(location(&loaded), v1);
@@ -672,17 +701,7 @@ async fn test_default_naming_register_vn_pointer_writes_no_hint() {
         .await
         .expect("namespace");
     let table_location = warehouse.path().join("registered");
-    let metadata = TableMetadataBuilder::from_table_creation(
-        TableCreation::builder()
-            .name("t".to_string())
-            .location(table_location.to_str().expect("utf8").to_string())
-            .schema(schema())
-            .build(),
-    )
-    .expect("builder")
-    .build()
-    .expect("metadata")
-    .metadata;
+    let metadata = metadata_at(&table_location, schema());
     let v3 = format!("{}/metadata/v3.metadata.json", metadata.location());
     metadata
         .write_to(&catalog.file_io, &v3)
@@ -694,6 +713,7 @@ async fn test_default_naming_register_vn_pointer_writes_no_hint() {
         .await
         .expect("register");
     assert_eq!(location(&registered), v3);
+    assert_no_hint(&registered);
 
     let committed = commit_property(&catalog, "a").await;
     assert!(
@@ -701,8 +721,8 @@ async fn test_default_naming_register_vn_pointer_writes_no_hint() {
         "{}",
         location(&committed)
     );
-    assert!(!table_location.join("metadata/version-hint.text").exists());
-    assert_eq!(hint(&committed), None);
+    assert_absent(&table_location.join("metadata/version-hint.text"));
+    assert_no_hint(&committed);
 }
 
 #[tokio::test]
@@ -727,7 +747,7 @@ async fn test_hadoop_create_with_failed_hint_registers_v1_and_commits_on() {
     std::fs::remove_dir(&hint_dir).expect("remove hint dir");
     let committed = commit_property(&catalog, "a").await;
     assert!(location(&committed).ends_with("/metadata/v2.metadata.json"));
-    assert_eq!(hint(&committed).as_deref(), Some("2"));
+    assert_eq!(hint(&committed), "2");
 }
 
 #[tokio::test]
@@ -767,17 +787,7 @@ async fn assert_create_racing_register(delay_register: bool, yields: usize) -> b
         .await
         .expect("namespace");
     let table_dir = warehouse.path().join("ns/t");
-    let metadata = TableMetadataBuilder::from_table_creation(
-        TableCreation::builder()
-            .name("t".to_string())
-            .location(table_dir.to_str().expect("utf8").to_string())
-            .schema(wide_schema())
-            .build(),
-    )
-    .expect("builder")
-    .build()
-    .expect("metadata")
-    .metadata;
+    let metadata = metadata_at(&table_dir, wide_schema());
     let v3 = format!("{}/metadata/v3.metadata.json", metadata.location());
     metadata
         .write_to(&catalog.file_io, &v3)
@@ -814,14 +824,14 @@ async fn assert_create_racing_register(delay_register: bool, yields: usize) -> b
     assert_ne!(created.is_ok(), registered.is_ok(), "{context}");
     let pointer = location(&catalog.load_table(&ident()).await.expect("load"));
     let metadata_dir = table_dir.join("metadata");
-    if let Ok(hint) = std::fs::read_to_string(metadata_dir.join("version-hint.text")) {
+    if let Some(hint) = hint_if_present(&metadata_dir.join("version-hint.text")) {
         assert_eq!(hint, pointer_version(&pointer), "{context}: {pointer}");
     }
     if created.is_ok() {
         assert!(pointer.ends_with("/metadata/v1.metadata.json"), "{context}");
     } else {
         assert_eq!(pointer, v3, "{context}");
-        assert!(!metadata_dir.join("v1.metadata.json").exists(), "{context}");
+        assert_absent(&metadata_dir.join("v1.metadata.json"));
     }
     created.is_ok()
 }
@@ -860,7 +870,7 @@ async fn assert_create_survives_partial_hint(pre_existing_hint: Option<&str>) {
     assert_eq!(location(&loaded), location(&created));
     assert!(location(&loaded).ends_with("/metadata/v1.metadata.json"));
     assert!(metadata_dir.join("v1.metadata.json").is_file());
-    assert_eq!(hint(&loaded).as_deref(), Some("1"));
+    assert_eq!(hint(&loaded), "1");
 }
 
 #[tokio::test]
@@ -931,12 +941,12 @@ async fn test_hadoop_create_at_target_name_after_refused_rename() {
         "{}",
         location(&created)
     );
-    assert_eq!(hint(&created).as_deref(), Some("1"));
+    assert_eq!(hint(&created), "1");
 
     let loaded = catalog.load_table(&ident()).await.expect("load t");
     assert_eq!(location(&loaded), location(&original));
     assert_eq!(loaded.metadata().uuid(), original.metadata().uuid());
-    assert_eq!(hint(&loaded).as_deref(), Some("1"));
+    assert_eq!(hint(&loaded), "1");
 }
 
 #[tokio::test]
@@ -944,6 +954,7 @@ async fn test_uuid_rename_then_create_at_old_name_succeeds() {
     let warehouse = TempDir::new().expect("tempdir");
     let catalog = load_catalog(&warehouse, None).await.expect("load");
     let original = create(&catalog, HashMap::new()).await.expect("create");
+    assert_no_hint(&original);
 
     catalog
         .rename_table(&ident(), &renamed())
@@ -956,6 +967,10 @@ async fn test_uuid_rename_then_create_at_old_name_succeeds() {
     let recreated = create_named(&catalog, &ident()).await.expect("create t");
     assert_uuid_named(&location(&recreated), "00000");
     assert_ne!(location(&recreated), location(&original));
+    assert_no_hint(&recreated);
+    let committed = commit_property(&catalog, "a").await;
+    assert_uuid_named(&location(&committed), "00001");
+    assert_no_hint(&committed);
 }
 
 #[tokio::test]
