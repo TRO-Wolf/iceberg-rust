@@ -45,7 +45,7 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-4 | Uuid mode drop: the current file goes, the earlier `00000-<uuid>` file, a hand-placed `v1.metadata.json` and `version-hint.text` stay | `uuid_drop_leaves_hand_placed_hadoop_files` |
 | C-5 | (r2) Hadoop drop of a `v3` table: `v1..v3` and the hint absent by name; these survive with their content, each by name: `v0.metadata.json` (parses, K = 0), `V1.metadata.json` (parse error), `v1.metadata.json.bak` (parse error), `v4.metadata.json` (K > N), `00001-<uuid>.metadata.json` (uuid convention), `metadata/sub/v1.metadata.json` (not the pointer's directory), `other.metadata.json` (parse error). Measured parser accepts, so deleted as K <= N, each absent by name (r6 adds the last two): `v01.metadata.json` (K = 1), `v2.gz.metadata.json` (K = 2), `v1.metadata.json.gz` (K = 1) and `v+1.metadata.json` (K = 1) | `hadoop_drop_leaves_near_miss_names` |
 | C-6 | (r2) Register a hand-placed `v2000000000.metadata.json` with a hand-placed hint and `v1`, then drop on its own thread and runtime under a 10 s `tokio::time::timeout` on the result: it completes; the pointer, the hint and `v1` are absent | `hadoop_drop_of_registered_huge_version_completes` |
-| C-7 | (r2, table-driven in r7) The listing returns storage-native locations (`LocalFsStorage` without `file:`, `MemoryStorage` without `memory:`). For every warehouse form each storage accepts, create, commit to `v3`, drop: `v1..v3` and the hint absent by name, re-create at `v1`, commit `v2`. Memory storage: `memory:///warehouse`, `memory://warehouse`, `memory:/warehouse` (red before the r7 fix: `memory:/warehouse: memory:/warehouse/ns/t/metadata/v1.metadata.json must not exist`), `/warehouse`, `warehouse`. Local fs: `<tmp>`, `file://<tmp>` (= `file:///tmp/..`), `file://<tmp without leading />`, `file:<tmp>`, `file:<tmp without leading />` | `hadoop_drop_then_recreate_over_every_accepted_warehouse_form` |
+| C-7 | (r2, table-driven in r7) The listing returns storage-native locations (`LocalFsStorage` without `file:`, `MemoryStorage` without `memory:`). For every warehouse form each storage accepts, create, commit to `v3`, drop: `v1..v3` and the hint absent by name, re-create at `v1`, commit `v2`. Memory storage: `memory:///warehouse`, `memory://warehouse`, `memory:/warehouse` (red before the r7 fix: `memory:/warehouse: memory:/warehouse/ns/t/metadata/v1.metadata.json must not exist`), `/warehouse`, `warehouse`, and (r8) `C:/warehouse` and `C:\\warehouse`. Local fs: `<tmp>`, `file://<tmp>` (= `file:///tmp/..`), `file://<tmp without leading />`, `file:<tmp>`, `file:<tmp without leading />` | `hadoop_drop_then_recreate_over_every_accepted_warehouse_form` |
 | C-8 | (r5, replaces the r2 walk clause) A storage whose `list` fails `FeatureUnsupported`, drop at `v3`: `v3` and the hint absent; `v1` and `v2` still hold their pre-drop bytes (read back); a re-create at the same location fails `CatalogCommitConflicts` on the leftover `v1` | `hadoop_drop_without_listing_removes_only_current_file_and_hint` |
 | C-9 | (r2) A storage whose `list` fails with any other kind: `drop_table` returns that error; the pointer is gone, `v3` is gone (current-file delete), `v1`, `v2` and the hint stay; (r6) a re-create fails `CatalogCommitConflicts` | `hadoop_drop_propagates_other_list_errors` |
 | C-10 | (r5) Registered `v2000000000.metadata.json` on a storage whose `list` fails `FeatureUnsupported`: drop returns `Ok` after exactly 2 deletes (the current file and the hint) and 1 list call; the pointer is absent. The counting storage fails any delete past 64 per catalog, so a reintroduced walk fails instead of hanging | `hadoop_drop_of_huge_registered_version_without_listing_is_bounded` |
@@ -56,6 +56,8 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-15 | (r6) The hint delete fails at `v3`: the error propagates; the pointer is gone, a second drop is `TableNotFound`; `v1..v3` are gone; the hint still reads `3`; a re-create succeeds at `v1` and overwrites the hint with `1` | `hadoop_drop_hint_delete_error_leaves_only_the_hint` |
 | C-16 | (r6, critic V-002) A drop whose listing never completes, cancelled by a 100 ms timeout: the pointer is gone, a second drop is `TableNotFound`; `v3` is gone; `v1`, `v2` and the hint stay | `hadoop_drop_cancelled_at_listing_leaves_chain_without_pointer` |
 | C-17 | (r7) Default (uuid) mode, a registered `v3.metadata.json` pointer with hand-placed `v1`, `v2` and hint: drop deletes only `v3`; `v1`, `v2` and the hint keep their content | `uuid_mode_drop_of_registered_vn_pointer_deletes_only_the_pointer` |
+| C-25 | (r8, critic V-008) Memory storage, `memory:///warehouse`, drop at `v2`: `v1`, `v2` and the hint are gone, and these raw keys under the metadata directory survive with their content, each by exact name: `<dir>/x://<dir without scheme>/v1.metadata.json` (red before the fix: `File not found: memory:///warehouse/ns/t/metadata/x://warehouse/ns/t/metadata/v1.metadata.json`), `<dir>/s3://b/v1.metadata.json`, `<dir>/x:/<dir without scheme>/v1.metadata.json`, `<dir>/v1.metadata.json/v1.metadata.json`, `<dir>/metadata/v1.metadata.json`, `<dir>//v1.metadata.json`; the listing is checked to hold each raw key before the drop | `hadoop_drop_keeps_nested_keys_holding_a_scheme_separator` |
+| C-26 | (r8, critic V-009) Hadoop mode on a storage whose `list` waits on a gate, table at `v1` and, separately, at `v2`: a `drop_table` is held at its listing (the current file already deleted) while a `create_table` of the same name is started and driven for 64 yields; after the gate opens, the drop and the create both return `Ok`, the new pointer is `v1`, its file exists, the hint reads `1`, and the create had not finished while the drop was at its listing. Red before the fix (`v1` case): `load: DataInvalid => File not found: memory:///warehouse/ns/t/metadata/v1.metadata.json` | `race_tests::hadoop_create_racing_a_drop_keeps_its_v1` (`hadoop_drop_race_tests.rs`) |
 | C-18 | (r8, HMETA-DROPNS) Hadoop mode, namespace `db` with a table: `drop_namespace` fails `NamespaceNotEmpty` with the full message `Namespace db is not empty.`; `db` still exists, the table still loads at the same location, and its `v1.metadata.json` still exists. Red before the fix: `namespace holds a table: ()` | `hadoop_mode_drop_namespace_with_table_is_refused` |
 | C-19 | (r8) Hadoop mode, empty namespace: `drop_namespace` succeeds and the namespace is gone | `hadoop_mode_drop_of_empty_namespace_succeeds` |
 | C-20 | (r8) Hadoop mode, `a.b` holds a table: `drop_namespace(a)` fails `NamespaceNotEmpty` `Namespace a is not empty.`, `drop_namespace(a.b)` fails `Namespace a.b is not empty.`; both namespaces and the table remain | `hadoop_mode_drop_namespace_refuses_a_table_in_a_descendant` |
@@ -134,6 +136,15 @@ per run, each reverted with `git checkout`:
 | (ns-p6) a child namespace counts as a table | C-21 |
 | (ns-p7) Hadoop mode answers a missing namespace with its own message | C-24 |
 
+Round r8 (critic r5) mutation checks, one per run, each reverted with `git checkout`:
+
+| Mutation | Red |
+|---|---|
+| (r8-s) `storage_path` splits on `://` anywhere again | C-25 (`File not found: memory:///warehouse/ns/t/metadata/x://warehouse/ns/t/metadata/v1.metadata.json`) |
+| (r8-t) the Hadoop arm of `drop_table` releases the lock before `drop_metadata` | C-26 (`load: DataInvalid => File not found: memory:///warehouse/ns/t/metadata/v1.metadata.json`) |
+| (r8-u) the uuid arm also holds the lock across its delete | none: green everywhere; not pinned: uuid drop lock scope |
+| (r8-v) the directory match becomes a prefix match (`starts_with`) | C-25, C-5 |
+
 C-6 first awaited `tokio::time::timeout` directly on `drop_table`. Under the walk mutation that
 test hung rather than failing: `LocalFsStorage::delete` never yields, so the timer never ran. The
 drop now runs on its own thread and runtime, and the test awaits a oneshot under the timeout.
@@ -154,7 +165,10 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
 - D-2 (revised in r2): for a `vN` pointer the helper lists the pointer's metadata directory once
   (`FileIO::list`, recursive) and deletes each listed location that `MetadataLocation::from_file_path`
   parses as Hadoop convention with `1 <= K <= N`, and whose directory is the pointer's directory.
-  The directory match ignores a leading `scheme://`, a `file:` or `memory:` prefix (r7, critic
+  The directory match ignores a leading RFC 3986 scheme and its `://` (r8, critic V-008: only when
+  the text before the first `:` starts with an ASCII letter and holds only ASCII alphanumerics,
+  `+`, `-` or `.`, and the `:` is followed by `//`; a `://` inside a key is not a scheme, C-25,
+  mutation (r8-s)), a `file:` or `memory:` prefix (r7, critic
   V-005: `memory:/x` is a form `MemoryStorage` accepts) and leading `/` (C-7, mutations (p), (gg),
   (hh)). No other `<x>:` prefix is stripped, so a Windows drive letter such as `C:` survives; this
   is not pinned: every listed entry shares the pointer's prefix, so both sides of the comparison
@@ -192,6 +206,13 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   A missing namespace falls through to `remove_existing_namespace` and keeps its error (C-24,
   ns-p7). Uuid mode is unchanged (C-23, ns-p2). The message is the one the owner measured from
   Java `HadoopCatalog.dropNamespace` (external evidence, not pinned by a Rust test).
+- D-6 (r8, critic V-009, the #347 r3 V-007 precedent): in Hadoop mode `drop_table` holds the
+  `root_namespace_state` lock from `remove_existing_table` through `cache_invalidate` and
+  `drop_metadata`, so a `create_table` of the same name, which holds the same lock across its name
+  check, `v1` write and insert, cannot publish a `v1` that the drop's listing then deletes (C-26,
+  mutation (r8-t)). Uuid mode keeps the short lock and deletes outside it; that is not pinned (uuid
+  drop lock scope: mutation (r8-u) stays green). The drop's error semantics are unchanged: the
+  pointer is removed first, and a delete error still returns `Err` after it is gone (D-3).
 - D-3: a delete error propagates as the `drop_table` error, as the current-file delete already did
   (C-13 current file, C-14 chain entry, C-15 hint). The pointer is removed first, so the table is
   dropped either way (C-13 to C-16 assert `table_exists` false and a `TableNotFound` retry).
@@ -210,9 +231,19 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   overwrites it (C-15). In cases 1 to 3, a remaining `v1` makes a re-create fail
   `CatalogCommitConflicts` (C-13, C-9, C-14).
 - (critic V-002, narrowed in r7) A `drop_table` future cancelled during the listing await leaves
-  the chain below the current file and the hint, with no pointer for a retry (C-16). Cancellation
+  the chain below the current file and the hint, with no pointer for a retry (C-16); since r8 the
+  Hadoop drop holds the pointer lock at that await, and dropping the future releases it. Cancellation
   at a per-file delete await or at the hint delete await is not pinned: in this harness a delete
   that completes before the cancel is observed cannot be told apart from one that does not.
+- (r8 sweep, residue R8-1) Hadoop `update_table` writes `v(N+1)` with the exclusive create outside the
+  pointer lock, then takes the lock for the pointer swap; staged replace (`publish_replace_table`)
+  does the same. Interleaving: a table at `v2`; a commit writes `v3` outside the lock; a drop takes
+  the lock, removes the pointer, deletes `v2`, lists and deletes `v1` (K <= 2) but not `v3` (K > 2),
+  deletes the hint and releases; the commit then fails its pointer check. The orphan `v3` stays, and
+  once the table is re-created and reaches `v2`, its next commit fails `CatalogCommitConflicts` on
+  that `v3`. The same holds when a commit from a stale base writes after the drop. No committed
+  data is lost; not changed here (the commit and replace paths are out of this PR's scope), not
+  pinned.
 - Purge through maintenance `DeleteReachableFiles` is unchanged (ledger 1, section 8); this PR does
   not touch that path and does not pin it.
 - (r8) Uuid-mode `drop_namespace` still removes a namespace with its table pointers and deletes no
