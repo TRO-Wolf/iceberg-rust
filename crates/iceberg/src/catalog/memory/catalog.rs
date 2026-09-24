@@ -456,14 +456,9 @@ impl Catalog for MemoryCatalog {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
             root_namespace_state.remove_existing_table(table_ident)?
         };
-        if let Some(cache) = self.table_metadata_cache.as_ref() {
-            cache
-                .invalidate(&self.cache_scope, &metadata_location)
-                .await;
-        }
-        self.file_io.delete(&metadata_location).await?;
+        self.cache_invalidate(&metadata_location).await;
         self.metadata_naming
-            .drop_metadata_chain(&self.file_io, &metadata_location)
+            .drop_metadata(&self.file_io, &metadata_location)
             .await
     }
 
@@ -508,11 +503,7 @@ impl Catalog for MemoryCatalog {
             root_namespace_state.insert_new_table(table_ident, metadata_location.clone())
         };
         if let Err(e) = insert_result {
-            if let Some(cache) = self.table_metadata_cache.as_ref() {
-                cache
-                    .invalidate(&self.cache_scope, &metadata_location)
-                    .await;
-            }
+            self.cache_invalidate(&metadata_location).await;
             return Err(e);
         }
 

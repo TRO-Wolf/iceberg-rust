@@ -96,11 +96,12 @@ impl MetadataNaming {
         }
     }
 
-    pub(crate) async fn drop_metadata_chain(
+    pub(crate) async fn drop_metadata(
         self,
         file_io: &FileIO,
         metadata_location: &str,
     ) -> Result<()> {
+        file_io.delete(metadata_location).await?;
         if self != Self::Hadoop {
             return Ok(());
         }

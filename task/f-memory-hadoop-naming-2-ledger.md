@@ -50,7 +50,7 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-9 | (r2) A storage whose `list` fails with any other kind: `drop_table` returns that error; the pointer is gone, `v3` is gone (current-file delete), `v1`, `v2` and the hint stay | `hadoop_drop_propagates_other_list_errors` |
 
 Mutation check (measured, restored, suite green after): with the chain and hint deletes skipped in
-`MetadataNaming::drop_metadata_chain`, C-1, C-2 and C-5 go red; C-3 and C-4 stay green (C-3's only
+`MetadataNaming::drop_metadata_chain` (renamed `drop_metadata` in r3), C-1, C-2 and C-5 go red; C-3 and C-4 stay green (C-3's only
 file is the current one, which `drop_table` deletes itself; C-4 is uuid mode).
 
 Round r2 mutation checks (each measured and restored; suite green after):
@@ -67,8 +67,11 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
 
 ## 3. Decisions
 
-- D-1: `drop_table` keeps its current-file delete and then calls
-  `MetadataNaming::drop_metadata_chain`. Uuid mode returns at once, so default mode is unchanged.
+- D-1 (r3 shape): `drop_table` makes one call, `MetadataNaming::drop_metadata`, which deletes the
+  current file and then, in Hadoop mode only, the chain and the hint. Uuid mode returns right after
+  the current-file delete, so default mode is unchanged. r3 moved the current-file delete out of
+  `drop_table` and factored the two cache-invalidate blocks into `MemoryCatalog::cache_invalidate`
+  (`caches.rs`), so `catalog.rs` stays under its unchanged 3153-line ceiling.
   Hadoop mode parses the dropped location with `MetadataLocation::from_file_path`; a uuid-named
   pointer (a registered uuid table in Hadoop mode) or an unparsable one is a no-op.
 - D-2 (revised in r2): for a `vN` pointer the helper lists the pointer's metadata directory once

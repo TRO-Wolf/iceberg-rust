@@ -85,4 +85,10 @@ impl MemoryCatalog {
                 .await;
         }
     }
+
+    pub(crate) async fn cache_invalidate(&self, metadata_location: &str) {
+        if let Some(cache) = self.table_metadata_cache.as_ref() {
+            cache.invalidate(&self.cache_scope, metadata_location).await;
+        }
+    }
 }
