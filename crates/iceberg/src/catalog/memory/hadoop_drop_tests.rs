@@ -952,3 +952,6 @@ async fn hadoop_drop_keeps_nested_keys_holding_a_scheme_separator() {
 
 #[path = "hadoop_drop_race_tests.rs"]
 mod race_tests;
+
+#[path = "hadoop_drop_path_tests.rs"]
+mod path_tests;
