@@ -296,21 +296,24 @@ impl NamespaceState {
         }
     }
 
-    pub(crate) fn ensure_table_name_free(&self, table_ident: &TableIdent) -> Result<()> {
-        let namespace = self.get_namespace(table_ident.namespace())?;
+    pub(crate) fn vacant_table_slot(
+        &mut self,
+        table_ident: &TableIdent,
+    ) -> Result<hash_map::VacantEntry<'_, String, String>> {
+        let namespace = self.get_mut_namespace(table_ident.namespace())?;
         if namespace
             .view_metadata_locations
             .contains_key(table_ident.name())
         {
             return view_with_same_name_err(table_ident);
         }
-        if namespace
+        match namespace
             .table_metadata_locations
-            .contains_key(table_ident.name())
+            .entry(table_ident.name().to_string())
         {
-            return table_already_exists_err(table_ident);
+            hash_map::Entry::Occupied(_) => table_already_exists_err(table_ident),
+            hash_map::Entry::Vacant(entry) => Ok(entry),
         }
-        Ok(())
     }
 
     // Inserts the given table or returns an error if it already exists

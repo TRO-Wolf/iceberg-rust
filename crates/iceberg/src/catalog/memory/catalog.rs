@@ -414,11 +414,11 @@ impl Catalog for MemoryCatalog {
         let metadata_location = first_location.to_string();
         if self.metadata_naming == MetadataNaming::Hadoop {
             let mut root_namespace_state = self.root_namespace_state.lock().await;
-            root_namespace_state.ensure_table_name_free(&table_ident)?;
+            let slot = root_namespace_state.vacant_table_slot(&table_ident)?;
             self.metadata_naming
                 .write_first_metadata(&self.file_io, &metadata, &first_location)
                 .await?;
-            root_namespace_state.insert_new_table(&table_ident, metadata_location.clone())?;
+            let _ = slot.insert(metadata_location.clone());
         } else {
             self.metadata_naming
                 .write_first_metadata(&self.file_io, &metadata, &first_location)

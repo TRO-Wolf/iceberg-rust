@@ -706,32 +706,28 @@ async fn test_default_naming_register_vn_pointer_writes_no_hint() {
 }
 
 #[tokio::test]
-async fn test_hadoop_create_fails_and_registers_nothing_when_hint_write_fails() {
+async fn test_hadoop_create_with_failed_hint_registers_v1_and_commits_on() {
     let warehouse = TempDir::new().expect("tempdir");
     let catalog = load_catalog(&warehouse, Some("hadoop"))
         .await
         .expect("load");
-    std::fs::create_dir_all(warehouse.path().join("ns/t/metadata/version-hint.text"))
-        .expect("hint dir");
-
     let hint_dir = warehouse.path().join("ns/t/metadata/version-hint.text");
-    let v1 = warehouse.path().join("ns/t/metadata/v1.metadata.json");
+    std::fs::create_dir_all(&hint_dir).expect("hint dir");
 
-    create(&catalog, HashMap::new())
+    let created = create(&catalog, HashMap::new()).await.expect("create");
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    assert_eq!(location(&loaded), location(&created));
+    assert!(location(&loaded).ends_with("/metadata/v1.metadata.json"));
+    assert!(Path::new(&location(&loaded)).is_file());
+    let err = create(&catalog, HashMap::new())
         .await
-        .expect_err("hint write fails");
-    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
-    assert!(!v1.exists());
+        .expect_err("duplicate");
+    assert_eq!(err.kind(), ErrorKind::TableAlreadyExists);
 
     std::fs::remove_dir(&hint_dir).expect("remove hint dir");
-    let table = create(&catalog, HashMap::new()).await.expect("retry");
-    assert!(
-        location(&table).ends_with("/metadata/v1.metadata.json"),
-        "{}",
-        location(&table)
-    );
-    assert!(v1.is_file());
-    assert_eq!(hint(&table).as_deref(), Some("1"));
+    let committed = commit_property(&catalog, "a").await;
+    assert!(location(&committed).ends_with("/metadata/v2.metadata.json"));
+    assert_eq!(hint(&committed).as_deref(), Some("2"));
 }
 
 #[tokio::test]
@@ -849,48 +845,32 @@ async fn failing_hint_catalog(warehouse: &TempDir, failing: Arc<AtomicBool>) -> 
     .expect("load")
 }
 
-#[tokio::test]
-async fn test_hadoop_create_removes_partial_hint_and_v1_when_hint_write_fails_after_bytes() {
+async fn assert_create_survives_partial_hint(pre_existing_hint: Option<&str>) {
     let warehouse = TempDir::new().expect("tempdir");
-    let failing = Arc::new(AtomicBool::new(true));
-    let catalog = failing_hint_catalog(&warehouse, failing.clone()).await;
+    let catalog = failing_hint_catalog(&warehouse, Arc::new(AtomicBool::new(true))).await;
     let metadata_dir = warehouse.path().join("ns/t/metadata");
+    if let Some(bytes) = pre_existing_hint {
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        std::fs::write(metadata_dir.join("version-hint.text"), bytes).expect("hint");
+    }
 
-    let err = create(&catalog, HashMap::new())
-        .await
-        .expect_err("hint write fails");
-    assert_eq!(err.kind(), ErrorKind::Unexpected);
-    assert_eq!(err.message(), INJECTED_HINT_FAILURE);
-    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
-    assert!(!metadata_dir.join("v1.metadata.json").exists());
-    assert!(!metadata_dir.join("version-hint.text").exists());
-
-    failing.store(false, Ordering::SeqCst);
-    let table = create(&catalog, HashMap::new()).await.expect("retry");
-    assert!(
-        location(&table).ends_with("/metadata/v1.metadata.json"),
-        "{}",
-        location(&table)
-    );
-    assert_eq!(hint(&table).as_deref(), Some("1"));
+    let created = create(&catalog, HashMap::new()).await.expect("create");
+    assert!(catalog.table_exists(&ident()).await.expect("exists"));
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    assert_eq!(location(&loaded), location(&created));
+    assert!(location(&loaded).ends_with("/metadata/v1.metadata.json"));
+    assert!(metadata_dir.join("v1.metadata.json").is_file());
+    assert_eq!(hint(&loaded).as_deref(), Some("1"));
 }
 
 #[tokio::test]
-async fn test_hadoop_failed_create_keeps_pre_existing_hint_file() {
-    let warehouse = TempDir::new().expect("tempdir");
-    let failing = Arc::new(AtomicBool::new(true));
-    let catalog = failing_hint_catalog(&warehouse, failing).await;
-    let metadata_dir = warehouse.path().join("ns/t/metadata");
-    std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
-    std::fs::write(metadata_dir.join("version-hint.text"), "7").expect("hint");
+async fn test_hadoop_create_succeeds_when_hint_write_fails_after_bytes() {
+    assert_create_survives_partial_hint(None).await;
+}
 
-    let err = create(&catalog, HashMap::new())
-        .await
-        .expect_err("hint write fails");
-    assert_eq!(err.message(), INJECTED_HINT_FAILURE);
-    assert!(!catalog.table_exists(&ident()).await.expect("exists"));
-    assert!(!metadata_dir.join("v1.metadata.json").exists());
-    assert!(metadata_dir.join("version-hint.text").is_file());
+#[tokio::test]
+async fn test_hadoop_create_succeeds_over_pre_existing_hint_when_hint_write_fails() {
+    assert_create_survives_partial_hint(Some("7")).await;
 }
 
 fn renamed() -> TableIdent {
