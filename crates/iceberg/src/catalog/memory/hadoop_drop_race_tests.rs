@@ -104,7 +104,7 @@ impl StorageFactory for GatedListStorageFactory {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn hadoop_create_racing_a_drop_keeps_its_v1() {
     for version in [1, 2] {
         let gate = ListGate::default();
@@ -126,13 +126,24 @@ async fn hadoop_create_racing_a_drop_keeps_its_v1() {
             async move { catalog.drop_table(&ident()).await }
         });
         gate.reached.notified().await;
+        let entered = Arc::new(Notify::new());
         let creator = tokio::spawn({
             let catalog = catalog.clone();
-            async move { create(&catalog, HashMap::new()).await }
+            let entered = entered.clone();
+            async move {
+                entered.notify_one();
+                catalog
+                    .create_table(
+                        &ident().namespace,
+                        TableCreation::builder()
+                            .name(ident().name().to_string())
+                            .schema(schema())
+                            .build(),
+                    )
+                    .await
+            }
         });
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
+        entered.notified().await;
         let created_during_list = creator.is_finished();
         gate.release.notify_one();
 
