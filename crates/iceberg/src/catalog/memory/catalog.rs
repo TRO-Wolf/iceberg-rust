@@ -449,13 +449,13 @@ impl Catalog for MemoryCatalog {
 
     /// Drop a table from the catalog.
     ///
-    /// Removes the pointer under a short lock, then deletes the metadata file outside it.
     /// Evicts the opt-in pointer-cache entry for the dropped location (if a cache is injected).
     async fn drop_table(&self, table_ident: &TableIdent) -> Result<()> {
-        let metadata_location = {
-            let mut root_namespace_state = self.root_namespace_state.lock().await;
-            root_namespace_state.remove_existing_table(table_ident)?
-        };
+        let mut root_namespace_state = self.root_namespace_state.lock().await;
+        let metadata_location = root_namespace_state.remove_existing_table(table_ident)?;
+        if self.metadata_naming != MetadataNaming::Hadoop {
+            drop(root_namespace_state);
+        }
         self.cache_invalidate(&metadata_location).await;
         self.metadata_naming
             .drop_metadata(&self.file_io, &metadata_location)
