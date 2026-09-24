@@ -878,3 +878,56 @@ async fn hadoop_mode_drop_of_missing_namespace_keeps_the_not_found_error() {
         );
     }
 }
+
+#[tokio::test]
+async fn hadoop_drop_keeps_nested_keys_holding_a_scheme_separator() {
+    let catalog = load_catalog_with(
+        Arc::new(MemoryStorageFactory),
+        "memory:///warehouse",
+        Some("hadoop"),
+    )
+    .await
+    .expect("load");
+    let table = create(&catalog, HashMap::new()).await.expect("create");
+    commit_property(&catalog, "a").await;
+    let dir = metadata_dir(&table);
+    let bare = dir.trim_start_matches("memory:///");
+    let nested = [
+        format!("{dir}/x://{bare}/v1.metadata.json"),
+        format!("{dir}/s3://b/v1.metadata.json"),
+        format!("{dir}/x:/{bare}/v1.metadata.json"),
+    ];
+    for path in &nested {
+        catalog
+            .file_io
+            .new_output(path)
+            .expect("output")
+            .write(Bytes::from(path.clone()))
+            .await
+            .expect("write nested key");
+    }
+    let listed: Vec<String> = catalog
+        .file_io
+        .list(&dir)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|file| file.location)
+        .collect();
+    for path in &nested {
+        let key = path.trim_start_matches("memory:///");
+        assert!(listed.iter().any(|location| location == key), "{key}");
+    }
+
+    catalog.drop_table(&ident()).await.expect("drop");
+    for name in ["v1.metadata.json", "v2.metadata.json", "version-hint.text"] {
+        assert!(!file_exists(&catalog, &dir, name).await, "{name}");
+    }
+    for path in &nested {
+        assert_eq!(
+            read_bytes(&catalog, path).await,
+            Bytes::from(path.clone()),
+            "{path}"
+        );
+    }
+}
