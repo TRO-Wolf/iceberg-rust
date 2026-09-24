@@ -185,8 +185,9 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   mode `drop_namespace` refuses a namespace that holds a table, directly or in any descendant
   namespace, with `ErrorKind::NamespaceNotEmpty` and the message `Namespace <ns> is not empty.`,
   where `<ns>` is the levels joined with `.` (C-18, C-20; ns-p1, ns-p3, ns-p4). The check is
-  `NamespaceState::ensure_droppable`, run under the same lock as the removal. `holds_tables` walks
-  the subtree with an explicit stack, not recursion. An empty namespace, one with only empty child
+  `NamespaceState::ensure_droppable`, run under the same lock as the removal, and `holds_tables`
+  walks the subtree with an explicit stack, not recursion; both are code structure and not pinned
+  (no test here can race a table insert between the check and the removal). An empty namespace, one with only empty child
   namespaces, and one whose tables were dropped are still removed (C-19, C-21, C-22; ns-p5, ns-p6).
   A missing namespace falls through to `remove_existing_namespace` and keeps its error (C-24,
   ns-p7). Uuid mode is unchanged (C-23, ns-p2). The message is the one the owner measured from
