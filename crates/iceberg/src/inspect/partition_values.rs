@@ -16,9 +16,9 @@
 // under the License.
 
 use arrow_array::builder::{
-    BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int32Builder, Int64Builder, StringBuilder, StructBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
+    BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder, Float64Builder, Int32Builder,
+    Int64Builder, LargeBinaryBuilder, StringBuilder, StructBuilder, Time64MicrosecondBuilder,
+    TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
 };
 
 use crate::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
@@ -116,7 +116,7 @@ fn append_partition_field(
         PrimitiveType::TimestampNs => append_typed!(TimestampNanosecondBuilder, extract_i64),
         PrimitiveType::TimestamptzNs => append_typed!(TimestampNanosecondBuilder, extract_i64),
         PrimitiveType::String => append_typed!(StringBuilder, extract_string),
-        PrimitiveType::Binary => append_typed!(BinaryBuilder, extract_binary),
+        PrimitiveType::Binary => append_typed!(LargeBinaryBuilder, extract_binary),
         PrimitiveType::Decimal { .. } => append_typed!(Decimal128Builder, extract_i128),
         other => {
             return Err(Error::new(

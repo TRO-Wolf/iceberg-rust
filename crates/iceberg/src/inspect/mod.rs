@@ -18,6 +18,8 @@
 //! Metadata table APIs.
 
 mod all_manifests;
+#[cfg(test)]
+mod binary_partition_tests;
 mod count_map;
 mod data_file;
 mod entries;
