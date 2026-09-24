@@ -53,6 +53,16 @@ impl MetadataNaming {
         }
     }
 
+    pub(crate) fn ensure_rename_supported(self) -> Result<()> {
+        match self {
+            Self::Uuid => Ok(()),
+            Self::Hadoop => Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "Cannot rename Hadoop tables",
+            )),
+        }
+    }
+
     pub(crate) async fn write_first_metadata(
         self,
         file_io: &FileIO,

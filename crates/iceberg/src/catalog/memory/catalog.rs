@@ -477,6 +477,7 @@ impl Catalog for MemoryCatalog {
         src_table_ident: &TableIdent,
         dst_table_ident: &TableIdent,
     ) -> Result<()> {
+        self.metadata_naming.ensure_rename_supported()?;
         let mut root_namespace_state = self.root_namespace_state.lock().await;
 
         let mut new_root_namespace_state = root_namespace_state.clone();
