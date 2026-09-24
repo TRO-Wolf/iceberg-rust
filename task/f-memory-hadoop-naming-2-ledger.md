@@ -45,11 +45,11 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-4 | Uuid mode drop: the current file goes, the earlier `00000-<uuid>` file, a hand-placed `v1.metadata.json` and `version-hint.text` stay | `uuid_drop_leaves_hand_placed_hadoop_files` |
 | C-5 | (r2) Hadoop drop of a `v3` table: `v1..v3` and the hint absent by name; these survive with their content, each by name: `v0.metadata.json` (parses, K = 0), `V1.metadata.json` (parse error), `v1.metadata.json.bak` (parse error), `v4.metadata.json` (K > N), `00001-<uuid>.metadata.json` (uuid convention), `metadata/sub/v1.metadata.json` (not the pointer's directory), `other.metadata.json` (parse error). Measured parser accepts, so deleted as K <= N, each absent by name (r6 adds the last two): `v01.metadata.json` (K = 1), `v2.gz.metadata.json` (K = 2), `v1.metadata.json.gz` (K = 1) and `v+1.metadata.json` (K = 1) | `hadoop_drop_leaves_near_miss_names` |
 | C-6 | (r2) Register a hand-placed `v2000000000.metadata.json` with a hand-placed hint and `v1`, then drop on its own thread and runtime under a 10 s `tokio::time::timeout` on the result: it completes; the pointer, the hint and `v1` are absent | `hadoop_drop_of_registered_huge_version_completes` |
-| C-7 | (r2) The listing returns storage-native locations (`LocalFsStorage` without `file://`, `MemoryStorage` without `memory://`); a `file://` warehouse on local fs and a `memory:///warehouse` on memory storage both drop `v1..v3` and the hint and re-create at `v1`, then commit `v2` | `hadoop_drop_then_recreate_with_scheme_qualified_warehouses` |
+| C-7 | (r2, table-driven in r7) The listing returns storage-native locations (`LocalFsStorage` without `file:`, `MemoryStorage` without `memory:`). For every warehouse form each storage accepts, create, commit to `v3`, drop: `v1..v3` and the hint absent by name, re-create at `v1`, commit `v2`. Memory storage: `memory:///warehouse`, `memory://warehouse`, `memory:/warehouse` (red before the r7 fix: `memory:/warehouse: memory:/warehouse/ns/t/metadata/v1.metadata.json must not exist`), `/warehouse`, `warehouse`. Local fs: `<tmp>`, `file://<tmp>` (= `file:///tmp/..`), `file://<tmp without leading />`, `file:<tmp>`, `file:<tmp without leading />` | `hadoop_drop_then_recreate_over_every_accepted_warehouse_form` |
 | C-8 | (r5, replaces the r2 walk clause) A storage whose `list` fails `FeatureUnsupported`, drop at `v3`: `v3` and the hint absent; `v1` and `v2` still hold their pre-drop bytes (read back); a re-create at the same location fails `CatalogCommitConflicts` on the leftover `v1` | `hadoop_drop_without_listing_removes_only_current_file_and_hint` |
 | C-9 | (r2) A storage whose `list` fails with any other kind: `drop_table` returns that error; the pointer is gone, `v3` is gone (current-file delete), `v1`, `v2` and the hint stay; (r6) a re-create fails `CatalogCommitConflicts` | `hadoop_drop_propagates_other_list_errors` |
 | C-10 | (r5) Registered `v2000000000.metadata.json` on a storage whose `list` fails `FeatureUnsupported`: drop returns `Ok` after exactly 2 deletes (the current file and the hint) and 1 list call; the pointer is absent. The counting storage fails any delete past 64 per catalog, so a reintroduced walk fails instead of hanging | `hadoop_drop_of_huge_registered_version_without_listing_is_bounded` |
-| C-11 | (r5, critic V-003) Listing path, drop at `v3` on a counting pass-through storage: exactly 1 list call and 4 deletes (`v3`, `v1`, `v2`, hint); all four absent; re-create at `v1` | `hadoop_drop_lists_metadata_once` |
+| C-11 | (r5, critic V-003; prefix r7, critic V-006) Listing path, drop at `v3` on a counting pass-through storage: exactly 1 list call, and its recorded prefix is exactly the pointer's metadata directory as the catalog passes it (`memory:///warehouse/ns/t/metadata`); 4 deletes (`v3`, `v1`, `v2`, hint); all four absent; re-create at `v1` | `hadoop_drop_lists_metadata_once` |
 | C-12 | (r6) Hadoop mode, a registered uuid-named pointer and, separately, a registered unparsable pointer (`custom.json`): drop deletes only the pointer; a hand-placed `v1.metadata.json` and `version-hint.text` keep their content | `hadoop_drop_of_uuid_or_unparsable_pointer_deletes_only_the_pointer` |
 | C-13 | (r6) The current-file delete fails at `v3`: `drop_table` returns that error; the pointer is gone and a second drop is `TableNotFound`; `v1`, `v2`, `v3` and the hint stay; a re-create fails `CatalogCommitConflicts` | `hadoop_drop_current_file_delete_error_leaves_chain_and_hint` |
 | C-14 | (r6) The `v1` delete fails at `v3`: the error propagates; the pointer is gone, a second drop is `TableNotFound`; `v3` is gone; `v1` and the hint stay (`v2` depends on listing order, not asserted); a re-create fails `CatalogCommitConflicts` | `hadoop_drop_chain_delete_error_leaves_rest_of_chain_and_hint` |
@@ -87,6 +87,9 @@ Round r5 mutation checks (each measured on `drop_metadata` / `chain_member`, the
 | (l, r6) the hint delete error is ignored | C-15 |
 | (m, r6) the current-file delete error is ignored | C-13 |
 | (n, r6) `drop_table` removes the pointer after the file deletes instead of before | C-9, C-13, C-14, C-15, C-16 |
+| (p, r7) `storage_path` loses the `memory:` prefix strip | C-7 (`memory:/warehouse: memory:/warehouse/ns/t/metadata/v1.metadata.json must not exist`) |
+| (q, r7) the drop lists the table directory (parent of `metadata/`) | C-11 (prefix `memory:///warehouse/ns/t` instead of `.../metadata`) |
+| (r, r7) the drop lists the warehouse root | C-11 (prefix `memory:///warehouse` instead of `.../metadata`) |
 | (o, r6) `MemoryCatalog::cache_invalidate` does nothing | `pointer_cache_tests::test_fk4_1_drop_table_evicts_cache_entry`, `register_cache_tests::l2_register_insert_failure_evicts_stale_entry` |
 
 C-6 first awaited `tokio::time::timeout` directly on `drop_table`. Under the walk mutation that
@@ -108,8 +111,10 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
 - D-2 (revised in r2): for a `vN` pointer the helper lists the pointer's metadata directory once
   (`FileIO::list`, recursive) and deletes each listed location that `MetadataLocation::from_file_path`
   parses as Hadoop convention with `1 <= K <= N`, and whose directory is the pointer's directory.
-  The directory match ignores a leading `scheme://` or `file:` and leading `/`: `FileInfo::location`
-  is storage-native, so local fs and memory storage list without the scheme the catalog wrote.
+  The directory match ignores a leading `scheme://`, a `file:` or `memory:` prefix (r7, critic
+  V-005: `memory:/x` is a form `MemoryStorage` accepts) and leading `/`; no other `<x>:` prefix is
+  stripped, so a Windows drive letter such as `C:` survives. `FileInfo::location` is
+  storage-native, so local fs and memory storage list without the scheme the catalog wrote (C-7).
   Then it deletes `version-hint.text`. `FileIO::delete` treats a missing file as success. The
   parser accepts gzip siblings (`vK.gz.metadata.json`, `vK.metadata.json.gz`), leading zeros
   (`v01`) and a leading `+` (`v+1`), so these go when K <= N; all four forms are pinned by name in C-5
