@@ -55,6 +55,7 @@ recreate: CatalogCommitConflicts => Cannot commit table metadata to /tmp/.tmpCSX
 | C-14 | (r6) The `v1` delete fails at `v3`: the error propagates; the pointer is gone, a second drop is `TableNotFound`; `v3` is gone; `v1` and the hint stay (`v2` depends on listing order, not asserted); a re-create fails `CatalogCommitConflicts` | `hadoop_drop_chain_delete_error_leaves_rest_of_chain_and_hint` |
 | C-15 | (r6) The hint delete fails at `v3`: the error propagates; the pointer is gone, a second drop is `TableNotFound`; `v1..v3` are gone; the hint still reads `3`; a re-create succeeds at `v1` and overwrites the hint with `1` | `hadoop_drop_hint_delete_error_leaves_only_the_hint` |
 | C-16 | (r6, critic V-002) A drop whose listing never completes, cancelled by a 100 ms timeout: the pointer is gone, a second drop is `TableNotFound`; `v3` is gone; `v1`, `v2` and the hint stay | `hadoop_drop_cancelled_at_listing_leaves_chain_without_pointer` |
+| C-17 | (r7) Default (uuid) mode, a registered `v3.metadata.json` pointer with hand-placed `v1`, `v2` and hint: drop deletes only `v3`; `v1`, `v2` and the hint keep their content | `uuid_mode_drop_of_registered_vn_pointer_deletes_only_the_pointer` |
 
 Mutation check (measured, restored, suite green after): with the chain and hint deletes skipped in
 `MetadataNaming::drop_metadata_chain` (renamed `drop_metadata` in r3), C-1, C-2 and C-5 go red; C-3 and C-4 stay green (C-3's only
@@ -90,6 +91,27 @@ Round r5 mutation checks (each measured on `drop_metadata` / `chain_member`, the
 | (p, r7) `storage_path` loses the `memory:` prefix strip | C-7 (`memory:/warehouse: memory:/warehouse/ns/t/metadata/v1.metadata.json must not exist`) |
 | (q, r7) the drop lists the table directory (parent of `metadata/`) | C-11 (prefix `memory:///warehouse/ns/t` instead of `.../metadata`) |
 | (r, r7) the drop lists the warehouse root | C-11 (prefix `memory:///warehouse` instead of `.../metadata`) |
+| (s, r7) the hint delete is skipped | C-2, C-5, C-6, C-7, C-8, C-10, C-11, C-15 |
+| (t, r7) the drop also deletes `<table>/data` | C-2 (data file) |
+| (t2, r7) `chain_member` also accepts `*.avro` | C-2 (manifest list) |
+| (t3, r7) the drop deletes the whole `metadata/` directory | C-2, C-5, C-8, C-15 |
+| (t4, r7) the drop deletes the whole table directory | C-2, C-3, C-5, C-8, C-15 |
+| (u, r7) the current-file delete is skipped | C-4, C-8, C-9, C-10, C-12, C-16, C-17 |
+| (v, r7) the hint delete first reads the hint (a missing hint becomes an error) | C-3, C-10 |
+| (w, r7) the `self != Hadoop` early return is removed | C-17 |
+| (x, r7) uuid mode lists the directory and deletes every `*.metadata.json` | C-4 (earlier `00000-<uuid>` file gone), C-17 (`v1` gone) |
+| (y, r7) `(1..=version)` widened to `(0..=version)` | C-5 (`v0.metadata.json`) |
+| (z, r7) `/V` read as `/v` before parsing | C-5 (`V1.metadata.json`) |
+| (z2, r7) a `.bak` suffix stripped before parsing | C-5 (`v1.metadata.json.bak`) |
+| (z3, r7) a parse error counts as K = 1 | C-2, C-5, C-11, C-14, C-15 |
+| (aa, r7) a uuid-named listed entry counts as K = 1 | C-5 (`00001-<uuid>.metadata.json`) |
+| (bb, r7) the no-list arm returns before the hint delete | C-8, C-10 |
+| (cc, r7) `FeatureUnsupported` propagates as an error | C-8, C-10 |
+| (dd, r7) other list errors are swallowed | C-9 |
+| (ee, r7) the hint is deleted twice | C-10, C-11 (delete counts) |
+| (gg, r7) `storage_path` loses the `file:` strip | C-7 (`file:/tmp/..` form) |
+| (hh, r7) `storage_path` keeps leading `/` | C-7, C-11, C-14, C-15 |
+| (ff, r7) `storage_path` also strips any `<x>:` prefix | none: not discriminated by a drop test (see D-2) |
 | (o, r6) `MemoryCatalog::cache_invalidate` does nothing | `pointer_cache_tests::test_fk4_1_drop_table_evicts_cache_entry`, `register_cache_tests::l2_register_insert_failure_evicts_stale_entry` |
 
 C-6 first awaited `tokio::time::timeout` directly on `drop_table`. Under the walk mutation that
@@ -99,8 +121,9 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
 ## 3. Decisions
 
 - D-1 (r3 shape): `drop_table` makes one call, `MetadataNaming::drop_metadata`, which deletes the
-  current file and then, in Hadoop mode only, the chain and the hint (C-2, C-11). Uuid mode returns
-  right after the current-file delete, so default mode is unchanged (C-4). r3 moved the
+  current file and then, in Hadoop mode only, the chain and the hint (C-2, C-11; Hadoop-only pinned
+  by C-17, mutation (w)). Uuid mode returns right after the current-file delete, so default mode is
+  unchanged (C-4, C-17). r3 moved the
   current-file delete out of `drop_table` and factored the two cache-invalidate blocks into
   `MemoryCatalog::cache_invalidate` (`caches.rs`; mutation (o)); r4 ratcheted the `catalog.rs`
   size ceiling down to its measured 3147 lines (held by `scripts/check_rust_file_size.py`). The
@@ -112,15 +135,22 @@ drop now runs on its own thread and runtime, and the test awaits a oneshot under
   (`FileIO::list`, recursive) and deletes each listed location that `MetadataLocation::from_file_path`
   parses as Hadoop convention with `1 <= K <= N`, and whose directory is the pointer's directory.
   The directory match ignores a leading `scheme://`, a `file:` or `memory:` prefix (r7, critic
-  V-005: `memory:/x` is a form `MemoryStorage` accepts) and leading `/`; no other `<x>:` prefix is
-  stripped, so a Windows drive letter such as `C:` survives. `FileInfo::location` is
+  V-005: `memory:/x` is a form `MemoryStorage` accepts) and leading `/` (C-7, mutations (p), (gg),
+  (hh)). No other `<x>:` prefix is stripped, so a Windows drive letter such as `C:` survives; this
+  is not pinned: every listed entry shares the pointer's prefix, so both sides of the comparison
+  normalize alike and no drop test can tell a generic strip apart (mutation (ff) stays green). Only
+  a unit test on `storage_path` inside `metadata_naming.rs` would pin it. `FileInfo::location` is
   storage-native, so local fs and memory storage list without the scheme the catalog wrote (C-7).
-  Then it deletes `version-hint.text`. `FileIO::delete` treats a missing file as success. The
+  Then it deletes `version-hint.text` (mutation (s)). `FileIO::delete` treats a missing file as
+  success (C-3, mutation (v)). The
   parser accepts gzip siblings (`vK.gz.metadata.json`, `vK.metadata.json.gz`), leading zeros
   (`v01`) and a leading `+` (`v+1`), so these go when K <= N; all four forms are pinned by name in C-5
   (r6 ruling: Java `Integer.parseInt` accepts a leading `+`, and `HadoopTableOperations` reads both
   gzip suffixes). Data files,
-  manifests, other names and the directories stay. r1 walked `1..=N` without listing, so a
+  manifests, other names and the directories stay (C-2, C-5; mutations (t) to (t4), (y) to (aa)).
+  The listing is recursive; that is a storage property
+  (`io/storage/local_fs_tests.rs` `test_list_returns_exact_recursive_file_set_with_sizes_and_times`),
+  and its consequence for the drop, that `metadata/sub/` is not touched, is C-5, mutation (b). r1 walked `1..=N` without listing, so a
   registered `v2000000000` never finished.
 - D-4 (r5 ruling, replaces the r2 walk fallback): when `list` fails with `FeatureUnsupported`,
   `drop_metadata` deletes no chain entry beyond the current file (already deleted) and then deletes
