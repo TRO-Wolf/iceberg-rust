@@ -994,3 +994,33 @@ async fn test_hadoop_rename_of_missing_source_is_refused_first() {
     assert_eq!(err.message(), "Cannot rename Hadoop tables");
     assert!(!catalog.table_exists(&renamed()).await.expect("exists"));
 }
+
+#[tokio::test]
+async fn hadoop_drop_then_recreate_starts_at_v1() {
+    let warehouse = TempDir::new().expect("tempdir");
+    let catalog = load_catalog(&warehouse, Some("hadoop"))
+        .await
+        .expect("load");
+    create(&catalog, HashMap::new()).await.expect("create");
+    commit_property(&catalog, "a").await;
+    let dropped = commit_property(&catalog, "b").await;
+    assert!(location(&dropped).ends_with("/metadata/v3.metadata.json"));
+    catalog.drop_table(&ident()).await.expect("drop");
+
+    let recreated = create(&catalog, HashMap::new()).await.expect("recreate");
+    assert!(
+        location(&recreated).ends_with("/metadata/v1.metadata.json"),
+        "{}",
+        location(&recreated)
+    );
+    let loaded = catalog.load_table(&ident()).await.expect("load");
+    assert_eq!(location(&loaded), location(&recreated));
+    assert_eq!(hint(&loaded), "1");
+    let committed = commit_property(&catalog, "c").await;
+    assert!(
+        location(&committed).ends_with("/metadata/v2.metadata.json"),
+        "{}",
+        location(&committed)
+    );
+    assert_eq!(hint(&committed), "2");
+}
