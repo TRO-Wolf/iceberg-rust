@@ -559,12 +559,25 @@ async fn hadoop_drop_of_huge_registered_version_without_listing_is_bounded() {
     let (catalog, counters) = counting_catalog(ListMode::Unsupported).await;
     let pointer = "v2000000000.metadata.json";
     register_hand_placed(&catalog, Path::new("/warehouse/registered"), pointer).await;
+    let dir = "/warehouse/registered/metadata";
+    catalog
+        .file_io
+        .new_output(format!("{dir}/version-hint.text"))
+        .expect("hint output")
+        .write(Bytes::from("2000000000"))
+        .await
+        .expect("hint");
+    assert!(file_exists(&catalog, dir, "version-hint.text").await);
     let (lists, deletes) = (counters.lists(), counters.deletes());
 
     catalog.drop_table(&ident()).await.expect("drop");
     assert_eq!(counters.deletes() - deletes, 2);
     assert_eq!(counters.lists() - lists, 1);
-    assert!(!file_exists(&catalog, "/warehouse/registered/metadata", pointer).await);
+    assert!(!file_exists(&catalog, dir, pointer).await, "{pointer}");
+    assert!(
+        !file_exists(&catalog, dir, "version-hint.text").await,
+        "version-hint.text"
+    );
     assert!(!catalog.table_exists(&ident()).await.expect("exists"));
 }
 
