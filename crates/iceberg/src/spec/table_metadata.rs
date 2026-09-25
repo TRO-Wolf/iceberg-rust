@@ -845,6 +845,8 @@ pub(super) mod _serde {
         pub metadata_log: Option<Vec<MetadataLog>>,
         pub sort_orders: Option<Vec<SortOrder>>,
         pub default_sort_order_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub refs: Option<HashMap<String, SnapshotReference>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub statistics: Vec<StatisticsFile>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1266,18 +1268,7 @@ pub(super) mod _serde {
                 default_sort_order_id: value
                     .default_sort_order_id
                     .unwrap_or(SortOrder::UNSORTED_ORDER_ID),
-                refs: if let Some(snapshot_id) = current_snapshot_id {
-                    HashMap::from_iter(vec![(MAIN_BRANCH.to_string(), SnapshotReference {
-                        snapshot_id,
-                        retention: SnapshotRetention::Branch {
-                            min_snapshots_to_keep: None,
-                            max_snapshot_age_ms: None,
-                            max_ref_age_ms: None,
-                        },
-                    })])
-                } else {
-                    HashMap::new()
-                },
+                refs: value.refs.unwrap_or_default(),
                 statistics: index_statistics(value.statistics),
                 partition_statistics: index_partition_statistics(value.partition_statistics),
                 encryption_keys: HashMap::new(),
@@ -1467,6 +1458,7 @@ pub(super) mod _serde {
                         .collect(),
                 ),
                 default_sort_order_id: Some(v.default_sort_order_id),
+                refs: Some(v.refs),
                 statistics: v.statistics.into_values().collect(),
                 partition_statistics: v.partition_statistics.into_values().collect(),
             })
@@ -4243,6 +4235,7 @@ mod tests {
     }
 
     include!("table_metadata_snapshot_order_test.rs");
+    include!("table_metadata_v1_refs_test.rs");
 
     #[test]
     fn test_v2_to_v3_upgrade_preserves_existing_snapshots_without_row_lineage() {
