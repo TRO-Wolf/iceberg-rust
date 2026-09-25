@@ -36,7 +36,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics;
 
-use super::{FileWriter, FileWriterBuilder};
+use super::{FileWriter, FileWriterBuilder, parquet_unknown};
 use crate::arrow::{
     ArrowFileReader, DEFAULT_MAP_FIELD_NAME, FieldMatchMode, NanValueCountVisitor,
     get_parquet_stat_max_as_datum, get_parquet_stat_min_as_datum, is_utc_time_zone,
@@ -105,12 +105,13 @@ impl FileWriterBuilder for ParquetWriterBuilder {
 
     async fn build(&self, output_file: OutputFile) -> Result<Self::R> {
         reject_variant_write(self.schema.as_ref())?;
-        reject_unknown_write(self.schema.as_ref())?;
         let collect_nan_value_counts =
             schema_needs_nan_value_counts(self.schema.as_ref(), &self.metrics_config);
         Ok(ParquetWriter {
             schema: self.schema.clone(),
-            writer_arrow_schema: Arc::new(self.schema.as_ref().try_into()?),
+            writer_arrow_schema: Arc::new(parquet_unknown::writer_arrow_schema(
+                self.schema.as_ref(),
+            )?),
             inner_writer: None,
             writer_options: self
                 .writer_options
@@ -120,6 +121,7 @@ impl FileWriterBuilder for ParquetWriterBuilder {
             output_file,
             nan_value_count_visitor: NanValueCountVisitor::new_with_match_mode(self.match_mode),
             collect_nan_value_counts,
+            strip_unknown_columns: parquet_unknown::schema_has_unknown(self.schema.as_ref()),
             metrics: MetricsByFieldId::new(self.schema.as_ref(), &self.metrics_config),
         })
     }
@@ -146,64 +148,6 @@ fn reject_variant_write(schema: &Schema) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Refuse writing a schema that contains Iceberg `unknown` at any depth.
-///
-/// # Errors
-///
-/// [`ErrorKind::FeatureUnsupported`] naming the dotted path to the first unknown found.
-fn reject_unknown_write(schema: &Schema) -> Result<()> {
-    for field in schema.as_struct().fields() {
-        if let Some(path) = unknown_path_within(&field.name, field.field_type.as_ref()) {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "Writing the unknown column '{path}' is not supported yet: unknown is always \
-                     null and has no physical column"
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn unknown_path_within(name: &str, ty: &Type) -> Option<String> {
-    fn walk(name: &str, ty: &Type, depth: usize) -> Option<String> {
-        if depth > crate::arrow::MAX_VARIANT_NESTING_DEPTH {
-            return None;
-        }
-        let next = depth + 1;
-        match ty {
-            Type::Primitive(PrimitiveType::Unknown) => Some(name.to_string()),
-            Type::Struct(struct_type) => struct_type.fields().iter().find_map(|nested| {
-                walk(
-                    &format!("{name}.{}", nested.name),
-                    nested.field_type.as_ref(),
-                    next,
-                )
-            }),
-            Type::List(list) => walk(
-                &format!("{name}.element"),
-                list.element_field.field_type.as_ref(),
-                next,
-            ),
-            Type::Map(map) => walk(
-                &format!("{name}.key"),
-                map.key_field.field_type.as_ref(),
-                next,
-            )
-            .or_else(|| {
-                walk(
-                    &format!("{name}.value"),
-                    map.value_field.field_type.as_ref(),
-                    next,
-                )
-            }),
-            Type::Primitive(_) | Type::Variant => None,
-        }
-    }
-    walk(name, ty, 0)
 }
 
 /// A mapping from Parquet column path names to internal field id
@@ -339,6 +283,7 @@ pub struct ParquetWriter {
     /// When false the write path skips the NaN visitor entirely (no float/double leaves under a
     /// counts-collecting metrics mode). Computed once in [`ParquetWriterBuilder::build`].
     collect_nan_value_counts: bool,
+    strip_unknown_columns: bool,
     metrics: MetricsByFieldId,
 }
 
@@ -640,6 +585,14 @@ impl FileWriter for ParquetWriter {
             self.nan_value_count_visitor
                 .compute(self.schema.clone(), batch)?;
         }
+
+        let projected;
+        let batch = if self.strip_unknown_columns {
+            projected = parquet_unknown::project_batch(batch, &self.writer_arrow_schema)?;
+            &projected
+        } else {
+            batch
+        };
 
         // Relabel a UTC-alias timezone to the writer schema. The Parquet schema check is
         // timezone-sensitive, so a historical `"+00:00"` batch needs it. The relabel reuses the
@@ -3340,4 +3293,9 @@ mod tests {
 #[cfg(test)]
 mod unsupported_write_refusal_tests {
     include!("parquet_writer_unsupported_tests.rs");
+}
+
+#[cfg(test)]
+mod unknown_column_write_tests {
+    include!("parquet_writer_unknown_tests.rs");
 }

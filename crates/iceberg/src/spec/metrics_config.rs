@@ -543,6 +543,12 @@ pub(crate) fn struct_descended_field_ids(schema: &Schema) -> HashSet<i32> {
     let mut stack: Vec<&StructType> = vec![schema.as_struct()];
     while let Some(struct_type) = stack.pop() {
         for field in struct_type.fields() {
+            if matches!(
+                field.field_type.as_ref(),
+                Type::Primitive(PrimitiveType::Unknown)
+            ) {
+                continue;
+            }
             out.insert(field.id);
             if let Type::Struct(inner) = field.field_type.as_ref() {
                 stack.push(inner);

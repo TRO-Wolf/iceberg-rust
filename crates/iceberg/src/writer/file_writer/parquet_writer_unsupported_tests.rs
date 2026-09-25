@@ -127,125 +127,29 @@ async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
     }
 }
 
-/// An `unknown`-bearing schema is refused at build, at every depth, with no file left behind.
 #[tokio::test]
-async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
-    for (label, unknown_field) in [
-        (
-            "top level",
-            NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)),
-        ),
-        (
-            "in a struct",
-            NestedField::optional(
-                2,
-                "u",
-                Type::Struct(StructType::new(vec![
-                    NestedField::optional(3, "inner", Type::Primitive(PrimitiveType::Unknown))
-                        .into(),
-                ])),
-            ),
-        ),
-        (
-            "in a list",
-            NestedField::optional(
-                2,
-                "u",
-                Type::List(ListType {
-                    element_field: NestedField::list_element(
-                        3,
-                        Type::Primitive(PrimitiveType::Unknown),
-                        true,
-                    )
-                    .into(),
-                }),
-            ),
-        ),
-        (
-            "as a map key",
-            NestedField::optional(
-                2,
-                "u",
-                Type::Map(MapType {
-                    key_field: NestedField::map_key_element(
-                        3,
-                        Type::Primitive(PrimitiveType::Unknown),
-                    )
-                    .into(),
-                    value_field: NestedField::map_value_element(
-                        4,
-                        Type::Primitive(PrimitiveType::String),
-                        true,
-                    )
-                    .into(),
-                }),
-            ),
-        ),
-        (
-            "as a map value",
-            NestedField::optional(
-                2,
-                "u",
-                Type::Map(MapType {
-                    key_field: NestedField::map_key_element(
-                        3,
-                        Type::Primitive(PrimitiveType::String),
-                    )
-                    .into(),
-                    value_field: NestedField::map_value_element(
-                        4,
-                        Type::Primitive(PrimitiveType::Unknown),
-                        true,
-                    )
-                    .into(),
-                }),
-            ),
-        ),
-    ] {
-        let schema = Arc::new(
-            Schema::builder()
-                .with_fields(vec![
-                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                    unknown_field.into(),
-                ])
-                .build()
-                .expect("schema"),
-        );
+async fn an_unknown_top_level_schema_builds_without_refusal() {
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)).into(),
+            ])
+            .build()
+            .expect("schema"),
+    );
 
-        let temp_dir = TempDir::new().expect("temp dir");
-        let file_io = FileIO::new_with_fs();
-        let path = temp_dir
-            .path()
-            .join("out.parquet")
-            .to_string_lossy()
-            .to_string();
-        let output = file_io.new_output(&path).expect("output file");
+    let temp_dir = TempDir::new().expect("temp dir");
+    let file_io = FileIO::new_with_fs();
+    let path = temp_dir
+        .path()
+        .join("out.parquet")
+        .to_string_lossy()
+        .to_string();
+    let output = file_io.new_output(&path).expect("output file");
 
-        let error = match ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
-            .build(output)
-            .await
-        {
-            Ok(_) => panic!("an unknown schema must be refused at BUILD time ({label})"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.kind(),
-            ErrorKind::FeatureUnsupported,
-            "unknown {label} must be refused"
-        );
-        assert!(
-            error.message().contains("Writing the unknown column"),
-            "the error must name the unknown write refusal for {label}, got: {}",
-            error.message()
-        );
-        assert!(
-            error.message().contains("unknown"),
-            "the error must name the type for {label}, got: {}",
-            error.message()
-        );
-        assert!(
-            !std::path::Path::new(&path).exists(),
-            "refusing at build time must leave NO file behind for {label}"
-        );
-    }
+    ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+        .build(output)
+        .await
+        .expect("an unknown schema must build without refusal");
 }
