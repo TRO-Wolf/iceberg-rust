@@ -16,9 +16,6 @@
 // under the License.
 
 //! Fresh field-id (re)assignment ported from Java `TypeUtil` / `AssignFreshIds`.
-//!
-//! `assign_fresh_ids_with_base` and `reassign_doc` have no in-tree caller yet. The create-table
-//! and metadata-join consumers will wire them.
 
 use std::cell::Cell;
 

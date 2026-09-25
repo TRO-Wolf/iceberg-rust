@@ -720,7 +720,7 @@ pub(super) mod _serde {
     /// Deserialization reads the input into [TableMetadataV1] or [TableMetadataV2] and then
     /// converts it into [TableMetadata]. Serialization runs the other way. Both structs are
     /// internal to this module.
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use serde::{Deserialize, Serialize};
@@ -1338,21 +1338,9 @@ pub(super) mod _serde {
                 last_sequence_number: v.last_sequence_number,
                 last_updated_ms: v.last_updated_ms,
                 last_column_id: v.last_column_id,
-                schemas: v
-                    .schemas
-                    .into_values()
-                    .map(|x| {
-                        Arc::try_unwrap(x)
-                            .unwrap_or_else(|schema| schema.as_ref().clone())
-                            .into()
-                    })
-                    .collect(),
+                schemas: in_id_order(v.schemas).map(Into::into).collect(),
                 current_schema_id: v.current_schema_id,
-                partition_specs: v
-                    .partition_specs
-                    .into_values()
-                    .map(|x| Arc::try_unwrap(x).unwrap_or_else(|s| s.as_ref().clone()))
-                    .collect(),
+                partition_specs: in_id_order(v.partition_specs).collect(),
                 default_spec_id: v.default_spec.spec_id(),
                 last_partition_id: v.last_partition_id,
                 properties: if v.properties.is_empty() {
@@ -1371,11 +1359,7 @@ pub(super) mod _serde {
                 } else {
                     Some(v.metadata_log)
                 },
-                sort_orders: v
-                    .sort_orders
-                    .into_values()
-                    .map(|x| Arc::try_unwrap(x).unwrap_or_else(|s| s.as_ref().clone()))
-                    .collect(),
+                sort_orders: in_id_order(v.sort_orders).collect(),
                 default_sort_order_id: v.default_sort_order_id,
                 refs: Some(v.refs),
                 statistics: v.statistics.into_values().collect(),
@@ -1387,6 +1371,13 @@ pub(super) mod _serde {
     pub(super) fn sort_snapshots(mut snapshots: Vec<Arc<Snapshot>>) -> Vec<Arc<Snapshot>> {
         snapshots.sort_by_key(|s| (s.sequence_number(), s.timestamp_ms(), s.snapshot_id()));
         snapshots
+    }
+
+    fn in_id_order<K: Ord, V: Clone>(map: HashMap<K, Arc<V>>) -> impl Iterator<Item = V> {
+        map.into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .map(Arc::unwrap_or_clone)
     }
 
     impl TryFrom<TableMetadata> for TableMetadataV1 {
@@ -1409,24 +1400,10 @@ pub(super) mod _serde {
                         .clone()
                         .into(),
                 ),
-                schemas: Some(
-                    v.schemas
-                        .into_values()
-                        .map(|x| {
-                            Arc::try_unwrap(x)
-                                .unwrap_or_else(|schema| schema.as_ref().clone())
-                                .into()
-                        })
-                        .collect(),
-                ),
+                schemas: Some(in_id_order(v.schemas).map(Into::into).collect()),
                 current_schema_id: Some(v.current_schema_id),
                 partition_spec: Some(v.default_spec.fields().to_vec()),
-                partition_specs: Some(
-                    v.partition_specs
-                        .into_values()
-                        .map(|x| Arc::try_unwrap(x).unwrap_or_else(|s| s.as_ref().clone()))
-                        .collect(),
-                ),
+                partition_specs: Some(in_id_order(v.partition_specs).collect()),
                 default_spec_id: Some(v.default_spec.spec_id()),
                 last_partition_id: Some(v.last_partition_id),
                 properties: if v.properties.is_empty() {
@@ -1451,12 +1428,7 @@ pub(super) mod _serde {
                 } else {
                     Some(v.metadata_log)
                 },
-                sort_orders: Some(
-                    v.sort_orders
-                        .into_values()
-                        .map(|s| Arc::try_unwrap(s).unwrap_or_else(|s| s.as_ref().clone()))
-                        .collect(),
-                ),
+                sort_orders: Some(in_id_order(v.sort_orders).collect()),
                 default_sort_order_id: Some(v.default_sort_order_id),
                 refs: Some(v.refs),
                 statistics: v.statistics.into_values().collect(),
@@ -4236,6 +4208,7 @@ mod tests {
 
     include!("table_metadata_snapshot_order_test.rs");
     include!("table_metadata_v1_refs_test.rs");
+    include!("table_metadata_list_order_test.rs");
 
     #[test]
     fn test_v2_to_v3_upgrade_preserves_existing_snapshots_without_row_lineage() {
