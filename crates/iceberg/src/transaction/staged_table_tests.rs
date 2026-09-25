@@ -47,8 +47,6 @@ fn schema_id_name() -> Schema {
         .unwrap()
 }
 
-/// A genuinely different column set from [`schema_id_name`] with high, caller-chosen field-ids
-/// (50/51) — used to prove that replace takes the caller's ids AS-IS (D5).
 fn schema_sku_price() -> Schema {
     Schema::builder()
         .with_fields(vec![
@@ -702,12 +700,7 @@ async fn replace_downgrade_attempt_errors_and_keeps_original() {
 }
 
 #[tokio::test]
-async fn replace_with_different_schema_keeps_caller_ids() {
-    // D5: replace takes the caller's schema field-ids AS-IS (NOT Java's name-based
-    // `assignFreshIds`); `last_column_id` only advances monotonically (max, never reduced below
-    // the base). A replace with a genuinely different column set pins that the caller ids survive
-    // verbatim in the published current schema, and pre-replace snapshots stay readable via their
-    // own schema (per-snapshot schema binding).
+async fn replace_with_different_schema_assigns_fresh_ids_above_last_column_id() {
     let tmp = TempDir::new().unwrap();
     let warehouse = tmp.path().to_string_lossy().to_string();
     let (catalog, _) = shared_fs_catalog(&warehouse).await;
@@ -726,7 +719,6 @@ async fn replace_with_different_schema_keeps_caller_ids() {
         .await
         .unwrap();
 
-    // Replace 1: establish snapshot S1 under the id/name schema.
     StagedTableTransaction::begin_replace(
         &original,
         TableCreation::builder()
@@ -751,7 +743,6 @@ async fn replace_with_different_schema_keeps_caller_ids() {
     let s1 = s1_snapshot.snapshot_id();
     let s1_schema_id = s1_snapshot.schema_id();
 
-    // Replace 2: a genuinely DIFFERENT column set with high, caller-chosen ids (50/51).
     let published = StagedTableTransaction::begin_replace(
         &after1,
         TableCreation::builder()
@@ -769,25 +760,13 @@ async fn replace_with_different_schema_keeps_caller_ids() {
     .await
     .unwrap();
 
-    // Caller ids preserved AS-IS in the published current schema (no name-based reassignment).
     let current = published.metadata().current_schema();
-    assert!(
-        current.field_by_id(50).is_some_and(|f| f.name == "sku"),
-        "caller id 50 (sku) was not preserved as-is"
-    );
-    assert!(
-        current.field_by_id(51).is_some_and(|f| f.name == "price"),
-        "caller id 51 (price) was not preserved as-is"
-    );
-    // The genuinely different column set: base ids 1/2 are not part of the new current schema.
+    assert!(current.field_by_id(3).is_some_and(|f| f.name == "sku"));
+    assert!(current.field_by_id(4).is_some_and(|f| f.name == "price"));
+    assert!(current.field_by_id(50).is_none() && current.field_by_id(51).is_none());
     assert!(current.field_by_id(1).is_none() && current.field_by_id(2).is_none());
 
-    // last_column_id advanced to the caller's highest id, never reduced below the base.
-    assert_eq!(
-        published.metadata().last_column_id(),
-        51,
-        "last_column_id must advance to the caller's max field-id"
-    );
+    assert_eq!(published.metadata().last_column_id(), 4);
     assert!(published.metadata().last_column_id() >= after1.metadata().last_column_id());
 
     // Pre-replace snapshot S1 survives AND is still readable via its OWN schema (id/name),

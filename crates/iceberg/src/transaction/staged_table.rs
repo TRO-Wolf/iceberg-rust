@@ -25,18 +25,6 @@
 //! A published replace keeps the table's existing root location — it never relocates the
 //! table, so repeated CREATE OR REPLACE cycles do not drift the location.
 //!
-//! A **replace** is built ON TOP OF the existing table's metadata (Java
-//! `TableMetadata.buildReplacement`), not from scratch: it **retains** the table UUID, the full
-//! snapshot history, and the metadata log (appended-to, never truncated), while **resetting** what
-//! a replace replaces — the `main` branch ref is removed (no current snapshot) and the schema /
-//! partition spec / sort order / properties / location from the `TableCreation` become the new
-//! current ones. The replace-schema field-ids are taken **from the caller as provided**;
-//! `last_column_id` only advances monotonically (`max` of the existing value and the caller's
-//! highest field-id, never reduced). This diverges from Java's `TypeUtil.assignFreshIds`, which
-//! reassigns fresh ids by **name-matching** the replacement schema against the base schema — a
-//! caller supplying field-ids misaligned with the base schema's names diverges from Java (named
-//! residue: a base-aware fresh-id helper is the follow-up). This is not corruption: per-snapshot
-//! schema binding keeps prior history readable via each snapshot's own schema-id.
 //! The format version is **preserved** across a replace unless the `TableCreation`'s properties
 //! carry an explicit `format-version` directive requesting an upgrade; it is never downgraded.
 //! Retaining the history keeps time-travel raw material intact while the `main` branch exposes only
@@ -50,7 +38,9 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::expr::Predicate;
 use crate::io::FileIO;
 use crate::spec::{
-    DataFile, FormatVersion, MAIN_BRANCH, SortOrder, TableMetadataBuilder, TableProperties,
+    DataFile, FormatVersion, MAIN_BRANCH, Schema, SortField, SortOrder, TableMetadata,
+    TableMetadataBuilder, TableProperties, UnboundPartitionField, UnboundPartitionSpec,
+    assign_fresh_ids_with_base,
 };
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -125,16 +115,6 @@ impl StagedTableTransaction {
     }
 
     /// Begin a **replace** transaction against an existing catalog table.
-    ///
-    /// Builds the replacement metadata ON TOP OF the existing table's metadata (Java
-    /// `TableMetadata.buildReplacement`), keeping the table's **existing root location** (or the
-    /// caller-provided `creation.location`). The table UUID, snapshot history, and metadata log are
-    /// **retained** (the log is appended-to, never truncated); the `main` branch ref is **reset**
-    /// (no current snapshot) and the `TableCreation`'s schema / partition spec / sort order /
-    /// properties / location become the new current ones. The replace-schema field-ids are taken
-    /// **from the caller as provided** and `last_column_id` only advances monotonically (never
-    /// reduced below the base); this differs from Java's name-matching `TypeUtil.assignFreshIds`
-    /// (named residue).
     ///
     /// **Format version is preserved.** `creation.format_version` is **IGNORED** on the replace
     /// path — it is indistinguishable from `TableCreation::builder()`'s V2 default, so honoring it
@@ -211,8 +191,12 @@ impl StagedTableTransaction {
                 None => previous_format_version,
                 Some(raw) => parse_format_version_property(&raw)?,
             };
-        let partition_spec = partition_spec.unwrap_or_default();
-        let sort_order = sort_order.unwrap_or_else(SortOrder::unsorted_order);
+        let (schema, partition_spec, sort_order) = fresh_replacement(
+            &previous,
+            &schema,
+            partition_spec.unwrap_or_default(),
+            sort_order.unwrap_or_else(SortOrder::unsorted_order),
+        )?;
 
         let metadata =
             TableMetadataBuilder::new_from_metadata(previous, Some(base_metadata_location.clone()))
@@ -403,6 +387,63 @@ fn parse_format_version_property(raw: &str) -> Result<FormatVersion> {
     }
 }
 
+fn fresh_replacement(
+    previous: &TableMetadata,
+    schema: &Schema,
+    partition_spec: UnboundPartitionSpec,
+    sort_order: SortOrder,
+) -> Result<(Schema, UnboundPartitionSpec, SortOrder)> {
+    let mut last_column_id = previous.last_column_id();
+    let mut next_id = || -> Result<i32> {
+        last_column_id = last_column_id.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Field ID overflowed, cannot add more fields",
+            )
+        })?;
+        Ok(last_column_id)
+    };
+    let fresh = assign_fresh_ids_with_base(schema, previous.current_schema(), &mut next_id)?;
+    let rebind = |source_id: i32| -> Result<i32> {
+        schema
+            .name_by_field_id(source_id)
+            .and_then(|name| fresh.field_id_by_name(name))
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Cannot find source column {source_id} in the replacement schema"),
+                )
+            })
+    };
+    let partition_spec = UnboundPartitionSpec {
+        spec_id: partition_spec.spec_id,
+        fields: partition_spec
+            .fields
+            .into_iter()
+            .map(|field| {
+                Ok(UnboundPartitionField {
+                    source_id: rebind(field.source_id)?,
+                    ..field
+                })
+            })
+            .collect::<Result<_>>()?,
+    };
+    let sort_order = SortOrder {
+        order_id: sort_order.order_id,
+        fields: sort_order
+            .fields
+            .into_iter()
+            .map(|field| {
+                Ok(SortField {
+                    source_id: rebind(field.source_id)?,
+                    ..field
+                })
+            })
+            .collect::<Result<_>>()?,
+    };
+    Ok((fresh, partition_spec, sort_order))
+}
+
 fn hadoop_staged_location(metadata_location: &str) -> bool {
     MetadataLocation::from_file_path(metadata_location)
         .is_ok_and(|parsed| parsed.is_hadoop_convention())
@@ -448,6 +489,10 @@ mod rtas_ops_tests;
 #[cfg(test)]
 #[path = "staged_table_tests.rs"]
 mod staged_tests;
+
+#[cfg(test)]
+#[path = "staged_table_fresh_ids_tests.rs"]
+mod fresh_ids_tests;
 
 #[cfg(test)]
 mod tests {

@@ -442,12 +442,14 @@ the existing table's metadata (Java `TableMetadata.buildReplacement`), not from 
 **retains** the table UUID, the full snapshot history, and the metadata log (appended-to, never
 truncated); it **resets** the `main` branch ref (no current snapshot) and applies the
 `TableCreation`'s schema / partition spec / sort order / properties / location as the new current
-ones. The replace-schema field-ids are taken **from the caller as provided**; `last_column_id`
-advances monotonically (`max` of the existing value and the caller's highest id, never reduced).
-This diverges from Java `TypeUtil.assignFreshIds`, which reassigns fresh ids by **name-matching**
-the replacement schema against the base schema — a caller supplying field-ids misaligned with the
-base schema's names diverges from Java (**named residue**: a base-aware fresh-id helper is the
-follow-up; not corruption — per-snapshot schema binding keeps prior history readable). The format
+ones. The replace-schema field-ids are **reassigned by name** exactly as Java
+`TypeUtil.assignFreshIds(updatedSchema, schema(), newLastColumnId::incrementAndGet)` does: a column
+whose full dotted name exists in the current schema keeps that id, every other column takes the next
+id above `last-column-id`, so a dropped id is never reused; the caller's ids only identify columns
+within its own schema. The partition spec and sort order are rebound by source-column name to the
+fresh schema (Java `freshSpec` / `freshSortOrder`); a source id absent from the caller's schema is
+`DataInvalid`. A caller that already passes by-name ids gets them back unchanged (F-REPLACE-IDS-1,
+pins `staged_table_fresh_ids_tests.rs`). The format
 version is **preserved** across a replace unless the `TableCreation`'s properties carry an explicit
 `format-version` directive: absent ⇒ keep the existing version; a higher value ⇒ upgrade; equal ⇒
 no-op; a lower value ⇒ hard `DataInvalid` error (never downgraded); unparsable ⇒ hard `DataInvalid`.
