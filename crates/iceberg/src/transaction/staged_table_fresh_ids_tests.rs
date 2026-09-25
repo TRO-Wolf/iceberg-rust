@@ -267,6 +267,37 @@ async fn replace_rejects_a_partition_source_missing_from_the_replacement_schema(
 }
 
 #[tokio::test]
+async fn replace_rejects_a_sort_source_missing_from_the_replacement_schema() {
+    let tmp = TempDir::new().unwrap();
+    let base = schema(vec![long(1, "id"), long(2, "name")]);
+    let (_catalog, table) = table_with(&tmp, replacement(base)).await;
+
+    let order = SortOrder::builder()
+        .with_sort_field(SortField {
+            source_id: 9,
+            transform: Transform::Identity,
+            direction: SortDirection::Ascending,
+            null_order: NullOrder::First,
+        })
+        .build_unbound()
+        .unwrap();
+    let creation = TableCreation {
+        sort_order: Some(order),
+        ..replacement(schema(vec![long(1, "id"), long(2, "name")]))
+    };
+    let err = match StagedTableTransaction::begin_replace(&table, creation).await {
+        Ok(_) => panic!("a sort source outside the replacement schema must fail"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    assert!(
+        err.message()
+            .contains("Cannot find source column 9 in the replacement schema"),
+        "the rebind arm must reject the sort source, got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn replace_keeps_identifier_fields_by_name() {
     let tmp = TempDir::new().unwrap();
     let base = Schema::builder()
@@ -285,6 +316,32 @@ async fn replace_keeps_identifier_fields_by_name() {
 
     assert_eq!(fresh.identifier_field_ids().collect::<Vec<_>>(), vec![1]);
     assert_eq!(id_of(&fresh, "id"), Some(1));
+}
+
+#[tokio::test]
+async fn replace_identifier_fields_come_from_the_replacement_not_the_base() {
+    let tmp = TempDir::new().unwrap();
+    let base = Schema::builder()
+        .with_fields(vec![Arc::new(long(1, "id")), Arc::new(long(2, "name"))])
+        .with_identifier_field_ids(vec![1])
+        .build()
+        .unwrap();
+    let (_catalog, table) = table_with(&tmp, replacement(base)).await;
+
+    let keyed_by_name = Schema::builder()
+        .with_fields(vec![Arc::new(long(1, "id")), Arc::new(long(2, "name"))])
+        .with_identifier_field_ids(vec![2])
+        .build()
+        .unwrap();
+    let (fresh, _) = staged_schema(&table, replacement(keyed_by_name)).await;
+
+    assert_eq!(id_of(&fresh, "name"), Some(2));
+    assert_eq!(fresh.identifier_field_ids().collect::<Vec<_>>(), vec![2]);
+
+    let unkeyed = schema(vec![long(1, "id"), long(2, "name")]);
+    let (fresh, _) = staged_schema(&table, replacement(unkeyed)).await;
+
+    assert_eq!(fresh.identifier_field_ids().count(), 0);
 }
 
 #[tokio::test]
