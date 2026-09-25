@@ -698,6 +698,7 @@ fn test_get_batch_stream_clamps_zero_knobs_at_apply() {
         target_partitions: 1,
         multi_partition_scan: true,
         row_selection_enabled: true,
+        uuid_as_string: false,
     };
     let effective_batch = knobs.batch_size.map(clamp_scan_knob);
     let effective_conc = knobs.data_file_concurrency.map(clamp_scan_knob);
@@ -830,6 +831,7 @@ async fn test_pin2_execute_out_of_range_multipath() {
         target_partitions: 4,
         multi_partition_scan: true,
         row_selection_enabled: true,
+        uuid_as_string: false,
     };
     let scan = IcebergTableScan::plan(
         table,

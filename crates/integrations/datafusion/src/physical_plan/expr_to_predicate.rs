@@ -618,6 +618,10 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::Float64(Some(v)) => Some(Datum::double(*v)),
         ScalarValue::Utf8(Some(v)) => Some(Datum::string(v.clone())),
         ScalarValue::LargeUtf8(Some(v)) => Some(Datum::string(v.clone())),
+        ScalarValue::FixedSizeBinary(16, Some(v)) => {
+            let bytes: [u8; 16] = v.clone().try_into().ok()?;
+            Some(Datum::uuid(uuid::Uuid::from_bytes(bytes)))
+        }
         ScalarValue::Binary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),

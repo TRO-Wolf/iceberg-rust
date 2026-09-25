@@ -29,11 +29,18 @@ use crate::error::to_datafusion_error;
 
 impl IcebergTableProvider {
     pub(crate) fn from_planning_load(catalog: Arc<dyn Catalog>, table: Table) -> Result<Self> {
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let ice_schema = table.metadata().current_schema();
+        let schema = Arc::new(schema_to_arrow_schema(ice_schema)?);
+        let uuid_text_schema = Arc::new(super::uuid_text::arrow_schema_with_uuid_as_text(
+            &schema,
+            &super::uuid_text::collect_uuid_field_ids(ice_schema),
+        ));
         Ok(IcebergTableProvider {
             catalog,
             table_ident: table.identifier().clone(),
             schema,
+            uuid_text_schema,
+            uuid_as_string: false,
             commit_branch: None,
             stage_only: false,
             snapshot_properties: HashMap::new(),

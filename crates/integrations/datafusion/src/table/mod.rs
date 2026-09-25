@@ -26,6 +26,7 @@ mod loaded;
 pub mod metadata_table;
 mod static_provider;
 pub mod table_provider_factory;
+pub(crate) mod uuid_text;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -71,6 +72,8 @@ pub struct IcebergTableProvider {
     pub(crate) table_ident: TableIdent,
     /// FIXED for the life of the instance: DataFusion stores ordinals against it.
     pub(crate) schema: ArrowSchemaRef,
+    pub(crate) uuid_text_schema: ArrowSchemaRef,
+    pub(crate) uuid_as_string: bool,
     pub(crate) commit_branch: Option<String>,
     pub(crate) stage_only: bool,
     pub(crate) snapshot_properties: HashMap<String, String>,
@@ -87,12 +90,19 @@ impl IcebergTableProvider {
     ) -> Result<Self> {
         let table_ident = TableIdent::new(namespace, name.into());
         let table = catalog.load_table(&table_ident).await?;
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+        let ice_schema = table.metadata().current_schema();
+        let schema = Arc::new(schema_to_arrow_schema(ice_schema)?);
+        let uuid_text_schema = Arc::new(uuid_text::arrow_schema_with_uuid_as_text(
+            &schema,
+            &uuid_text::collect_uuid_field_ids(ice_schema),
+        ));
 
         Ok(IcebergTableProvider {
             catalog,
             table_ident,
             schema,
+            uuid_text_schema,
+            uuid_as_string: false,
             commit_branch: None,
             stage_only: false,
             snapshot_properties: HashMap::new(),
@@ -106,16 +116,29 @@ impl IcebergTableProvider {
     /// [`crate::IcebergCatalogProvider`] never needs it: each query resolves a fresh provider.
     pub async fn refreshed(&self) -> Result<Self> {
         let table = self.catalog.load_table(&self.table_ident).await?;
+        let ice_schema = table.metadata().current_schema();
+        let schema = Arc::new(schema_to_arrow_schema(ice_schema)?);
+        let uuid_text_schema = Arc::new(uuid_text::arrow_schema_with_uuid_as_text(
+            &schema,
+            &uuid_text::collect_uuid_field_ids(ice_schema),
+        ));
         Ok(IcebergTableProvider {
             catalog: self.catalog.clone(),
             table_ident: self.table_ident.clone(),
-            schema: Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?),
+            schema,
+            uuid_text_schema,
+            uuid_as_string: self.uuid_as_string,
             commit_branch: self.commit_branch.clone(),
             stage_only: self.stage_only,
             snapshot_properties: self.snapshot_properties.clone(),
             planning_table: None,
             output_spec_id: self.output_spec_id,
         })
+    }
+
+    pub fn with_uuid_as_string(mut self, enabled: bool) -> Self {
+        self.uuid_as_string = enabled;
+        self
     }
 
     /// Scan and commit snapshot-producing DML against `branch` instead of `main`. Java `SnapshotUpdate.toBranch`.
@@ -152,7 +175,11 @@ impl IcebergTableProvider {
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        Arc::new(strip_nested_metadata_from_schema(&self.schema))
+        if self.uuid_as_string {
+            Arc::new(strip_nested_metadata_from_schema(&self.uuid_text_schema))
+        } else {
+            Arc::new(strip_nested_metadata_from_schema(&self.schema))
+        }
     }
 
     fn table_type(&self) -> TableType {
@@ -178,7 +205,19 @@ impl TableProvider for IcebergTableProvider {
                 .snapshot_ref(name)
                 .is_some_and(|reference| reference.is_branch()),
         };
-        let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
+        let mut knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
+        knobs.uuid_as_string = self.uuid_as_string;
+        let rewritten;
+        let filters: &[Expr] = if self.uuid_as_string {
+            rewritten = uuid_text::rewrite_uuid_text_filters(
+                filters,
+                table.metadata().current_schema(),
+                false,
+            );
+            &rewritten
+        } else {
+            filters
+        };
         Ok(Arc::new(
             IcebergTableScan::plan(
                 table,
@@ -213,6 +252,15 @@ impl TableProvider for IcebergTableProvider {
             .load_table_with_current_schema()
             .await
             .map_err(to_datafusion_error)?;
+
+        let input: Arc<dyn ExecutionPlan> = if self.uuid_as_string {
+            Arc::new(uuid_text::UuidTextToBytesExec::new(
+                input,
+                current_schema.clone(),
+            ))
+        } else {
+            input
+        };
 
         let output_spec = iceberg::writer::resolve_output_spec(&table, self.output_spec_id)
             .map_err(to_datafusion_error)?;
@@ -274,6 +322,11 @@ impl TableProvider for IcebergTableProvider {
         let output_spec = iceberg::writer::resolve_output_spec(&table, self.output_spec_id)
             .map_err(to_datafusion_error)?;
 
+        let filters = if self.uuid_as_string {
+            uuid_text::rewrite_uuid_text_filters(&filters, table.metadata().current_schema(), true)
+        } else {
+            filters
+        };
         // Exact PhysicalExpr is the row contract. Iceberg gets prune-only.
         let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
         let predicate = match filters.into_iter().reduce(Expr::and) {
@@ -314,6 +367,11 @@ impl TableProvider for IcebergTableProvider {
 
         let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
 
+        let filters = if self.uuid_as_string {
+            uuid_text::rewrite_uuid_text_filters(&filters, table.metadata().current_schema(), true)
+        } else {
+            filters
+        };
         let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
         let predicate = match filters.into_iter().reduce(Expr::and) {
             None => None,
@@ -327,6 +385,16 @@ impl TableProvider for IcebergTableProvider {
                     "UPDATE assignment to unknown column '{column}': {e}"
                 ))
             })?;
+            let expr = if self.uuid_as_string {
+                match table.metadata().current_schema().field_by_name(&column) {
+                    Some(field) => {
+                        uuid_text::rewrite_uuid_text_assignment(expr, &field.field_type)?
+                    }
+                    None => expr,
+                }
+            } else {
+                expr
+            };
             let value = state.create_physical_expr(expr, &df_schema)?;
             physical_assignments.push((col_idx, value));
         }
@@ -355,3 +423,5 @@ mod output_spec_id_tests;
 mod schema_evo_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod uuid_as_string_tests;

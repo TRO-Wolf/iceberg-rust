@@ -56,6 +56,7 @@ fn test_pin13_effective_t_with_off_switch() {
         target_partitions: 8,
         multi_partition_scan: false,
         row_selection_enabled: true,
+        uuid_as_string: false,
     };
     let t = if knobs.multi_partition_scan {
         knobs.target_partitions.max(1)
@@ -97,6 +98,7 @@ async fn test_pin12_snapshot_frozen_on_work() {
         target_partitions: 1,
         multi_partition_scan: true,
         row_selection_enabled: true,
+        uuid_as_string: false,
     };
     let scan = IcebergTableScan::plan(
         table,
