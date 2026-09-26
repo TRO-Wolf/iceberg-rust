@@ -173,7 +173,11 @@ fn uuid_text_helpers_reject_non_hyphenated_and_bad_hex() {
     assert!(parse_uuid_text("123e4567e89b12d3a456426614174000").is_err());
     assert!(parse_uuid_text("not-a-uuid").is_err());
     assert!(parse_uuid_text("123e4567-e89b-12d3-a456-42661417400z").is_err());
-    assert!(parse_uuid_text("123e4567-e89b-12d3-a456-42661417400").is_err());
+    assert_eq!(
+        parse_uuid_text("123e4567-e89b-12d3-a456-42661417400")
+            .map(|bytes| render_uuid_text(&bytes)),
+        Ok("123e4567-e89b-12d3-a456-042661417400".to_string())
+    );
     assert!(is_canonical_uuid_text(U1));
     assert!(!is_canonical_uuid_text(U1_UPPER));
     assert!(!is_canonical_uuid_text("not-a-uuid"));

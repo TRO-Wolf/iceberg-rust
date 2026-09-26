@@ -27,6 +27,8 @@ pub mod metadata_table;
 mod static_provider;
 pub mod table_provider_factory;
 pub(crate) mod uuid_text;
+mod uuid_text_expr;
+mod uuid_text_filters;
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -209,10 +211,9 @@ impl TableProvider for IcebergTableProvider {
         knobs.uuid_as_string = self.uuid_as_string;
         let rewritten;
         let filters: &[Expr] = if self.uuid_as_string {
-            rewritten = uuid_text::rewrite_uuid_text_filters(
+            rewritten = uuid_text_filters::rewrite_uuid_text_filters(
                 filters,
                 table.metadata().current_schema(),
-                false,
             );
             &rewritten
         } else {
@@ -322,19 +323,34 @@ impl TableProvider for IcebergTableProvider {
         let output_spec = iceberg::writer::resolve_output_spec(&table, self.output_spec_id)
             .map_err(to_datafusion_error)?;
 
-        let filters = if self.uuid_as_string {
-            uuid_text::rewrite_uuid_text_filters(&filters, table.metadata().current_schema(), true)
+        let ice_schema = table.metadata().current_schema();
+        let (prune, predicate) = if self.uuid_as_string {
+            uuid_text_filters::refuse_unbindable_uuid_delete_filters(&filters, ice_schema)?;
+            let prune = convert_filters_to_predicate(
+                &uuid_text_filters::rewrite_uuid_text_filters(&filters, ice_schema),
+                ice_schema,
+            );
+            let text_schema = uuid_text_expr::uuid_text_schema(&current_schema, ice_schema);
+            let predicate = match filters.into_iter().reduce(Expr::and) {
+                None => None,
+                Some(combined) => Some(uuid_text_expr::uuid_text_expr(
+                    uuid_text_expr::text_physical_expr(state, combined, &text_schema)?,
+                    &text_schema,
+                    None,
+                    None,
+                )),
+            };
+            (prune, predicate)
         } else {
-            filters
-        };
-        // Exact PhysicalExpr is the row contract. Iceberg gets prune-only.
-        let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
-        let predicate = match filters.into_iter().reduce(Expr::and) {
-            None => None,
-            Some(combined) => {
-                let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
-                Some(state.create_physical_expr(combined, &df_schema)?)
-            }
+            let prune = convert_filters_to_predicate(&filters, ice_schema);
+            let predicate = match filters.into_iter().reduce(Expr::and) {
+                None => None,
+                Some(combined) => {
+                    let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
+                    Some(state.create_physical_expr(combined, &df_schema)?)
+                }
+            };
+            (prune, predicate)
         };
 
         Ok(Arc::new(IcebergDeleteExec::new(
@@ -367,15 +383,31 @@ impl TableProvider for IcebergTableProvider {
 
         let df_schema = DFSchema::try_from(current_schema.as_ref().clone())?;
 
-        let filters = if self.uuid_as_string {
-            uuid_text::rewrite_uuid_text_filters(&filters, table.metadata().current_schema(), true)
-        } else {
-            filters
+        let ice_schema = table.metadata().current_schema();
+        let text_schema = self
+            .uuid_as_string
+            .then(|| uuid_text_expr::uuid_text_schema(&current_schema, ice_schema));
+        let prune = match &text_schema {
+            Some(_) => convert_filters_to_predicate(
+                &uuid_text_filters::rewrite_uuid_text_filters(&filters, ice_schema),
+                ice_schema,
+            ),
+            None => convert_filters_to_predicate(&filters, ice_schema),
         };
-        let prune = convert_filters_to_predicate(&filters, table.metadata().current_schema());
-        let predicate = match filters.into_iter().reduce(Expr::and) {
-            None => None,
-            Some(combined) => Some(state.create_physical_expr(combined, &df_schema)?),
+        let text_filter = match (filters.iter().cloned().reduce(Expr::and), &text_schema) {
+            (Some(combined), Some(text_schema)) => Some(uuid_text_expr::text_physical_expr(
+                state,
+                combined,
+                text_schema,
+            )?),
+            _ => None,
+        };
+        let predicate = match (filters.into_iter().reduce(Expr::and), &text_schema) {
+            (None, _) => None,
+            (Some(_), Some(text_schema)) => text_filter
+                .clone()
+                .map(|inner| uuid_text_expr::uuid_text_expr(inner, text_schema, None, None)),
+            (Some(combined), None) => Some(state.create_physical_expr(combined, &df_schema)?),
         };
 
         let mut physical_assignments = Vec::with_capacity(assignments.len());
@@ -385,17 +417,19 @@ impl TableProvider for IcebergTableProvider {
                     "UPDATE assignment to unknown column '{column}': {e}"
                 ))
             })?;
-            let expr = if self.uuid_as_string {
-                match table.metadata().current_schema().field_by_name(&column) {
-                    Some(field) => {
-                        uuid_text::rewrite_uuid_text_assignment(expr, &field.field_type)?
-                    }
-                    None => expr,
+            let value = match &text_schema {
+                Some(text_schema) => {
+                    let byte_type = current_schema.field(col_idx).data_type();
+                    let changed = text_schema.field(col_idx).data_type() != byte_type;
+                    uuid_text_expr::uuid_text_expr(
+                        uuid_text_expr::text_physical_expr(state, expr, text_schema)?,
+                        text_schema,
+                        changed.then(|| byte_type.clone()),
+                        text_filter.clone(),
+                    )
                 }
-            } else {
-                expr
+                None => state.create_physical_expr(expr, &df_schema)?,
             };
-            let value = state.create_physical_expr(expr, &df_schema)?;
             physical_assignments.push((col_idx, value));
         }
 
@@ -423,5 +457,7 @@ mod output_spec_id_tests;
 mod schema_evo_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod uuid_as_string_dml_tests;
 #[cfg(test)]
 mod uuid_as_string_tests;

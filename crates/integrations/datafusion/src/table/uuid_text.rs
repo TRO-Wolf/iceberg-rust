@@ -28,15 +28,12 @@ use datafusion::arrow::datatypes::{
 };
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::expr::InList;
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use iceberg::spec::{
     NestedFieldRef, PrimitiveType, Schema as IcebergSchema, StructType, Type as IcebergType,
@@ -126,40 +123,83 @@ fn arrow_field_id(field: &Field) -> Option<i32> {
         .ok()
 }
 
-pub(crate) fn parse_uuid_text(value: &str) -> Result<[u8; 16], ()> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 36 {
-        return Err(());
+pub(crate) fn parse_uuid_text(value: &str) -> Result<[u8; 16], String> {
+    if value.encode_utf16().count() > 36 {
+        return Err("UUID string too large".to_string());
     }
-    for (index, byte) in bytes.iter().enumerate() {
-        let hyphen = index == 8 || index == 13 || index == 18 || index == 23;
-        if hyphen {
-            if *byte != b'-' {
-                return Err(());
-            }
-        } else if !byte.is_ascii_hexdigit() {
-            return Err(());
-        }
-    }
+    let chars: Vec<char> = value.chars().collect();
+    let dashes: Vec<usize> = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| **c == '-')
+        .map(|(index, _)| index)
+        .collect();
+    let &[d1, d2, d3, d4] = dashes.as_slice() else {
+        return Err(format!("Invalid UUID string: {value}"));
+    };
+    let group = |start: usize, end: usize| chars.get(start..end).unwrap_or(&[]);
+    let g1 = parse_java_hex_long(group(0, d1))? & 0xffff_ffff;
+    let g2 = parse_java_hex_long(group(d1 + 1, d2))? & 0xffff;
+    let g3 = parse_java_hex_long(group(d2 + 1, d3))? & 0xffff;
+    let g4 = parse_java_hex_long(group(d3 + 1, d4))? & 0xffff;
+    let g5 = parse_java_hex_long(group(d4 + 1, chars.len()))? & 0xffff_ffff_ffff;
+    let most = (g1 << 32) | (g2 << 16) | g3;
+    let least = (g4 << 48) | g5;
     let mut out = [0u8; 16];
-    let mut nibbles = 0usize;
-    for byte in bytes.iter() {
-        if *byte == b'-' {
-            continue;
-        }
-        let digit = (*byte as char).to_digit(16).ok_or(())? as u8;
-        if nibbles.is_multiple_of(2) {
-            out[nibbles / 2] = digit << 4;
-        } else {
-            out[nibbles / 2] |= digit;
-        }
-        nibbles += 1;
+    for (slot, byte) in out
+        .iter_mut()
+        .zip(most.to_be_bytes().into_iter().chain(least.to_be_bytes()))
+    {
+        *slot = byte;
     }
     Ok(out)
 }
 
+fn parse_java_hex_long(group: &[char]) -> Result<u64, String> {
+    let text: String = group.iter().collect();
+    let error_at =
+        |index: usize| format!("NumberFormatException: Error at index {index} in: \"{text}\"");
+    let Some(first) = group.first() else {
+        return Err("NumberFormatException: ".to_string());
+    };
+    let start = if *first == '+' {
+        1
+    } else if *first < '0' {
+        return Err(error_at(0));
+    } else {
+        0
+    };
+    if group.len() <= start {
+        return Err(error_at(start));
+    }
+    let limit = -i64::MAX;
+    let multmin = limit / 16;
+    let mut result: i64 = 0;
+    for (index, c) in group.iter().enumerate().skip(start) {
+        let Some(digit) = c.to_digit(16).map(i64::from) else {
+            return Err(error_at(index));
+        };
+        if result < multmin {
+            return Err(error_at(index));
+        }
+        result *= 16;
+        if result < limit + digit {
+            return Err(error_at(index));
+        }
+        result -= digit;
+    }
+    Ok(result.unsigned_abs())
+}
+
 pub(crate) fn is_canonical_uuid_text(value: &str) -> bool {
-    parse_uuid_text(value).is_ok() && value.bytes().all(|b| !b.is_ascii_uppercase())
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index == 8 || index == 13 || index == 18 || index == 23 {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
@@ -361,11 +401,8 @@ fn render_list_uuid_as_text(
     }
 }
 
-pub(crate) fn invalid_uuid_string(value: &str) -> DataFusionError {
-    to_datafusion_error(Error::new(
-        ErrorKind::DataInvalid,
-        format!("Invalid UUID string: {value}"),
-    ))
+pub(crate) fn uuid_parse_error(message: &str) -> DataFusionError {
+    to_datafusion_error(Error::new(ErrorKind::DataInvalid, message.to_string()))
 }
 
 pub(crate) fn convert_batch_uuid_text_to_bytes(
@@ -403,7 +440,10 @@ pub(crate) fn convert_batch_uuid_text_to_bytes(
     })
 }
 
-fn convert_column_uuid_text_to_bytes(column: &ArrayRef, target: &DataType) -> DFResult<ArrayRef> {
+pub(crate) fn convert_column_uuid_text_to_bytes(
+    column: &ArrayRef,
+    target: &DataType,
+) -> DFResult<ArrayRef> {
     if column.data_type() == target {
         return Ok(column.clone());
     }
@@ -421,9 +461,7 @@ fn convert_column_uuid_text_to_bytes(column: &ArrayRef, target: &DataType) -> DF
                 if source.is_null(row) {
                     Ok(None)
                 } else {
-                    parse_uuid_text(source.value(row))
-                        .map(Some)
-                        .map_err(|_| source.value(row).to_string())
+                    parse_uuid_text(source.value(row)).map(Some)
                 }
             })
         }
@@ -440,9 +478,7 @@ fn convert_column_uuid_text_to_bytes(column: &ArrayRef, target: &DataType) -> DF
                 if source.is_null(row) {
                     Ok(None)
                 } else {
-                    parse_uuid_text(source.value(row))
-                        .map(Some)
-                        .map_err(|_| source.value(row).to_string())
+                    parse_uuid_text(source.value(row)).map(Some)
                 }
             })
         }
@@ -459,9 +495,7 @@ fn convert_column_uuid_text_to_bytes(column: &ArrayRef, target: &DataType) -> DF
                 if source.is_null(row) {
                     Ok(None)
                 } else {
-                    parse_uuid_text(source.value(row))
-                        .map(Some)
-                        .map_err(|_| source.value(row).to_string())
+                    parse_uuid_text(source.value(row)).map(Some)
                 }
             })
         }
@@ -564,7 +598,7 @@ fn parse_text_values(
                 values.extend_from_slice(&bytes);
                 valid.push(true);
             }
-            Err(text) => return Err(invalid_uuid_string(&text)),
+            Err(message) => return Err(uuid_parse_error(&message)),
         }
     }
     let mut builder = FixedSizeBinaryBuilder::new(16);
@@ -722,191 +756,4 @@ impl ExecutionPlan for UuidTextToBytesExec {
             Box::pin(converted),
         )))
     }
-}
-
-pub(crate) fn uuid_column_names(schema: &IcebergSchema) -> HashSet<String> {
-    schema
-        .as_struct()
-        .fields()
-        .iter()
-        .filter(|field| {
-            matches!(
-                field.field_type.as_ref(),
-                IcebergType::Primitive(PrimitiveType::Uuid)
-            )
-        })
-        .map(|field| field.name.clone())
-        .collect()
-}
-
-pub(crate) fn rewrite_uuid_text_filters(
-    filters: &[Expr],
-    schema: &IcebergSchema,
-    byte_residual: bool,
-) -> Vec<Expr> {
-    let uuid_columns = uuid_column_names(schema);
-    filters
-        .iter()
-        .map(|filter| rewrite_uuid_text_expr(filter, &uuid_columns, byte_residual, false))
-        .collect()
-}
-
-fn rewrite_uuid_text_expr(
-    expr: &Expr,
-    uuid_columns: &HashSet<String>,
-    byte_residual: bool,
-    negated: bool,
-) -> Expr {
-    match expr {
-        Expr::Not(inner) => Expr::Not(Box::new(rewrite_uuid_text_expr(
-            inner,
-            uuid_columns,
-            byte_residual,
-            !negated,
-        ))),
-        Expr::BinaryExpr(binary) => match binary.op {
-            Operator::And | Operator::Or => Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(rewrite_uuid_text_expr(
-                    &binary.left,
-                    uuid_columns,
-                    byte_residual,
-                    negated,
-                )),
-                binary.op,
-                Box::new(rewrite_uuid_text_expr(
-                    &binary.right,
-                    uuid_columns,
-                    byte_residual,
-                    negated,
-                )),
-            )),
-            Operator::Eq
-            | Operator::NotEq
-            | Operator::Lt
-            | Operator::LtEq
-            | Operator::Gt
-            | Operator::GtEq => rewrite_uuid_comparison(
-                &binary.left,
-                binary.op,
-                &binary.right,
-                uuid_columns,
-                byte_residual,
-                negated,
-            )
-            .unwrap_or_else(|| expr.clone()),
-            _ => expr.clone(),
-        },
-        Expr::InList(inlist) => rewrite_uuid_in_list(inlist, uuid_columns, byte_residual, negated)
-            .unwrap_or_else(|| expr.clone()),
-        _ => expr.clone(),
-    }
-}
-
-fn string_literal_value(value: &ScalarValue) -> Option<String> {
-    match value {
-        ScalarValue::Utf8(Some(text))
-        | ScalarValue::LargeUtf8(Some(text))
-        | ScalarValue::Utf8View(Some(text)) => Some(text.clone()),
-        _ => None,
-    }
-}
-
-fn uuid_byte_literal(bytes: [u8; 16]) -> Expr {
-    Expr::Literal(ScalarValue::FixedSizeBinary(16, Some(bytes.to_vec())), None)
-}
-
-fn rewrite_uuid_comparison(
-    left: &Expr,
-    op: Operator,
-    right: &Expr,
-    uuid_columns: &HashSet<String>,
-    byte_residual: bool,
-    negated: bool,
-) -> Option<Expr> {
-    let (name, text, swapped) = match (left, right) {
-        (Expr::Column(column), Expr::Literal(value, _)) => {
-            (column.name.clone(), string_literal_value(value)?, false)
-        }
-        (Expr::Literal(value, _), Expr::Column(column)) => {
-            (column.name.clone(), string_literal_value(value)?, true)
-        }
-        _ => return None,
-    };
-    if !uuid_columns.contains(&name) {
-        return None;
-    }
-    let bytes = parse_uuid_text(&text).ok()?;
-    let effective_not_eq = (op == Operator::NotEq) != negated;
-    let is_range = matches!(
-        op,
-        Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
-    );
-    if !byte_residual && (is_range || effective_not_eq) && !is_canonical_uuid_text(&text) {
-        return None;
-    }
-    let literal = uuid_byte_literal(bytes);
-    if swapped {
-        Some(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(literal),
-            op,
-            Box::new(left.clone()),
-        )))
-    } else {
-        Some(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(left.clone()),
-            op,
-            Box::new(literal),
-        )))
-    }
-}
-
-fn rewrite_uuid_in_list(
-    inlist: &InList,
-    uuid_columns: &HashSet<String>,
-    byte_residual: bool,
-    negated: bool,
-) -> Option<Expr> {
-    let Expr::Column(column) = inlist.expr.as_ref() else {
-        return None;
-    };
-    if !uuid_columns.contains(&column.name) {
-        return None;
-    }
-    let effective_negated = inlist.negated != negated;
-    let mut literals = Vec::with_capacity(inlist.list.len());
-    for item in &inlist.list {
-        let Expr::Literal(value, _) = item else {
-            return None;
-        };
-        let text = string_literal_value(value)?;
-        if !byte_residual && effective_negated && !is_canonical_uuid_text(&text) {
-            return None;
-        }
-        literals.push(uuid_byte_literal(parse_uuid_text(&text).ok()?));
-    }
-    Some(Expr::InList(InList::new(
-        inlist.expr.clone(),
-        literals,
-        inlist.negated,
-    )))
-}
-
-pub(crate) fn rewrite_uuid_text_assignment(
-    value: Expr,
-    field_type: &IcebergType,
-) -> DFResult<Expr> {
-    let IcebergType::Primitive(PrimitiveType::Uuid) = field_type else {
-        return Ok(value);
-    };
-    let Expr::Literal(literal, meta) = &value else {
-        return Ok(value);
-    };
-    let Some(text) = string_literal_value(literal) else {
-        return Ok(value);
-    };
-    let bytes = parse_uuid_text(&text).map_err(|_| invalid_uuid_string(&text))?;
-    Ok(Expr::Literal(
-        ScalarValue::FixedSizeBinary(16, Some(bytes.to_vec())),
-        meta.clone(),
-    ))
 }
