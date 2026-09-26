@@ -53,7 +53,6 @@ pub use static_provider::IcebergStaticTableProvider;
 
 use crate::error::to_datafusion_error;
 use crate::physical_plan::commit::IcebergCommitExec;
-use crate::physical_plan::conform::strip_nested_metadata_from_schema;
 use crate::physical_plan::delete::{
     IcebergDeleteExec, IsolationLevel, WRITE_DELETE_ISOLATION_LEVEL, WRITE_DELETE_MODE,
     WRITE_UPDATE_ISOLATION_LEVEL, WRITE_UPDATE_MODE, WriteMode,
@@ -177,11 +176,11 @@ impl IcebergTableProvider {
 #[async_trait]
 impl TableProvider for IcebergTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        if self.uuid_as_string {
-            Arc::new(strip_nested_metadata_from_schema(&self.uuid_text_schema))
-        } else {
-            Arc::new(strip_nested_metadata_from_schema(&self.schema))
-        }
+        crate::physical_plan::scan::advertised_schema(
+            &self.schema,
+            &self.uuid_text_schema,
+            self.uuid_as_string,
+        )
     }
 
     fn table_type(&self) -> TableType {
@@ -461,3 +460,5 @@ mod tests;
 mod uuid_as_string_dml_tests;
 #[cfg(test)]
 mod uuid_as_string_tests;
+#[cfg(test)]
+mod uuid_static_tests;
