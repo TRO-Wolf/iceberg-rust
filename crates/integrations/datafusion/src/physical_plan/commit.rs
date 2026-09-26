@@ -86,11 +86,6 @@ pub(crate) struct IcebergCommitExec {
     catalog: Arc<dyn Catalog>,
     input: Arc<dyn ExecutionPlan>,
     schema: ArrowSchemaRef,
-    /// The DML write operation: `Append` commits via `fast_append` (no §5 validations — appends are
-    /// conflict-free by construction, Java `SparkWrite.BatchAppend`); `Overwrite` (`INSERT OVERWRITE`)
-    /// replaces ALL existing data via `overwrite_files().overwrite_by_row_filter(AlwaysTrue)` with the
-    /// §5 static-overwrite validations per [`WRITE_OVERWRITE_ISOLATION_LEVEL`]. Both stamp
-    /// [`OPERATION_ID_PROP`].
     insert_op: InsertOp,
     count_schema: ArrowSchemaRef,
     plan_properties: Arc<PlanProperties>,
@@ -392,7 +387,7 @@ impl ExecutionPlan for IcebergCommitExec {
                         }
                     }
                     let base = tx
-                        .fast_append()
+                        .merge_append()
                         .add_data_files(data_files)
                         .set_snapshot_properties(snapshot_properties);
                     let base = if stage_only { base.stage_only() } else { base };
