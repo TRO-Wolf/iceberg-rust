@@ -203,7 +203,7 @@ fn refuse_unbindable_uuid_expr(expr: &Expr, uuid_columns: &HashMap<String, i32>)
             | Operator::Gt
             | Operator::GtEq => {
                 match uuid_column_literal(&binary.left, &binary.right, uuid_columns) {
-                    Some((text, _)) => refuse_unparseable(&text),
+                    Some((text, _)) => refuse_unparsable(&text),
                     None => Ok(()),
                 }
             }
@@ -220,7 +220,7 @@ fn refuse_unbindable_uuid_expr(expr: &Expr, uuid_columns: &HashMap<String, i32>)
                 if let Expr::Literal(value, _) = item
                     && let Some(text) = string_literal_value(value)
                 {
-                    refuse_unparseable(&text)?;
+                    refuse_unparsable(&text)?;
                 }
             }
             Ok(())
@@ -230,7 +230,7 @@ fn refuse_unbindable_uuid_expr(expr: &Expr, uuid_columns: &HashMap<String, i32>)
     }
 }
 
-fn refuse_unparseable(text: &str) -> DFResult<()> {
+fn refuse_unparsable(text: &str) -> DFResult<()> {
     parse_uuid_text(text)
         .map(|_| ())
         .map_err(|message| uuid_parse_error(&message))
@@ -257,7 +257,7 @@ fn refuse_uuid_like(like: &Like, uuid_columns: &HashMap<String, i32>) -> DFResul
         return if like.negated {
             Ok(())
         } else {
-            refuse_unparseable(&pattern)
+            refuse_unparsable(&pattern)
         };
     }
     match pattern.strip_suffix('%') {
