@@ -212,7 +212,9 @@ fn is_iceberg_convertible(expr: &Expr) -> bool {
             | Operator::Lt
             | Operator::LtEq
             | Operator::Gt
-            | Operator::GtEq => {
+            | Operator::GtEq
+            | Operator::IsNotDistinctFrom
+            | Operator::IsDistinctFrom => {
                 (is_column(&binary.left) && is_literal(&binary.right))
                     || (is_literal(&binary.left) && is_column(&binary.right))
             }
@@ -252,7 +254,9 @@ fn refuse_unbindable_uuid_expr(expr: &Expr, uuid_columns: &HashMap<String, i32>)
             | Operator::Lt
             | Operator::LtEq
             | Operator::Gt
-            | Operator::GtEq => {
+            | Operator::GtEq
+            | Operator::IsNotDistinctFrom
+            | Operator::IsDistinctFrom => {
                 match uuid_column_literal(&binary.left, &binary.right, uuid_columns) {
                     Some((text, _)) => refuse_unparsable(&text),
                     None => Ok(()),

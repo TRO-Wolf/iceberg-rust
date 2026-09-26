@@ -186,7 +186,7 @@ async fn surviving(fixture: &Fixture) -> Vec<i32> {
 
 #[tokio::test]
 async fn uuid_delete_follows_spark_string_semantics() {
-    let cases: [(String, u64, Vec<i32>); 17] = [
+    let cases: [(String, u64, Vec<i32>); 18] = [
         (format!("u = '{UP}'"), 0, vec![1, 2, 3, 4]),
         (format!("u <> '{UP}'"), 3, vec![3]),
         (format!("u <> '{U1}'"), 2, vec![1, 3]),
@@ -197,6 +197,7 @@ async fn uuid_delete_follows_spark_string_semantics() {
         (format!("u > '{UP}'"), 2, vec![3, 4]),
         (format!("u < '{U2}'"), 2, vec![2, 3]),
         ("u IS NULL".to_string(), 1, vec![1, 2, 4]),
+        ("u <=> NULL".to_string(), 1, vec![1, 2, 4]),
         ("u LIKE '%4266%'".to_string(), 2, vec![3, 4]),
         ("u = '1-2-3-4-5'".to_string(), 0, vec![1, 2, 3, 4]),
         ("u < '1-2-3-4-5'".to_string(), 1, vec![1, 2, 3]),
@@ -230,6 +231,9 @@ async fn uuid_delete_refuses_literals_iceberg_cannot_bind() {
         ("u LIKE 'abc'", "Invalid UUID string: abc"),
         ("u NOT LIKE 'abc'", "Invalid UUID string: abc"),
         ("u NOT IN ('abc')", "Invalid UUID string: abc"),
+        ("u <=> 'abc'", "Invalid UUID string: abc"),
+        ("u IS NOT DISTINCT FROM 'abc'", "Invalid UUID string: abc"),
+        ("u = 'abc' AND NOT (u <=> NULL)", "Invalid UUID string: abc"),
         (
             "u LIKE '123e%'",
             "Term for STARTS_WITH or NOT_STARTS_WITH must produce a string: ref(id=2, accessor-type=uuid): uuid",
@@ -248,6 +252,37 @@ async fn uuid_delete_refuses_literals_iceberg_cannot_bind() {
                 .expect_err("Spark refuses this DELETE");
             assert!(err.contains(message), "{mode}: {query} -> {err}");
             assert_eq!(surviving(&fixture).await, vec![1, 2, 3, 4]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn uuid_delete_conversion_follows_this_engines_optimizer_shape() {
+    let kept = [
+        "u = 'abc' AND id + 0 = 1",
+        "u = 'abc' AND id = 1.0",
+        "u = 'abc' AND id IN (1, 2.5)",
+    ];
+    for mode in MODES {
+        let fixture = spark_rows(mode).await;
+        let query = "DELETE FROM t WHERE CAST(id AS STRING) = '1' AND u = 'abc'";
+        let err = sql(&fixture, query)
+            .await
+            .expect_err("the unwrapped cast converts here");
+        assert!(
+            err.contains("Invalid UUID string: abc"),
+            "{mode}: {query} -> {err}"
+        );
+        assert_eq!(surviving(&fixture).await, vec![1, 2, 3, 4]);
+        for predicate in kept {
+            let fixture = spark_rows(mode).await;
+            let query = format!("DELETE FROM t WHERE {predicate}");
+            assert_eq!(count(&fixture, &query).await, 0, "{mode}: {query}");
+            assert_eq!(
+                surviving(&fixture).await,
+                vec![1, 2, 3, 4],
+                "{mode}: {query}"
+            );
         }
     }
 }
@@ -416,9 +451,21 @@ async fn two_file_fixture(as_string: bool) -> Fixture {
 
 #[tokio::test]
 async fn uuid_delete_evaluates_rows_where_spark_drops_whole_files_by_bytes() {
-    let fixture = two_file_fixture(true).await;
+    let upper = two_file_fixture(true).await;
     let query = format!("DELETE FROM t WHERE u = '{UP}'");
-    assert_eq!(count(&fixture, &query).await, 0, "{query}");
+    assert_eq!(count(&upper, &query).await, 0, "{query}");
+    assert_eq!(surviving(&upper).await, vec![1, 2]);
+    let fixture = fixture("copy-on-write", scalar_fields(), true).await;
+    for (id, value) in [(1, SHORT), (2, U2)] {
+        sql(
+            &fixture,
+            &format!("INSERT INTO t VALUES ({id}, '{value}', 'a')"),
+        )
+        .await
+        .expect("one file per row");
+    }
+    let query = "DELETE FROM t WHERE u = '1-2-3-4-5'";
+    assert_eq!(count(&fixture, query).await, 0, "{query}");
     assert_eq!(surviving(&fixture).await, vec![1, 2]);
 }
 
