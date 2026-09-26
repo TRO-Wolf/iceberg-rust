@@ -26,7 +26,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
 use crate::arrow::schema_to_arrow_schema;
-use crate::spec::{DataFile, PartitionKey, PartitionSpec, SchemaRef};
+use crate::spec::{DataFile, PartitionKey, PartitionSpec, PrimitiveType, SchemaRef, Type};
 use crate::writer::base_writer::data_file_writer::resolve_partition_spec_id;
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{FileNameGenerator, LocationGenerator};
@@ -81,25 +81,32 @@ where
 /// Config for `EqualityDeleteWriter`.
 #[derive(Debug)]
 pub struct EqualityDeleteWriterConfig {
-    // Field ids used to determine row equality in equality delete files.
     equality_ids: Vec<i32>,
-    // Projector used to project the data chunk into specific fields.
     projector: RecordBatchProjector,
 }
 
 impl EqualityDeleteWriterConfig {
     /// Create a new `DataFileWriterConfig` with equality ids.
     pub fn new(equality_ids: Vec<i32>, original_schema: SchemaRef) -> Result<Self> {
+        if let Some(field) = equality_ids
+            .iter()
+            .filter_map(|id| original_schema.field_by_id(*id))
+            .find(|field| *field.field_type == Type::Primitive(PrimitiveType::Unknown))
+        {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "Equality delete field '{}' (id {}) is unknown: an always-null unknown \
+                     column cannot key an equality delete",
+                    field.name, field.id
+                ),
+            ));
+        }
         let original_arrow_schema = Arc::new(schema_to_arrow_schema(&original_schema)?);
         let projector = RecordBatchProjector::new(
             original_arrow_schema,
             &equality_ids,
-            // The following rule comes from https://iceberg.apache.org/spec/#identifier-field-ids
-            // and https://iceberg.apache.org/spec/#equality-delete-files
-            // - The identifier field ids must be used for primitive types.
-            // - The identifier field ids must not be used for floating point types or nullable fields.
             |field| {
-                // Only primitive type is allowed to be used for identifier field ids
                 if field.data_type().is_nested()
                     || matches!(
                         field.data_type(),
@@ -263,20 +270,16 @@ mod test {
     ) {
         assert_eq!(data_file.file_format, DataFileFormat::Parquet);
 
-        // read the written file
         let input_file = file_io.new_input(data_file.file_path.clone()).unwrap();
-        // read the written file
         let input_content = input_file.read().await.unwrap();
         let reader_builder =
             ParquetRecordBatchReaderBuilder::try_new(input_content.clone()).unwrap();
         let metadata = reader_builder.metadata().clone();
 
-        // check data
         let reader = reader_builder.build().unwrap();
         let batches = reader.map(|batch| batch.unwrap()).collect::<Vec<_>>();
         crate::writer::tests::assert_batches_read_back(batch, &batches);
 
-        // check metadata
         let expect_column_num = batch.num_columns();
 
         assert_eq!(
@@ -341,8 +344,6 @@ mod test {
         let file_name_gen =
             DefaultFileNameGenerator::new("test".to_string(), None, DataFileFormat::Parquet);
 
-        // prepare data
-        // Int, Struct(Int), String, List(Int), Struct(Struct(Int))
         let schema = Schema::builder()
             .with_schema_id(1)
             .with_fields(vec![
@@ -454,7 +455,6 @@ mod test {
             arrow_schema_to_schema(equality_config.projected_arrow_schema_ref()).unwrap();
         let projector = equality_config.projector.clone();
 
-        // prepare writer
         let pb =
             ParquetWriterBuilder::new(WriterProperties::builder().build(), Arc::new(delete_schema));
         let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
@@ -469,13 +469,11 @@ mod test {
                 .build(None)
                 .await?;
 
-        // write
         equality_delete_writer.write(to_write.clone()).await?;
         let res = equality_delete_writer.close().await?;
         assert_eq!(res.len(), 1);
         let data_file = res.into_iter().next().unwrap();
 
-        // check
         let to_write_projected = projector.project_batch(to_write)?;
         check_parquet_data_file_with_equality_delete_write(
             &file_io,

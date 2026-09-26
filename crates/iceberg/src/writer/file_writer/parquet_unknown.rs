@@ -26,12 +26,15 @@ use crate::{Error, ErrorKind, Result};
 const MAX_NESTING_DEPTH: usize = 128;
 
 pub(crate) fn schema_has_unknown(schema: &Schema) -> bool {
-    let mut stack: Vec<&Type> = schema
+    schema
         .as_struct()
         .fields()
         .iter()
-        .map(|field| field.field_type.as_ref())
-        .collect();
+        .any(|field| type_has_unknown(field.field_type.as_ref()))
+}
+
+fn type_has_unknown(root: &Type) -> bool {
+    let mut stack: Vec<&Type> = vec![root];
     while let Some(current) = stack.pop() {
         match current {
             Type::Primitive(PrimitiveType::Unknown) => return true,
@@ -52,12 +55,77 @@ pub(crate) fn schema_has_unknown(schema: &Schema) -> bool {
     false
 }
 
+fn is_unknown(ty: &Type) -> bool {
+    matches!(ty, Type::Primitive(PrimitiveType::Unknown))
+}
+
 pub(crate) fn writer_arrow_schema(schema: &Schema) -> Result<ArrowSchema> {
+    for field in schema.as_struct().fields() {
+        refuse_unwritable_unknown(&field.name, field.field_type.as_ref(), 0)?;
+    }
     let full: ArrowSchema = schema.try_into()?;
     Ok(ArrowSchema::new_with_metadata(
         strip_fields(full.fields(), 0)?,
         full.metadata().clone(),
     ))
+}
+
+fn refuse_unwritable_unknown(path: &str, ty: &Type, depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("write schema exceeds nesting depth {MAX_NESTING_DEPTH}"),
+        ));
+    }
+    match ty {
+        Type::Struct(struct_type) => {
+            let fields = struct_type.fields();
+            if !fields.is_empty() && fields.iter().all(|field| is_unknown(&field.field_type)) {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Cannot write struct '{path}': every field is unknown, and Parquet \
+                         refuses an empty group"
+                    ),
+                ));
+            }
+            for field in fields {
+                refuse_unwritable_unknown(
+                    &format!("{path}.{}", field.name),
+                    field.field_type.as_ref(),
+                    depth + 1,
+                )?;
+            }
+            Ok(())
+        }
+        Type::List(list_type) => {
+            refuse_unknown_under(path, "element", list_type.element_field.field_type.as_ref())
+        }
+        Type::Map(map_type) => {
+            refuse_unknown_under(path, "key", map_type.key_field.field_type.as_ref())?;
+            refuse_unknown_under(path, "value", map_type.value_field.field_type.as_ref())
+        }
+        Type::Primitive(_) | Type::Variant => Ok(()),
+    }
+}
+
+fn refuse_unknown_under(path: &str, role: &str, ty: &Type) -> Result<()> {
+    if is_unknown(ty) {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!("Cannot convert {role} Parquet: unknown (column '{path}.{role}')"),
+        ));
+    }
+    if type_has_unknown(ty) {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "Writing an unknown field under the {role} of '{path}' is not supported: \
+                 only top-level and struct unknown fields are omitted from the Parquet file"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn strip_fields(fields: &Fields, depth: usize) -> Result<Vec<Field>> {
@@ -166,11 +234,22 @@ fn project_column(
                     depth + 1,
                 )?);
             }
-            Ok(Arc::new(StructArray::new(
+            let projected = StructArray::try_new(
                 writer_children.clone(),
                 children,
                 struct_array.nulls().cloned(),
-            )))
+            )
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "failed to project struct column '{}' for writing",
+                        writer_field.name()
+                    ),
+                )
+                .with_source(err)
+            })?;
+            Ok(Arc::new(projected))
         }
         _ => Ok(column.clone()),
     }

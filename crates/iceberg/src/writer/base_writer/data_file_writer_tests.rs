@@ -548,8 +548,15 @@ async fn data_file_writer_writes_unknown_null_column_without_parquet_column() ->
         "column_sizes must carry no entry for the unknown field id"
     );
 
+    assert_file_holds_only_id(&file_io, &data_files[0]).await
+}
+
+async fn assert_file_holds_only_id(
+    file_io: &FileIO,
+    data_file: &crate::spec::DataFile,
+) -> Result<()> {
     let bytes = file_io
-        .new_input(data_files[0].file_path.clone())?
+        .new_input(data_file.file_path.clone())?
         .read()
         .await?;
     let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
@@ -570,6 +577,10 @@ async fn data_file_writer_writes_unknown_null_column_without_parquet_column() ->
         names,
         vec!["id"],
         "the parquet file holds no column for the unknown field"
+    );
+    assert!(
+        !data_file.column_sizes().contains_key(&2),
+        "column_sizes must carry no entry for the unknown field id"
     );
     Ok(())
 }
@@ -607,7 +618,7 @@ async fn data_file_writer_fills_omitted_optional_unknown_column_with_null() -> R
         !data_files[0].value_counts().contains_key(&2),
         "value_counts must carry no entry for the omitted unknown field id"
     );
-    Ok(())
+    assert_file_holds_only_id(&file_io, &data_files[0]).await
 }
 
 #[tokio::test]

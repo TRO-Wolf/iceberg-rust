@@ -111,7 +111,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/variant/tests.rs": 3262,
     "crates/iceberg/src/variant/write.rs": 1090,
     "crates/iceberg/src/writer/base_writer/deletion_vector_writer.rs": 1400,
-    "crates/iceberg/src/writer/base_writer/equality_delete_writer.rs": 1030,
+    "crates/iceberg/src/writer/base_writer/equality_delete_writer.rs": 1028,
     "crates/iceberg/src/writer/file_writer/avro_writer.rs": 1385,
     "crates/iceberg/src/writer/file_writer/parquet_writer.rs": 3301,
     "crates/iceberg/tests/interop_inspection_manifests.rs": 2289,

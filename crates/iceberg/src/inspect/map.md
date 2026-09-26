@@ -49,7 +49,7 @@ point: `MetadataTable` (`metadata_table.rs`), reached via `table.inspect()`.
 | `position_deletes.rs` | `PositionDeletesTable` (`calculateSchema` + `PositionDeletesBatchScan`) | schema: fixed `MetadataColumns` ids, partition child-id reassignment, empty-partition `partition` drop; partition type is the unified type (increment D). scan (F-POSDEL-SCAN-1): current-snapshot DELETE manifests, dual manifest evaluators (transformed-spec + own-spec), live `POSITION_DELETES` entries, per-file tasks with residuals; Puffin → `load_delete_vector`, Parquet → `BasicDeleteFileLoader` positional-delete read; `partition`/`spec_id`/`delete_file_path`/v3 DV columns are per-task constants; no filter reaches `scan()` yet — a non-`AlwaysTrue` residual would refuse loud |
 | `binary_partition_tests.rs` | — | **test-only** (`#[cfg(test)]`): `truncate[1]` over a `binary` column projects `LargeBinary` partition values through `files` / `entries` / `partitions` (F-META-BINARY-PART-1) |
 | `promoted_partition_tests.rs` | — | **test-only** (`#[cfg(test)]`): mixed-era identity-partition pins for `files` / `entries` / `partitions` after a legal `int → long` source promotion (F-PROMOTE-READ-1 L-01); lives here because the per-table test modules sit at their file-size ceilings |
-| `readable_metrics_unknown_tests.rs` | — | **test-only** (`#[cfg(test)]`, included from `readable_metrics.rs`): an `unknown` leaf column answers all six metrics null while a known sibling keeps its values |
+| `readable_metrics_unknown_tests.rs` | — | **test-only** (`#[cfg(test)]`, included from `readable_metrics.rs`): an `unknown` leaf column, top level (`c`) or nested (`s.a`), answers all six metrics null with `Null`-typed bounds while a known sibling (`id`, `s.b`) keeps its values |
 
 ## I want to...
 

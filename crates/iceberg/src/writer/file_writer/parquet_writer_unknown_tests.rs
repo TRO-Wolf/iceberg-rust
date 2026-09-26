@@ -413,3 +413,123 @@ async fn batch_missing_a_written_column_fails_loud_instead_of_writing_short() {
         error.message()
     );
 }
+
+fn unknown_top_and_nested_schema() -> Arc<Schema> {
+    Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "c", Type::Primitive(PrimitiveType::Unknown)).into(),
+                NestedField::optional(
+                    3,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(4, "a", Type::Primitive(PrimitiveType::Unknown))
+                            .into(),
+                        NestedField::optional(5, "b", Type::Primitive(PrimitiveType::Long))
+                            .into(),
+                    ])),
+                )
+                .into(),
+            ])
+            .build()
+            .expect("unknown top-level and nested schema"),
+    )
+}
+
+#[tokio::test]
+async fn written_unknown_file_scans_null_through_the_fork_reader() {
+    use futures::{TryStreamExt, stream};
+
+    use crate::arrow::ArrowReaderBuilder;
+    use crate::scan::{FileScanTask, FileScanTaskStream};
+
+    let schema = unknown_top_and_nested_schema();
+    let nested = batch_with_null_nested_unknown(vec![1, 2], vec![10, 20]);
+    let batch = RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("c", DataType::Null, true),
+            nested.schema().field(1).clone(),
+        ])),
+        vec![
+            nested.column(0).clone(),
+            Arc::new(NullArray::new(2)) as ArrayRef,
+            nested.column(1).clone(),
+        ],
+    )
+    .expect("batch with top-level and nested unknown");
+    let (_temp_dir, data_file) = write_single_file(&schema, &batch).await;
+
+    let reader = ArrowReaderBuilder::new(FileIO::new_with_fs()).build();
+    let tasks = Box::pin(stream::iter(vec![Ok(FileScanTask {
+        file_size_in_bytes: data_file.file_size_in_bytes(),
+        start: 0,
+        length: 0,
+        record_count: None,
+        file_record_count: None,
+        data_file_path: Arc::from(data_file.file_path()),
+        data_file_format: DataFileFormat::Parquet,
+        schema: schema.clone(),
+        project_field_ids: Arc::from(vec![1, 2, 3]),
+        predicate: None,
+        deletes: Arc::from(vec![]),
+        partition: None,
+        partition_spec: None,
+        name_mapping: None,
+        case_sensitive: false,
+        split_offsets: None,
+        first_row_id: None,
+        file_sequence_number: None,
+    })])) as FileScanTaskStream;
+    let batches: Vec<RecordBatch> = reader
+        .read(tasks)
+        .expect("scan written file")
+        .try_collect()
+        .await
+        .expect("collect scanned batches");
+    let out = concat_file_batches(&batches);
+
+    assert_eq!(out.num_rows(), 2);
+    let ids = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id column");
+    assert_eq!(ids.values(), &[1, 2]);
+    let c = out.column(1);
+    assert_eq!(c.data_type(), &DataType::Null);
+    assert_eq!(c.logical_null_count(), 2);
+    let s = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("struct column");
+    assert_eq!(s.num_columns(), 2, "the scanned struct carries a and b");
+    assert_eq!(s.column(0).data_type(), &DataType::Null);
+    assert_eq!(s.column(0).logical_null_count(), 2);
+    let b = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sibling column");
+    assert_eq!(b.values(), &[10, 20]);
+}
+
+#[test]
+fn an_unknown_equality_delete_id_is_refused_by_name() {
+    use crate::writer::base_writer::equality_delete_writer::EqualityDeleteWriterConfig;
+
+    let error = EqualityDeleteWriterConfig::new(vec![2], unknown_top_level_schema())
+        .expect_err("an unknown equality id must be refused");
+    assert_eq!(error.kind(), crate::ErrorKind::FeatureUnsupported);
+    assert_eq!(
+        error.message(),
+        "Equality delete field 'c' (id 2) is unknown: an always-null unknown column cannot key \
+         an equality delete"
+    );
+    let config = EqualityDeleteWriterConfig::new(vec![1], unknown_top_level_schema())
+        .expect("a known equality id on an unknown-bearing schema stays eligible");
+    assert_eq!(config.projected_arrow_schema_ref().fields().len(), 1);
+}
