@@ -87,6 +87,10 @@ impl IcebergSchemaProvider {
         self
     }
 
+    fn apply_uuid_as_string(provider: IcebergTableProvider, enabled: bool) -> IcebergTableProvider {
+        provider.with_uuid_as_string(enabled)
+    }
+
     /// Populate [`Self::tables`] from `list_tables` on first successful access.
     ///
     /// A successful listing is cached forever (exactly one `list_tables` per namespace). A failed
@@ -153,8 +157,9 @@ impl IcebergSchemaProvider {
             .await
             .map_err(to_datafusion_error)?;
         let provider = IcebergTableProvider::from_planning_load(self.catalog.clone(), table)
-            .map_err(to_datafusion_error)?
-            .with_uuid_as_string(self.uuid_as_string.load(Ordering::SeqCst));
+            .map_err(to_datafusion_error)?;
+        let provider =
+            Self::apply_uuid_as_string(provider, self.uuid_as_string.load(Ordering::SeqCst));
         Ok(Some(Arc::new(provider)))
     }
 }
@@ -335,6 +340,7 @@ impl SchemaProvider for IcebergSchemaProvider {
         let tables = self.tables.clone();
         let tables_listed = self.tables_listed.clone();
         let table_name = name.to_string();
+        let uuid_as_string = self.uuid_as_string.load(Ordering::SeqCst);
 
         // Run on a runtime the caller does not own — see `register_table` and
         // `block_on_off_caller_runtime` for why running on the caller's runtime is unsafe (the old
@@ -356,6 +362,7 @@ impl SchemaProvider for IcebergSchemaProvider {
                 IcebergTableProvider::try_new(catalog.clone(), namespace, table_name.clone())
                     .await
                     .ok()
+                    .map(|provider| Self::apply_uuid_as_string(provider, uuid_as_string))
                     .map(|provider| Arc::new(provider) as Arc<dyn TableProvider>);
 
             // Drop the table from the Iceberg catalog

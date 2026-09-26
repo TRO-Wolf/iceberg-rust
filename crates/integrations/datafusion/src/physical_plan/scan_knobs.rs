@@ -16,8 +16,10 @@
 // under the License.
 
 use std::pin::Pin;
+use std::sync::Arc;
 
 use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use datafusion::common::config::{ConfigEntry, ConfigExtension, ExtensionOptions};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -26,6 +28,7 @@ use iceberg::expr::Predicate;
 use iceberg::scan::TableScan;
 use iceberg::table::Table;
 
+use super::conform::strip_nested_metadata_from_schema;
 use crate::to_datafusion_error;
 
 /// Iceberg-specific scan knobs registered on DataFusion [`ConfigOptions`], prefix `iceberg.`.
@@ -190,6 +193,18 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
         multi_partition_scan,
         row_selection_enabled: iceberg_opts.row_selection_enabled,
         uuid_as_string: false,
+    }
+}
+
+pub(crate) fn advertised_schema(
+    schema: &ArrowSchema,
+    uuid_text_schema: &ArrowSchema,
+    uuid_as_string: bool,
+) -> ArrowSchemaRef {
+    if uuid_as_string {
+        Arc::new(strip_nested_metadata_from_schema(uuid_text_schema))
+    } else {
+        Arc::new(strip_nested_metadata_from_schema(schema))
     }
 }
 

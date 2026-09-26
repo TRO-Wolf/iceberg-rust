@@ -32,7 +32,6 @@ use iceberg::{Error, ErrorKind, Result};
 
 use super::{uuid_text, uuid_text_filters};
 use crate::error::to_datafusion_error;
-use crate::physical_plan::conform::strip_nested_metadata_from_schema;
 use crate::physical_plan::scan::IcebergTableScan;
 
 /// Static table provider for read-only snapshot access. It holds a cached table instance and
@@ -137,11 +136,11 @@ impl IcebergStaticTableProvider {
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        if self.uuid_as_string {
-            Arc::new(strip_nested_metadata_from_schema(&self.uuid_text_schema))
-        } else {
-            Arc::new(strip_nested_metadata_from_schema(&self.schema))
-        }
+        crate::physical_plan::scan::advertised_schema(
+            &self.schema,
+            &self.uuid_text_schema,
+            self.uuid_as_string,
+        )
     }
 
     fn table_type(&self) -> TableType {

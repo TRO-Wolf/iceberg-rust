@@ -31,7 +31,7 @@ rows R164, R169, R170.
 | `lib.rs` | crate root; re-exports catalog, table providers, scan knobs |
 | `catalog.rs` | `IcebergCatalogProvider` (row R164 namespace scope) |
 | `catalog_uuid_text.rs` | `IcebergCatalogProvider::with_uuid_as_string(bool)` (F-UUID-STRING-1 follow-up, default off); sets the flag on every schema provider, so resolved tables advertise uuid as text |
-| `schema.rs` | `IcebergSchemaProvider` — `table_names` lists catalog entries only (row R170); `$`-name `table` / `table_exist` still resolve; `with_uuid_as_string(bool)` propagates to every resolved `IcebergTableProvider`, metadata tables unchanged |
+| `schema.rs` | `IcebergSchemaProvider` — `table_names` lists catalog entries only (row R170); `$`-name `table` / `table_exist` still resolve; `with_uuid_as_string(bool)` propagates to every resolved and deregistered `IcebergTableProvider` through one helper (F-UUID-STATIC-2), metadata tables unchanged |
 | `error.rs` | DataFusion error conversion |
 | `task_writer.rs` | per-task data writers |
 | `table/` | catalog-backed, static, and metadata table providers (row R169) |

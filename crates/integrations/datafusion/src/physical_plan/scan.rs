@@ -44,7 +44,7 @@ use super::expr_to_predicate::scan_predicates;
 use super::scan_helpers::{exact_table_row_count, project_bindings, resolve_bindings};
 pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
 pub(crate) use super::scan_knobs::{
-    ScanKnobs, clamp_scan_knob, get_batch_stream, scan_knobs_from_context,
+    ScanKnobs, advertised_schema, clamp_scan_knob, get_batch_stream, scan_knobs_from_context,
 };
 use crate::table::uuid_text;
 use crate::to_datafusion_error;
