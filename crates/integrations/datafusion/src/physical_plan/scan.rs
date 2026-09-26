@@ -46,6 +46,7 @@ pub use super::scan_knobs::{IcebergScanOptions, ensure_iceberg_scan_options};
 pub(crate) use super::scan_knobs::{
     ScanKnobs, clamp_scan_knob, get_batch_stream, scan_knobs_from_context,
 };
+use crate::table::uuid_text;
 use crate::to_datafusion_error;
 
 /// Manages the scanning process of an Iceberg [`Table`]. [`IcebergTableScan::plan`] assigns the
@@ -76,6 +77,8 @@ pub struct IcebergTableScan {
     per_partition_concurrency: usize,
     batch_size: Option<usize>,
     pub(crate) row_selection_enabled: bool,
+    uuid_as_string: bool,
+    text_schema: Option<ArrowSchemaRef>,
 }
 
 impl IcebergTableScan {
@@ -143,6 +146,8 @@ impl IcebergTableScan {
             per_partition_concurrency: 1,
             batch_size: None,
             row_selection_enabled: true,
+            uuid_as_string: false,
+            text_schema: None,
         })
     }
 
@@ -219,6 +224,19 @@ impl IcebergTableScan {
         scan.batch_size = knobs.batch_size.map(clamp_scan_knob);
         scan.row_selection_enabled = knobs.row_selection_enabled;
         scan.plan_properties = Self::compute_properties(scan.schema(), n);
+        if knobs.uuid_as_string {
+            let uuid_ids = uuid_text::collect_uuid_field_ids(table.metadata().current_schema());
+            let text_schema = Arc::new(uuid_text::arrow_schema_with_uuid_as_text(
+                &scan.conform_schema,
+                &uuid_ids,
+            ));
+            scan.plan_properties = Self::compute_properties(
+                Arc::new(strip_nested_metadata_from_schema(&text_schema)),
+                n,
+            );
+            scan.uuid_as_string = true;
+            scan.text_schema = Some(text_schema);
+        }
         Ok(scan)
     }
 
@@ -307,6 +325,8 @@ impl ExecutionPlan for IcebergTableScan {
     ) -> DFResult<SendableRecordBatchStream> {
         let conform_schema = self.conform_schema.clone();
         let sources = self.sources.clone();
+        let text_schema = self.text_schema.clone();
+        let uuid_as_string = self.uuid_as_string;
 
         if !self.partition_work.is_empty() {
             let n = self.partition_work.len();
@@ -341,10 +361,13 @@ impl ExecutionPlan for IcebergTableScan {
             .map_err(to_datafusion_error)?
             .map_err(to_datafusion_error)
             .and_then(move |batch| {
-                futures::future::ready(
-                    conform_batch(batch, &conform_schema, &sources)
-                        .and_then(strip_nested_metadata_from_record_batch),
-                )
+                futures::future::ready(conform_render_strip(
+                    batch,
+                    &conform_schema,
+                    &sources,
+                    &text_schema,
+                    uuid_as_string,
+                ))
             });
 
             // GlobalLimitExec owns the limit when N > 1.
@@ -394,10 +417,13 @@ impl ExecutionPlan for IcebergTableScan {
         let stream = futures::stream::once(fut)
             .try_flatten()
             .and_then(move |batch| {
-                futures::future::ready(
-                    conform_batch(batch, &conform_schema, &sources)
-                        .and_then(strip_nested_metadata_from_record_batch),
-                )
+                futures::future::ready(conform_render_strip(
+                    batch,
+                    &conform_schema,
+                    &sources,
+                    &text_schema,
+                    uuid_as_string,
+                ))
             });
 
         let limited_stream: Pin<Box<dyn Stream<Item = DFResult<RecordBatch>> + Send>> =
@@ -424,6 +450,21 @@ impl ExecutionPlan for IcebergTableScan {
             limited_stream,
         )))
     }
+}
+
+fn conform_render_strip(
+    batch: RecordBatch,
+    conform_schema: &ArrowSchemaRef,
+    sources: &[ColumnSource],
+    text_schema: &Option<ArrowSchemaRef>,
+    uuid_as_string: bool,
+) -> DFResult<RecordBatch> {
+    let batch = conform_batch(batch, conform_schema, sources)?;
+    let batch = match (uuid_as_string, text_schema) {
+        (true, Some(text)) => uuid_text::render_batch_uuid_as_text(batch, text)?,
+        _ => batch,
+    };
+    strip_nested_metadata_from_record_batch(batch)
 }
 
 impl DisplayAs for IcebergTableScan {

@@ -141,6 +141,7 @@ pub(crate) struct ScanKnobs {
     /// Dedicated multi-partition off-switch (pin 13). Default true.
     pub multi_partition_scan: bool,
     pub row_selection_enabled: bool,
+    pub uuid_as_string: bool,
 }
 
 impl Default for ScanKnobs {
@@ -151,6 +152,7 @@ impl Default for ScanKnobs {
             target_partitions: 1,
             multi_partition_scan: true,
             row_selection_enabled: true,
+            uuid_as_string: false,
         }
     }
 }
@@ -187,6 +189,7 @@ pub(crate) fn scan_knobs_from_context(context: &TaskContext) -> ScanKnobs {
         target_partitions,
         multi_partition_scan,
         row_selection_enabled: iceberg_opts.row_selection_enabled,
+        uuid_as_string: false,
     }
 }
 
