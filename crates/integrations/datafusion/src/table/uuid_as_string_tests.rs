@@ -22,7 +22,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray, StructArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
-use datafusion::catalog::TableProvider;
+use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
@@ -31,7 +31,7 @@ use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema, StructType, Type};
-use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use tempfile::TempDir;
 
 use super::uuid_text::{
@@ -507,4 +507,235 @@ async fn uuid_option_off_keeps_byte_path() {
     assert!(!refreshed.uuid_as_string);
     let refreshed_on = on.refreshed().await.expect("refresh keeps working");
     assert!(refreshed_on.uuid_as_string);
+}
+
+async fn current_snapshot_id(
+    catalog: &Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    name: &str,
+) -> i64 {
+    catalog
+        .load_table(&TableIdent::new(namespace.clone(), name.to_string()))
+        .await
+        .expect("table loads")
+        .metadata()
+        .current_snapshot()
+        .expect("a snapshot exists")
+        .snapshot_id()
+}
+
+async fn uuid_static_provider(
+    catalog: &Arc<dyn Catalog>,
+    namespace: &NamespaceIdent,
+    name: &str,
+    snapshot_id: i64,
+    as_string: bool,
+) -> Arc<IcebergStaticTableProvider> {
+    let table = catalog
+        .load_table(&TableIdent::new(namespace.clone(), name.to_string()))
+        .await
+        .expect("table loads");
+    Arc::new(
+        IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
+            .await
+            .expect("static provider builds")
+            .with_uuid_as_string(as_string),
+    )
+}
+
+async fn pruned_files(provider: Arc<dyn TableProvider>, filter: Option<Expr>) -> HashSet<String> {
+    let ctx = SessionContext::new();
+    let filters: Vec<Expr> = filter.into_iter().collect();
+    let plan = provider
+        .scan(&ctx.state(), None, &filters, None)
+        .await
+        .expect("scan plans");
+    let scan = plan
+        .downcast_ref::<crate::physical_plan::IcebergTableScan>()
+        .expect("provider scan is an IcebergTableScan");
+    scan.partition_work()
+        .iter()
+        .flat_map(|work| work.tasks())
+        .map(|task| task.data_file_path().to_string())
+        .collect()
+}
+
+fn uuid_eq_filter(literal: ScalarValue) -> Expr {
+    Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(Expr::Column(datafusion::common::Column::from_name("u"))),
+        Operator::Eq,
+        Box::new(Expr::Literal(literal, None)),
+    ))
+}
+
+#[tokio::test]
+async fn uuid_static_provider_advertises_text_and_renders_pinned_rows() {
+    let (catalog, namespace, name, _temp) = uuid_catalog_and_table().await;
+    let on = uuid_provider(&catalog, &namespace, &name, true).await;
+    run_sql(
+        on.clone(),
+        &format!("INSERT INTO t VALUES (1, '{U1}', NULL)"),
+    )
+    .await;
+    let first = current_snapshot_id(&catalog, &namespace, &name).await;
+    run_sql(
+        on.clone(),
+        &format!("INSERT INTO t VALUES (2, '{U2}', NULL)"),
+    )
+    .await;
+    let pinned = uuid_static_provider(&catalog, &namespace, &name, first, true).await;
+    let text_type = pinned
+        .schema()
+        .field_with_name("u")
+        .expect("uuid field")
+        .data_type()
+        .clone();
+    assert_eq!(text_type, DataType::Utf8);
+    let batches = run_sql(pinned.clone(), "SELECT id, u FROM t ORDER BY id").await;
+    assert_eq!(int_column(&batches, "id"), vec![1]);
+    assert_eq!(text_column(&batches, "u"), vec![Some(U1.to_string())]);
+    let off = uuid_static_provider(&catalog, &namespace, &name, first, false).await;
+    let byte_type = off
+        .schema()
+        .field_with_name("u")
+        .expect("uuid field")
+        .data_type()
+        .clone();
+    assert_eq!(byte_type, DataType::FixedSizeBinary(16));
+}
+
+#[tokio::test]
+async fn uuid_static_provider_pushes_text_predicate_to_same_files() {
+    let (catalog, namespace, name, _temp) = uuid_catalog_and_table().await;
+    let on = uuid_provider(&catalog, &namespace, &name, true).await;
+    run_sql(
+        on.clone(),
+        &format!("INSERT INTO t VALUES (1, '{U1}', NULL)"),
+    )
+    .await;
+    run_sql(
+        on.clone(),
+        &format!("INSERT INTO t VALUES (2, '{U2}', NULL)"),
+    )
+    .await;
+    let latest = current_snapshot_id(&catalog, &namespace, &name).await;
+    let pinned = uuid_static_provider(&catalog, &namespace, &name, latest, true).await;
+    let text_files = pruned_files(
+        pinned.clone(),
+        Some(uuid_eq_filter(ScalarValue::Utf8(Some(U1.to_string())))),
+    )
+    .await;
+    let off = uuid_static_provider(&catalog, &namespace, &name, latest, false).await;
+    let byte_files = pruned_files(
+        off.clone(),
+        Some(uuid_eq_filter(ScalarValue::FixedSizeBinary(
+            16,
+            Some(uuid_bytes(U1).to_vec()),
+        ))),
+    )
+    .await;
+    let all_files = pruned_files(pinned.clone(), None).await;
+    assert_eq!(all_files.len(), 2);
+    assert_eq!(text_files.len(), 1);
+    assert_eq!(text_files, byte_files);
+    let batches = run_sql(
+        pinned.clone(),
+        &format!("SELECT id FROM t WHERE u = '{U1}'"),
+    )
+    .await;
+    assert_eq!(int_column(&batches, "id"), vec![1]);
+}
+
+#[tokio::test]
+async fn uuid_static_option_off_keeps_byte_path() {
+    let (catalog, namespace, name, _temp) = uuid_catalog_and_table().await;
+    let on = uuid_provider(&catalog, &namespace, &name, true).await;
+    run_sql(
+        on.clone(),
+        &format!("INSERT INTO t VALUES (1, '{U1}', NULL)"),
+    )
+    .await;
+    let latest = current_snapshot_id(&catalog, &namespace, &name).await;
+    let off = uuid_static_provider(&catalog, &namespace, &name, latest, false).await;
+    let batches = run_sql(off.clone(), "SELECT id, u FROM t").await;
+    assert_eq!(int_column(&batches, "id"), vec![1]);
+    let column = batches[0].column_by_name("u").expect("u scans");
+    assert_eq!(*column.data_type(), DataType::FixedSizeBinary(16));
+    let bytes = column
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("bytes scan");
+    assert_eq!(bytes.value(0), uuid_bytes(U1));
+}
+
+#[tokio::test]
+async fn uuid_catalog_provider_propagates_option_to_resolved_tables() {
+    let (catalog, namespace, name, _temp) = uuid_catalog_and_table().await;
+    let on = uuid_provider(&catalog, &namespace, &name, true).await;
+    run_sql(
+        on.clone(),
+        &format!("INSERT INTO t VALUES (1, '{U1}', NULL)"),
+    )
+    .await;
+    let catalog_provider = crate::IcebergCatalogProvider::try_new(catalog.clone())
+        .await
+        .expect("catalog provider builds")
+        .with_uuid_as_string(true);
+    let schema_provider =
+        CatalogProvider::schema(&catalog_provider, "uuid_ns").expect("namespace resolves");
+    let resolved = schema_provider
+        .table(&name)
+        .await
+        .expect("table resolves")
+        .expect("table listed");
+    let text_type = resolved
+        .schema()
+        .field_with_name("u")
+        .expect("uuid field")
+        .data_type()
+        .clone();
+    assert_eq!(text_type, DataType::Utf8);
+    let metadata = schema_provider
+        .table("uuid_table$files")
+        .await
+        .expect("metadata lookup runs");
+    assert!(metadata.is_some(), "metadata tables still resolve");
+    let off_catalog = crate::IcebergCatalogProvider::try_new(catalog.clone())
+        .await
+        .expect("catalog provider builds");
+    let off_schema = CatalogProvider::schema(&off_catalog, "uuid_ns").expect("namespace resolves");
+    let off_table = off_schema
+        .table(&name)
+        .await
+        .expect("table resolves")
+        .expect("table listed");
+    let byte_type = off_table
+        .schema()
+        .field_with_name("u")
+        .expect("uuid field")
+        .data_type()
+        .clone();
+    assert_eq!(byte_type, DataType::FixedSizeBinary(16));
+}
+
+#[tokio::test]
+async fn uuid_schema_provider_flags_resolved_tables() {
+    let (catalog, namespace, name, _temp) = uuid_catalog_and_table().await;
+    let schema_provider =
+        crate::schema::IcebergSchemaProvider::try_new(catalog.clone(), namespace.clone())
+            .await
+            .expect("schema provider builds");
+    schema_provider.with_uuid_as_string(true);
+    let resolved = schema_provider
+        .table(&name)
+        .await
+        .expect("table resolves")
+        .expect("table listed");
+    let text_type = resolved
+        .schema()
+        .field_with_name("u")
+        .expect("uuid field")
+        .data_type()
+        .clone();
+    assert_eq!(text_type, DataType::Utf8);
 }

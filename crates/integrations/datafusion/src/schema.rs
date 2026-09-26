@@ -16,6 +16,7 @@
 // under the License.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -55,6 +56,7 @@ pub(crate) struct IcebergSchemaProvider {
     /// Set to `true` only after a *successful* `list_tables`. A failed listing is not cached
     /// (the next access retries). Guarded so two concurrent first-accesses issue one listing.
     tables_listed: Arc<tokio::sync::Mutex<bool>>,
+    uuid_as_string: AtomicBool,
 }
 
 impl IcebergSchemaProvider {
@@ -76,7 +78,13 @@ impl IcebergSchemaProvider {
             namespace,
             tables: Arc::new(DashMap::new()),
             tables_listed: Arc::new(tokio::sync::Mutex::new(false)),
+            uuid_as_string: AtomicBool::new(false),
         })
+    }
+
+    pub(crate) fn with_uuid_as_string(&self, enabled: bool) -> &Self {
+        self.uuid_as_string.store(enabled, Ordering::SeqCst);
+        self
     }
 
     /// Populate [`Self::tables`] from `list_tables` on first successful access.
@@ -145,7 +153,8 @@ impl IcebergSchemaProvider {
             .await
             .map_err(to_datafusion_error)?;
         let provider = IcebergTableProvider::from_planning_load(self.catalog.clone(), table)
-            .map_err(to_datafusion_error)?;
+            .map_err(to_datafusion_error)?
+            .with_uuid_as_string(self.uuid_as_string.load(Ordering::SeqCst));
         Ok(Some(Arc::new(provider)))
     }
 }

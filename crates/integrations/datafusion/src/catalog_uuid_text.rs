@@ -15,21 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod catalog;
-pub use catalog::*;
-mod catalog_uuid_text;
+use crate::catalog::IcebergCatalogProvider;
 
-mod error;
-pub use error::*;
-
-pub mod physical_plan;
-/// Multi-partition scan knobs (pin 13 off-switch + pin 14 distinct `L`) and the scan plan node.
-pub use physical_plan::{
-    DataFileCommitOrder, IcebergScanOptions, IcebergTableScan, ensure_iceberg_scan_options,
-};
-mod schema;
-pub mod table;
-pub use table::table_provider_factory::IcebergTableProviderFactory;
-pub use table::*;
-
-pub(crate) mod task_writer;
+impl IcebergCatalogProvider {
+    pub fn with_uuid_as_string(self, enabled: bool) -> Self {
+        for provider in self.schemas.values() {
+            provider.with_uuid_as_string(enabled);
+        }
+        self
+    }
+}
