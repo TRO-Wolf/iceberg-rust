@@ -186,7 +186,7 @@ async fn surviving(fixture: &Fixture) -> Vec<i32> {
 
 #[tokio::test]
 async fn uuid_delete_follows_spark_string_semantics() {
-    let cases: [(String, u64, Vec<i32>); 13] = [
+    let cases: [(String, u64, Vec<i32>); 17] = [
         (format!("u = '{UP}'"), 0, vec![1, 2, 3, 4]),
         (format!("u <> '{UP}'"), 3, vec![3]),
         (format!("u <> '{U1}'"), 2, vec![1, 3]),
@@ -200,6 +200,12 @@ async fn uuid_delete_follows_spark_string_semantics() {
         ("u LIKE '%4266%'".to_string(), 2, vec![3, 4]),
         ("u = '1-2-3-4-5'".to_string(), 0, vec![1, 2, 3, 4]),
         ("u < '1-2-3-4-5'".to_string(), 1, vec![1, 2, 3]),
+        (format!("upper(u) = '{UP}'"), 1, vec![2, 3, 4]),
+        ("u = 'abc' OR upper(t) = 'X'".to_string(), 1, vec![1, 3, 4]),
+        ("u LIKE '123e%' OR upper(t) = 'X'".to_string(), 2, vec![
+            3, 4,
+        ]),
+        ("u < 'abc' AND upper(t) = 'X'".to_string(), 1, vec![1, 3, 4]),
     ];
     for mode in MODES {
         for (predicate, deleted, kept) in &cases {
@@ -222,6 +228,8 @@ async fn uuid_delete_refuses_literals_iceberg_cannot_bind() {
         ("NOT (u = 'abc')", "Invalid UUID string: abc"),
         ("u IN ('abc')", "Invalid UUID string: abc"),
         ("u LIKE 'abc'", "Invalid UUID string: abc"),
+        ("u NOT LIKE 'abc'", "Invalid UUID string: abc"),
+        ("u NOT IN ('abc')", "Invalid UUID string: abc"),
         (
             "u LIKE '123e%'",
             "Term for STARTS_WITH or NOT_STARTS_WITH must produce a string: ref(id=2, accessor-type=uuid): uuid",
@@ -404,6 +412,14 @@ async fn two_file_fixture(as_string: bool) -> Fixture {
             _warehouse: fixture._warehouse,
         }
     }
+}
+
+#[tokio::test]
+async fn uuid_delete_evaluates_rows_where_spark_drops_whole_files_by_bytes() {
+    let fixture = two_file_fixture(true).await;
+    let query = format!("DELETE FROM t WHERE u = '{UP}'");
+    assert_eq!(count(&fixture, &query).await, 0, "{query}");
+    assert_eq!(surviving(&fixture).await, vec![1, 2]);
 }
 
 #[tokio::test]

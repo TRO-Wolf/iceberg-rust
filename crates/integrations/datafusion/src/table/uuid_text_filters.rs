@@ -182,10 +182,61 @@ pub(crate) fn refuse_unbindable_uuid_delete_filters(
     filters: &[Expr],
     schema: &IcebergSchema,
 ) -> DFResult<()> {
+    if !filters.iter().all(is_iceberg_convertible) {
+        return Ok(());
+    }
     let uuid_columns = uuid_column_ids(schema);
     filters
         .iter()
         .try_for_each(|filter| refuse_unbindable_uuid_expr(filter, &uuid_columns))
+}
+
+fn is_column(expr: &Expr) -> bool {
+    matches!(expr, Expr::Column(_))
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(..))
+}
+
+fn is_iceberg_convertible(expr: &Expr) -> bool {
+    match expr {
+        Expr::Not(inner) => is_iceberg_convertible(inner),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => is_column(inner),
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And | Operator::Or => {
+                is_iceberg_convertible(&binary.left) && is_iceberg_convertible(&binary.right)
+            }
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                (is_column(&binary.left) && is_literal(&binary.right))
+                    || (is_literal(&binary.left) && is_column(&binary.right))
+            }
+            _ => false,
+        },
+        Expr::InList(inlist) => is_column(&inlist.expr) && inlist.list.iter().all(is_literal),
+        Expr::Like(like) => is_convertible_like(like),
+        _ => false,
+    }
+}
+
+fn is_convertible_like(like: &Like) -> bool {
+    if like.case_insensitive || like.escape_char.is_some() || !is_column(&like.expr) {
+        return false;
+    }
+    let Expr::Literal(value, _) = like.pattern.as_ref() else {
+        return false;
+    };
+    let Some(pattern) = string_literal_value(value) else {
+        return false;
+    };
+    let is_wildcard = |c: char| c == '%' || c == '_' || c == '\\';
+    let prefix = pattern.strip_suffix('%').unwrap_or(&pattern);
+    !prefix.contains(is_wildcard)
 }
 
 fn refuse_unbindable_uuid_expr(expr: &Expr, uuid_columns: &HashMap<String, i32>) -> DFResult<()> {
