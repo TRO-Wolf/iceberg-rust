@@ -127,24 +127,50 @@ async fn a_variant_schema_is_refused_before_any_bytes_are_written() {
     }
 }
 
-/// An `unknown`-bearing schema is refused at build, at every depth, with no file left behind.
 #[tokio::test]
-async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
-    for (label, unknown_field) in [
-        (
-            "top level",
-            NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)),
-        ),
+async fn an_unknown_top_level_schema_builds_without_refusal() {
+    let schema = Arc::new(
+        Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                NestedField::optional(2, "u", Type::Primitive(PrimitiveType::Unknown)).into(),
+            ])
+            .build()
+            .expect("schema"),
+    );
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let file_io = FileIO::new_with_fs();
+    let path = temp_dir
+        .path()
+        .join("out.parquet")
+        .to_string_lossy()
+        .to_string();
+    let output = file_io.new_output(&path).expect("output file");
+
+    ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
+        .build(output)
+        .await
+        .expect("an unknown schema must build without refusal");
+}
+
+fn unknown() -> Type {
+    Type::Primitive(PrimitiveType::Unknown)
+}
+
+#[tokio::test]
+async fn unknown_shapes_java_refuses_are_refused_before_any_bytes_are_written() {
+    for (label, unknown_field, expected) in [
         (
             "in a struct",
             NestedField::optional(
                 2,
                 "u",
                 Type::Struct(StructType::new(vec![
-                    NestedField::optional(3, "inner", Type::Primitive(PrimitiveType::Unknown))
-                        .into(),
+                    NestedField::optional(3, "inner", unknown()).into(),
                 ])),
             ),
+            "Cannot write struct 'u': every field is unknown, and Parquet refuses an empty group",
         ),
         (
             "in a list",
@@ -152,14 +178,10 @@ async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
                 2,
                 "u",
                 Type::List(ListType {
-                    element_field: NestedField::list_element(
-                        3,
-                        Type::Primitive(PrimitiveType::Unknown),
-                        true,
-                    )
-                    .into(),
+                    element_field: NestedField::list_element(3, unknown(), true).into(),
                 }),
             ),
+            "Cannot convert element Parquet: unknown (column 'u.element')",
         ),
         (
             "as a map key",
@@ -167,11 +189,7 @@ async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
                 2,
                 "u",
                 Type::Map(MapType {
-                    key_field: NestedField::map_key_element(
-                        3,
-                        Type::Primitive(PrimitiveType::Unknown),
-                    )
-                    .into(),
+                    key_field: NestedField::map_key_element(3, unknown()).into(),
                     value_field: NestedField::map_value_element(
                         4,
                         Type::Primitive(PrimitiveType::String),
@@ -180,6 +198,7 @@ async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
                     .into(),
                 }),
             ),
+            "Cannot convert key Parquet: unknown (column 'u.key')",
         ),
         (
             "as a map value",
@@ -192,14 +211,30 @@ async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
                         Type::Primitive(PrimitiveType::String),
                     )
                     .into(),
-                    value_field: NestedField::map_value_element(
-                        4,
-                        Type::Primitive(PrimitiveType::Unknown),
+                    value_field: NestedField::map_value_element(4, unknown(), true).into(),
+                }),
+            ),
+            "Cannot convert value Parquet: unknown (column 'u.value')",
+        ),
+        (
+            "in a struct inside a list",
+            NestedField::optional(
+                2,
+                "u",
+                Type::List(ListType {
+                    element_field: NestedField::list_element(
+                        3,
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(4, "a", unknown()).into(),
+                            NestedField::optional(5, "b", Type::Primitive(PrimitiveType::Long))
+                                .into(),
+                        ])),
                         true,
                     )
                     .into(),
                 }),
             ),
+            "Writing an unknown field under the element of 'u' is not supported",
         ),
     ] {
         let schema = Arc::new(
@@ -211,36 +246,27 @@ async fn an_unknown_schema_is_refused_before_any_bytes_are_written() {
                 .build()
                 .expect("schema"),
         );
-
         let temp_dir = TempDir::new().expect("temp dir");
-        let file_io = FileIO::new_with_fs();
         let path = temp_dir
             .path()
             .join("out.parquet")
             .to_string_lossy()
             .to_string();
-        let output = file_io.new_output(&path).expect("output file");
+        let output = FileIO::new_with_fs()
+            .new_output(&path)
+            .expect("output file");
 
         let error = match ParquetWriterBuilder::new(WriterProperties::builder().build(), schema)
             .build(output)
             .await
         {
-            Ok(_) => panic!("an unknown schema must be refused at BUILD time ({label})"),
+            Ok(_) => panic!("unknown {label} must be refused at BUILD time"),
             Err(error) => error,
         };
-        assert_eq!(
-            error.kind(),
-            ErrorKind::FeatureUnsupported,
-            "unknown {label} must be refused"
-        );
+        assert_eq!(error.kind(), ErrorKind::FeatureUnsupported, "{label}");
         assert!(
-            error.message().contains("Writing the unknown column"),
-            "the error must name the unknown write refusal for {label}, got: {}",
-            error.message()
-        );
-        assert!(
-            error.message().contains("unknown"),
-            "the error must name the type for {label}, got: {}",
+            error.message().contains(expected),
+            "unknown {label}: expected '{expected}', got: {}",
             error.message()
         );
         assert!(

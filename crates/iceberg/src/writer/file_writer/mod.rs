@@ -31,6 +31,7 @@ mod avro_writer;
 pub use avro_writer::{AvroWriter, AvroWriterBuilder};
 mod orc_writer;
 pub use orc_writer::{OrcWriter, OrcWriterBuilder};
+mod parquet_unknown;
 mod parquet_writer;
 pub use parquet_writer::{ParquetWriter, ParquetWriterBuilder};
 mod parquet_compression;

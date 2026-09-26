@@ -518,7 +518,7 @@ fn unknown_column_batch() -> RecordBatch {
 }
 
 #[tokio::test]
-async fn data_file_writer_refuses_unknown_null_column_loud() {
+async fn data_file_writer_writes_unknown_null_column_without_parquet_column() -> Result<()> {
     let temp_dir = TempDir::new().expect("temp dir");
     let file_io = FileIO::new_with_fs();
     let schema = unknown_column_schema();
@@ -528,37 +528,65 @@ async fn data_file_writer_refuses_unknown_null_column_loud() {
         .await
         .expect("build data file writer");
 
-    let err = writer
+    writer
         .write(unknown_column_batch())
         .await
-        .expect_err("a Null unknown column must be refused, not committed");
-    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        .expect("a Null unknown column writes without refusal");
+    let data_files = writer.close().await.expect("close writer");
+    assert_eq!(data_files.len(), 1);
+    assert_eq!(data_files[0].record_count(), 3);
     assert!(
-        err.message().contains("unknown"),
-        "refusal must name the type, got: {}",
-        err.message()
+        !data_files[0].value_counts().contains_key(&2),
+        "value_counts must carry no entry for the unknown field id"
     );
     assert!(
-        err.message().contains("Writing the unknown column"),
-        "refusal must name the write path, got: {}",
-        err.message()
+        !data_files[0].null_value_counts().contains_key(&2),
+        "null_value_counts must carry no entry for the unknown field id"
     );
     assert!(
-        err.message().contains("'u'") || err.message().contains("column 'u"),
-        "refusal must name the column when cheap, got: {}",
-        err.message()
+        !data_files[0].column_sizes().contains_key(&2),
+        "column_sizes must carry no entry for the unknown field id"
     );
+
+    assert_file_holds_only_id(&file_io, &data_files[0]).await
+}
+
+async fn assert_file_holds_only_id(
+    file_io: &FileIO,
+    data_file: &crate::spec::DataFile,
+) -> Result<()> {
+    let bytes = file_io
+        .new_input(data_file.file_path.clone())?
+        .read()
+        .await?;
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .expect("open parquet")
+        .build()
+        .expect("build reader");
+    let batches = reader
+        .map(|batch| batch.expect("file batch"))
+        .collect::<Vec<_>>();
+    let first = batches.first().expect("one file batch");
+    let first_schema = first.schema();
+    let names: Vec<&str> = first_schema
+        .fields()
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect();
     assert_eq!(
-        std::fs::read_dir(temp_dir.path())
-            .expect("read temp dir")
-            .count(),
-        0,
-        "refusal must leave no parquet file behind"
+        names,
+        vec!["id"],
+        "the parquet file holds no column for the unknown field"
     );
+    assert!(
+        !data_file.column_sizes().contains_key(&2),
+        "column_sizes must carry no entry for the unknown field id"
+    );
+    Ok(())
 }
 
 #[tokio::test]
-async fn data_file_writer_refuses_omitted_optional_unknown_column() {
+async fn data_file_writer_fills_omitted_optional_unknown_column_with_null() -> Result<()> {
     let temp_dir = TempDir::new().expect("temp dir");
     let file_io = FileIO::new_with_fs();
     let schema = unknown_column_schema();
@@ -579,16 +607,18 @@ async fn data_file_writer_refuses_omitted_optional_unknown_column() {
     ))])
     .expect("batch omitting unknown");
 
-    let err = writer
+    writer
         .write(batch)
         .await
-        .expect_err("an omitted optional unknown must not be filled into an unreadable file");
-    assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
+        .expect("an omitted optional unknown fills with null");
+    let data_files = writer.close().await.expect("close writer");
+    assert_eq!(data_files.len(), 1);
+    assert_eq!(data_files[0].record_count(), 3);
     assert!(
-        err.message().contains("unknown"),
-        "refusal must name the type, got: {}",
-        err.message()
+        !data_files[0].value_counts().contains_key(&2),
+        "value_counts must carry no entry for the omitted unknown field id"
     );
+    assert_file_holds_only_id(&file_io, &data_files[0]).await
 }
 
 #[tokio::test]

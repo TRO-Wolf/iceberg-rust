@@ -68,8 +68,9 @@ use std::sync::Arc;
 use arrow_array::StructArray;
 use arrow_array::builder::{
     BooleanBuilder, Date32Builder, Decimal128Builder, FixedSizeBinaryBuilder, Float32Builder,
-    Float64Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, StringBuilder, StructBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder, TimestampNanosecondBuilder,
+    Float64Builder, Int32Builder, Int64Builder, LargeBinaryBuilder, NullBuilder, StringBuilder,
+    StructBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    TimestampNanosecondBuilder,
 };
 use arrow_schema::Fields;
 
@@ -466,15 +467,16 @@ fn append_typed_bound(
                 None => child.append_null(),
             }
         }
-        // `unknown` has no physical column and no `PrimitiveLiteral` form, so it can carry no
-        // bound. A readable-metrics entry for an unknown column is never produced (Java
-        // `TypeToMessageType` returns null — no parquet column, hence no metrics); reaching here
-        // means a malformed manifest, so fail loudly rather than guess.
         PrimitiveType::Unknown => {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "readable_metrics bound for the unknown type is not supported: unknown has no physical column and no bound value",
-            ));
+            let child = builder.field_builder::<NullBuilder>(index).ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!(
+                        "readable_metrics bound sub-field at index {index} has an unexpected type"
+                    ),
+                )
+            })?;
+            child.append_null();
         }
     }
     Ok(())
@@ -982,4 +984,6 @@ mod tests {
         assert_eq!(count("lower_bound"), 55, "lower_bound source");
         assert_eq!(count("upper_bound"), 66, "upper_bound source");
     }
+
+    include!("readable_metrics_unknown_tests.rs");
 }
