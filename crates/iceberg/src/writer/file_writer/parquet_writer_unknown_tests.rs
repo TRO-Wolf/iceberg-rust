@@ -517,6 +517,53 @@ async fn written_unknown_file_scans_null_through_the_fork_reader() {
     assert_eq!(b.values(), &[10, 20]);
 }
 
+#[tokio::test]
+async fn null_struct_row_stays_null_when_its_unknown_child_is_projected_out() {
+    let schema = unknown_nested_schema();
+    let fields = batch_with_null_nested_unknown(vec![1, 2, 3], vec![10, 20, 30]);
+    let DataType::Struct(struct_fields) = fields.schema().field(1).data_type().clone() else {
+        panic!("fixture struct column must stay a struct");
+    };
+    let struct_column = Arc::new(StructArray::new(
+        struct_fields,
+        vec![
+            Arc::new(NullArray::new(3)) as ArrayRef,
+            Arc::new(Int64Array::from(vec![10, 20, 30])) as ArrayRef,
+        ],
+        Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+    )) as ArrayRef;
+    let batch = RecordBatch::try_new(fields.schema(), vec![
+        fields.column(0).clone(),
+        struct_column,
+    ])
+    .expect("batch with a NULL struct row");
+    let (_temp_dir, data_file) = write_single_file(&schema, &batch).await;
+
+    let file_io = FileIO::new_with_fs();
+    let file_batch = concat_file_batches(&read_file_batches(&file_io, &data_file).await);
+    let file_struct = file_batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("struct column");
+    assert_eq!(file_struct.num_columns(), 1);
+    let struct_nulls: Vec<bool> = (0..file_struct.len())
+        .map(|row| file_struct.is_null(row))
+        .collect();
+    assert_eq!(
+        struct_nulls,
+        vec![false, true, false],
+        "the NULL struct row must stay NULL in the written file"
+    );
+    let b = file_struct
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("sibling column");
+    assert_eq!(b.value(0), 10);
+    assert_eq!(b.value(2), 30);
+}
+
 #[test]
 fn an_unknown_equality_delete_id_is_refused_by_name() {
     use crate::writer::base_writer::equality_delete_writer::EqualityDeleteWriterConfig;
