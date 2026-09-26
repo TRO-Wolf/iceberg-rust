@@ -26,9 +26,11 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::spec::Schema as IcebergSchema;
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result};
 
+use super::{uuid_text, uuid_text_filters};
 use crate::error::to_datafusion_error;
 use crate::physical_plan::conform::strip_nested_metadata_from_schema;
 use crate::physical_plan::scan::IcebergTableScan;
@@ -42,18 +44,37 @@ pub struct IcebergStaticTableProvider {
     snapshot_id: Option<i64>,
     project_current_schema: bool,
     schema: ArrowSchemaRef,
+    uuid_text_schema: ArrowSchemaRef,
+    ice_schema: IcebergSchema,
+    uuid_as_string: bool,
 }
 
 impl IcebergStaticTableProvider {
-    /// Creates a read-only provider over the table's current snapshot.
-    pub async fn try_new_from_table(table: Table) -> Result<Self> {
-        let schema = Arc::new(schema_to_arrow_schema(table.metadata().current_schema())?);
+    fn from_parts(
+        table: Table,
+        snapshot_id: Option<i64>,
+        project_current_schema: bool,
+        ice_schema: &IcebergSchema,
+    ) -> Result<Self> {
+        let schema = Arc::new(schema_to_arrow_schema(ice_schema)?);
+        let uuid_text_schema = Arc::new(uuid_text::arrow_schema_with_uuid_as_text(
+            &schema,
+            &uuid_text::collect_uuid_field_ids(ice_schema),
+        ));
         Ok(IcebergStaticTableProvider {
             table,
-            snapshot_id: None,
-            project_current_schema: true,
+            snapshot_id,
+            project_current_schema,
             schema,
+            uuid_text_schema,
+            ice_schema: ice_schema.clone(),
+            uuid_as_string: false,
         })
+    }
+
+    pub async fn try_new_from_table(table: Table) -> Result<Self> {
+        let ice_schema = table.metadata().current_schema().clone();
+        Self::from_parts(table, None, true, &ice_schema)
     }
 
     /// Creates a read-only provider over one snapshot, for a time-travel query.
@@ -71,13 +92,7 @@ impl IcebergStaticTableProvider {
                 )
             })?;
         let table_schema = snapshot.schema(table.metadata())?;
-        let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
-        Ok(IcebergStaticTableProvider {
-            table,
-            snapshot_id: Some(snapshot_id),
-            project_current_schema: false,
-            schema,
-        })
+        Self::from_parts(table, Some(snapshot_id), false, &table_schema)
     }
 
     pub async fn try_new_from_table_ref(table: Table, ref_name: &str) -> Result<Self> {
@@ -110,20 +125,23 @@ impl IcebergStaticTableProvider {
                 })?
                 .schema(table.metadata())?
         };
-        let schema = Arc::new(schema_to_arrow_schema(&table_schema)?);
-        Ok(IcebergStaticTableProvider {
-            table,
-            snapshot_id: Some(snapshot_id),
-            project_current_schema: is_branch,
-            schema,
-        })
+        Self::from_parts(table, Some(snapshot_id), is_branch, &table_schema)
+    }
+
+    pub fn with_uuid_as_string(mut self, enabled: bool) -> Self {
+        self.uuid_as_string = enabled;
+        self
     }
 }
 
 #[async_trait]
 impl TableProvider for IcebergStaticTableProvider {
     fn schema(&self) -> ArrowSchemaRef {
-        Arc::new(strip_nested_metadata_from_schema(&self.schema))
+        if self.uuid_as_string {
+            Arc::new(strip_nested_metadata_from_schema(&self.uuid_text_schema))
+        } else {
+            Arc::new(strip_nested_metadata_from_schema(&self.schema))
+        }
     }
 
     fn table_type(&self) -> TableType {
@@ -137,7 +155,15 @@ impl TableProvider for IcebergStaticTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
+        let mut knobs = crate::physical_plan::scan::scan_knobs_from_context(&state.task_ctx());
+        knobs.uuid_as_string = self.uuid_as_string;
+        let rewritten;
+        let filters: &[Expr] = if self.uuid_as_string {
+            rewritten = uuid_text_filters::rewrite_uuid_text_filters(filters, &self.ice_schema);
+            &rewritten
+        } else {
+            filters
+        };
         Ok(Arc::new(
             IcebergTableScan::plan(
                 self.table.clone(),

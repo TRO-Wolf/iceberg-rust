@@ -52,9 +52,9 @@ const NAMESPACE_DISCOVERY_CONCURRENCY: usize = 16;
 #[derive(Debug)]
 pub struct IcebergCatalogProvider {
     /// Canonical schema name to provider. This is what [`CatalogProvider::schema_names`] reports.
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    pub(crate) schemas: HashMap<String, Arc<IcebergSchemaProvider>>,
     /// Unambiguous dot-joined alias to provider. Resolution only, never listed.
-    aliases: HashMap<String, Arc<dyn SchemaProvider>>,
+    pub(crate) aliases: HashMap<String, Arc<IcebergSchemaProvider>>,
 }
 
 impl IcebergCatalogProvider {
@@ -91,7 +91,7 @@ impl IcebergCatalogProvider {
 
         // `discover_namespaces` de-duplicates and rejects a level holding the separator, so
         // this join is injective and no insert overwrites another namespace's provider.
-        let mut schemas: HashMap<String, Arc<dyn SchemaProvider>> =
+        let mut schemas: HashMap<String, Arc<IcebergSchemaProvider>> =
             HashMap::with_capacity(namespaces.len());
         for (namespace, provider) in namespaces.iter().zip(providers.iter()) {
             schemas.insert(canonical_schema_name(namespace), provider.clone());
@@ -106,7 +106,7 @@ impl IcebergCatalogProvider {
                 .or_insert(0) += 1;
         }
 
-        let mut aliases: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
+        let mut aliases: HashMap<String, Arc<IcebergSchemaProvider>> = HashMap::new();
         for (namespace, provider) in namespaces.iter().zip(providers.iter()) {
             // A single-level namespace's alias is its canonical name.
             if namespace.len() <= 1 {
@@ -132,10 +132,8 @@ impl CatalogProvider for IcebergCatalogProvider {
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas
-            .get(name)
-            .or_else(|| self.aliases.get(name))
-            .cloned()
+        let provider = self.schemas.get(name).or_else(|| self.aliases.get(name))?;
+        Some(provider.clone() as Arc<dyn SchemaProvider>)
     }
 }
 
@@ -281,14 +279,14 @@ async fn list_child_namespaces(
 async fn build_schema_providers(
     client: &Arc<dyn Catalog>,
     namespaces: &[NamespaceIdent],
-) -> Result<Vec<Arc<dyn SchemaProvider>>> {
+) -> Result<Vec<Arc<IcebergSchemaProvider>>> {
     stream::iter(namespaces.iter().map(|namespace| {
         let client = client.clone();
         let namespace = namespace.clone();
         async move {
             IcebergSchemaProvider::try_new(client, namespace.clone())
                 .await
-                .map(|provider| Arc::new(provider) as Arc<dyn SchemaProvider>)
+                .map(Arc::new)
                 .map_err(|err| {
                     Error::new(
                         ErrorKind::Unexpected,
