@@ -41,6 +41,7 @@ pub(crate) async fn write_position_deletes(
     pairs: &[(String, i64)],
     scan_snapshot_id: Option<i64>,
 ) -> DFResult<Vec<DataFile>> {
+    let granularity = delete_granularity(table)?;
     let config = PositionDeleteWriterConfig::new().map_err(to_datafusion_error)?;
     let metadata = table.metadata();
     let default_spec = metadata.default_partition_spec();
@@ -51,15 +52,33 @@ pub(crate) async fn write_position_deletes(
         metadata.partition_specs_iter().len(),
         default_spec.fields().len(),
     ) {
-        // `with_partition_spec` keeps the sole spec's real id; `None` would fabricate spec id 0.
-        return write_position_deletes_for_partition(
-            table,
-            &config,
-            pairs,
-            None,
-            Some(default_spec.as_ref().clone()),
-        )
-        .await;
+        match granularity {
+            DeleteGranularity::Partition => {
+                return write_position_deletes_for_partition(
+                    table,
+                    &config,
+                    pairs,
+                    None,
+                    Some(default_spec.as_ref().clone()),
+                )
+                .await;
+            }
+            DeleteGranularity::File => {
+                let mut all_delete_files: Vec<DataFile> = Vec::new();
+                for run in split_pairs_by_file(pairs) {
+                    let files = write_position_deletes_for_partition(
+                        table,
+                        &config,
+                        &run,
+                        None,
+                        Some(default_spec.as_ref().clone()),
+                    )
+                    .await?;
+                    all_delete_files.extend(files);
+                }
+                return Ok(all_delete_files);
+            }
+        }
     }
 
     let path_to_partition = live_data_file_partitions(table, scan_snapshot_id, None).await?;
@@ -70,8 +89,17 @@ pub(crate) async fn write_position_deletes(
         .collect();
     let groups = group_pairs_by_partition(pairs, &path_to_partition)?;
 
+    let mut ordered = Vec::from_iter(groups);
+    ordered.sort_by(|left, right| {
+        left.0.0.cmp(&right.0.0).then_with(|| {
+            iceberg::writer::partitioning::fanout_writer::ascending_partition_order(
+                &left.0.1, &right.0.1,
+            )
+        })
+    });
+
     let mut all_delete_files: Vec<DataFile> = Vec::new();
-    for ((spec_id, partition), mut group_pairs) in groups {
+    for ((spec_id, partition), mut group_pairs) in ordered {
         // Maintain the per-file (path, pos) sort order within each group.
         sort_position_delete_pairs(&mut group_pairs);
 
@@ -89,18 +117,73 @@ pub(crate) async fn write_position_deletes(
         let partition_key =
             PartitionKey::new(spec, schema.clone(), partition).map_err(to_datafusion_error)?;
 
-        let files = write_position_deletes_for_partition(
-            table,
-            &config,
-            &group_pairs,
-            Some(partition_key),
-            None,
-        )
-        .await?;
-        all_delete_files.extend(files);
+        match granularity {
+            DeleteGranularity::Partition => {
+                let files = write_position_deletes_for_partition(
+                    table,
+                    &config,
+                    &group_pairs,
+                    Some(partition_key),
+                    None,
+                )
+                .await?;
+                all_delete_files.extend(files);
+            }
+            DeleteGranularity::File => {
+                for run in split_pairs_by_file(&group_pairs) {
+                    let files = write_position_deletes_for_partition(
+                        table,
+                        &config,
+                        &run,
+                        Some(partition_key.clone()),
+                        None,
+                    )
+                    .await?;
+                    all_delete_files.extend(files);
+                }
+            }
+        }
     }
 
     Ok(all_delete_files)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteGranularity {
+    File,
+    Partition,
+}
+
+fn delete_granularity(table: &Table) -> DFResult<DeleteGranularity> {
+    match table
+        .metadata()
+        .properties()
+        .get(TableProperties::PROPERTY_DELETE_GRANULARITY)
+    {
+        None => Ok(DeleteGranularity::File),
+        Some(value) if value.eq_ignore_ascii_case("file") => Ok(DeleteGranularity::File),
+        Some(value) if value.eq_ignore_ascii_case("partition") => Ok(DeleteGranularity::Partition),
+        Some(value) => Err(DataFusionError::Plan(format!(
+            "Invalid value '{value}' for table property '{}'",
+            TableProperties::PROPERTY_DELETE_GRANULARITY
+        ))),
+    }
+}
+
+fn split_pairs_by_file(pairs: &[(String, i64)]) -> Vec<Vec<(String, i64)>> {
+    let mut sorted = pairs.to_vec();
+    sort_position_delete_pairs(&mut sorted);
+    let mut runs: Vec<Vec<(String, i64)>> = Vec::new();
+    for pair in sorted {
+        if let Some(run) = runs.last_mut()
+            && run[0].0 == pair.0
+        {
+            run.push(pair);
+            continue;
+        }
+        runs.push(vec![pair]);
+    }
+    runs
 }
 
 /// The `(path, pos)` pairs of one position-delete output file, keyed by the `(spec_id, partition)`

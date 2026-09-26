@@ -3817,20 +3817,22 @@ async fn test_update_mread_cross_partition_delete_stamps() -> Result<()> {
 async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()> {
     let (ctx, client) = make_partitioned_mread_ctx("mread_partition_probe4", "items").await?;
 
-    // Two separate INSERT statements → two data files, both in 'electronics' partition.
-    ctx.sql("INSERT INTO catalog.mread_partition_probe4.items VALUES (1, 'electronics', 'laptop')")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
-    ctx.sql("INSERT INTO catalog.mread_partition_probe4.items VALUES (2, 'electronics', 'phone')")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
+    let ns = NamespaceIdent::new("mread_partition_probe4".to_string());
+    let tbl_id = iceberg::TableIdent::new(ns, "items".to_string());
+    let tx = iceberg::transaction::Transaction::new(&client.load_table(&tbl_id).await?);
+    let action = tx.update_table_properties().set(
+        "write.delete.granularity".to_string(),
+        "partition".to_string(),
+    );
+    iceberg::transaction::ApplyTransactionAction::apply(action, tx)?
+        .commit(client.as_ref())
+        .await?;
+    for statement in [
+        "INSERT INTO catalog.mread_partition_probe4.items VALUES (1, 'electronics', 'laptop')",
+        "INSERT INTO catalog.mread_partition_probe4.items VALUES (2, 'electronics', 'phone')",
+    ] {
+        ctx.sql(statement).await.unwrap().collect().await.unwrap();
+    }
 
     // UPDATE both rows (both files, same partition).
     let batches = ctx
@@ -3851,8 +3853,6 @@ async fn test_update_mread_two_files_same_partition_single_delete() -> Result<()
         .value(0);
     assert_eq!(upd_count, 2, "2 rows updated");
 
-    let ns = NamespaceIdent::new("mread_partition_probe4".to_string());
-    let tbl_id = iceberg::TableIdent::new(ns.clone(), "items".to_string());
     let table_after = client.load_table(&tbl_id).await?;
     let snap_after = table_after.metadata().current_snapshot().unwrap();
     let ml_after = snap_after
