@@ -169,6 +169,11 @@ the in-memory storage.
 - Staged create (`StagedTableTransaction::begin_create`, CTAS) still names `00000-<uuid>` in
   Hadoop mode; a later slice.
 - `publish_replace_table` writes no hint.
+- 2026-09-26 (WO F-HADOOP-STAGED-CREATE-1): both staged residues above are retired. A staged
+  create on a Hadoop-named catalog publishes `v1.metadata.json` plus `version-hint.text` = `1`
+  (the staged `00000-<uuid>` file is deleted after a successful publish); a staged replace onto a
+  `vN` base publishes `v(N+1)` plus the hint. Uuid naming is unchanged on both paths. Evidence:
+  `catalog/memory/hadoop_staged_tests.rs`, `catalog/memory/staged_publish.rs`.
 - `drop_table` deletes only the current metadata file, so earlier `vK` files and the hint survive a
   non-purge drop. Since D-3 was revised, re-creating a table dropped at `v2` or later fails at
   create with `CatalogCommitConflicts` on the leftover `v1` (Java `HadoopCatalog.dropTable` removes
@@ -278,7 +283,7 @@ best-effort, so the caller's retry collides with the leftover.
 | ... `VacantEntry::insert`, `cache_put`, `table_builder().build()` | pointer registered | No: `insert` and `cache_put` cannot fail; `build` fails only on a missing `file_io`, `metadata` or `identifier`, and all three are set | — |
 | Hadoop `update_table` commit: `write_commit_metadata(vN)` outside the lock, then the lock, a CAS check, `commit_table_update`, then the hint | `vN` published before the final CAS | Yes: a CAS conflict after `vN` is published returns `CatalogCommitConflicts` and leaves an orphan `vN` | The next commit from the new base targets the same `vN`, finds it and fails loud; re-registering at the newest version recovers. Pre-existing on `main` (R167); residue, not in this diff |
 | `register_table` | nothing written; pointer insert under the lock | The insert can fail (`TableAlreadyExists`); nothing durable to leak | — |
-| staged create (`begin_create`) | `00000-<uuid>` written before the pointer publish | Yes, the publish can fail | A fresh uuid name, so no collision on retry; the orphan file is harmless. Not in this diff |
+| staged create (`begin_create`) | `00000-<uuid>` written before the pointer publish; on Hadoop naming the publish (F-HADOOP-STAGED-CREATE-1, 2026-09-26) also exclusive-writes `v1` under the lock before the pointer insert | Yes, the publish can fail | A fresh uuid name, so no collision on retry; the orphan file is harmless. A leftover `v1` (a non-purge drop, or a cancellation between the `v1` write and the slot insert) makes the next staged create fail loud and retryable with `CatalogCommitConflicts`, exactly as D-3 describes for the direct create |
 | staged replace (`begin_replace`, `publish_replace_table`) | `v(N+1)` published before the pointer CAS | Yes, a CAS conflict leaves an orphan `v(N+1)` | As for `update_table`. Pre-existing on `main`; residue |
 | `stage_and_publish`: staging (`create_new` plus `write_all`) | nothing at `dest` | `Err` (Unexpected); the temp is removed best-effort | no `dest`; a stray temp at worst, never read |
 | `stage_and_publish`: `hard_link` `AlreadyExists` | nothing of ours at `dest` | `Err` (`PreconditionFailed`) | the other writer's `dest` (correct) |

@@ -21,11 +21,14 @@ mod caches;
 mod catalog;
 #[cfg(test)]
 mod hadoop_naming_tests;
+#[cfg(test)]
+mod hadoop_staged_tests;
 mod metadata_naming;
 mod namespace_state;
 #[cfg(test)]
 mod pointer_cache_tests;
 #[cfg(test)]
 mod register_cache_tests;
+mod staged_publish;
 
 pub use catalog::*;
