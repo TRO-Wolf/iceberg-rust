@@ -169,6 +169,11 @@ the in-memory storage.
 - Staged create (`StagedTableTransaction::begin_create`, CTAS) still names `00000-<uuid>` in
   Hadoop mode; a later slice.
 - `publish_replace_table` writes no hint.
+- 2026-09-26 (WO F-HADOOP-STAGED-CREATE-1): both staged residues above are retired. A staged
+  create on a Hadoop-named catalog publishes `v1.metadata.json` plus `version-hint.text` = `1`
+  (the staged `00000-<uuid>` file is deleted after a successful publish); a staged replace onto a
+  `vN` base publishes `v(N+1)` plus the hint. Uuid naming is unchanged on both paths. Evidence:
+  `catalog/memory/hadoop_staged_tests.rs`, `catalog/memory/staged_publish.rs`.
 - `drop_table` deletes only the current metadata file, so earlier `vK` files and the hint survive a
   non-purge drop. Since D-3 was revised, re-creating a table dropped at `v2` or later fails at
   create with `CatalogCommitConflicts` on the leftover `v1` (Java `HadoopCatalog.dropTable` removes
