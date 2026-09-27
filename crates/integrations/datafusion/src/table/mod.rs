@@ -453,6 +453,9 @@ mod branch_schema_tests;
 #[path = "delete_granularity_tests.rs"]
 mod delete_granularity_tests;
 #[cfg(test)]
+#[path = "manifest_merge_insert_tests.rs"]
+mod manifest_merge_insert_tests;
+#[cfg(test)]
 #[path = "output_spec_id_tests.rs"]
 mod output_spec_id_tests;
 #[cfg(test)]

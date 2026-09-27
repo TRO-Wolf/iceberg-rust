@@ -42,6 +42,7 @@ DataFusion `TableProvider` implementations. Metadata-table `scan` honors `projec
 | `table_provider_factory.rs` | DataFusion factory for `CREATE EXTERNAL TABLE` |
 | `tests.rs` | `#[cfg(test)]` unit tests: provider construction, static provider, partitioning/sort/limit plans, shared fixtures (`pub(super)` helpers reused by `schema_evo_tests.rs`) |
 | `schema_evo_tests.rs` | `#[cfg(test)]` unit tests: schema-evolution cells — stale providers, delete/update binding to the current schema, renames, nested evolution, pushdown after evolution |
+| `manifest_merge_insert_tests.rs` | F-MANIFEST-MERGE-1 pins: SQL INSERT merges manifests per `commit.manifest.*` like Spark `newAppend` |
 
 ## I want to...
 
