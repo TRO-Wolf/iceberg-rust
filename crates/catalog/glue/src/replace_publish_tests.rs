@@ -148,13 +148,17 @@ async fn replace_publish_unreadable_staged_metadata_refuses_before_send() {
         .metadata_location_result()
         .expect("staged location")
         .to_string();
-    file_io
-        .delete(&staged_location)
-        .await
-        .expect("delete staged");
+    let base_location = table
+        .metadata_location_result()
+        .expect("base location")
+        .to_string();
+    assert!(
+        !file_io.exists(&staged_location).await.expect("exists"),
+        "the staged target is unwritten before commit, so publish reads a missing file"
+    );
 
-    let error = staged
-        .commit(&catalog)
+    let error = catalog
+        .publish_replace_table(staged.table().clone(), Some(base_location))
         .await
         .expect_err("unreadable staged");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
@@ -173,6 +177,10 @@ async fn replace_publish_foreign_uuid_staged_metadata_refuses_before_send() {
         .metadata_location_result()
         .expect("staged location")
         .to_string();
+    let base_location = table
+        .metadata_location_result()
+        .expect("base location")
+        .to_string();
     let foreign = TableMetadataBuilder::from_table_creation(
         TableCreation::builder()
             .name(ident.name().to_string())
@@ -184,13 +192,16 @@ async fn replace_publish_foreign_uuid_staged_metadata_refuses_before_send() {
     .build()
     .expect("foreign metadata")
     .metadata;
-    assert_ne!(foreign.uuid(), table.metadata().uuid());
+    assert_ne!(foreign.uuid(), staged.table().metadata().uuid());
     foreign
         .write_to(&file_io, &staged_location)
         .await
-        .expect("overwrite staged file");
+        .expect("write foreign staged file");
 
-    let error = staged.commit(&catalog).await.expect_err("foreign uuid");
+    let error = catalog
+        .publish_replace_table(staged.table().clone(), Some(base_location))
+        .await
+        .expect_err("foreign uuid");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
     assert_eq!(catalog.catalog_commit_attempts(), 0);
     let still = catalog.load_table(&ident).await.expect("load");

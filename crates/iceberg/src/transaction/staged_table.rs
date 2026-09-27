@@ -217,10 +217,6 @@ impl StagedTableTransaction {
         };
         if hadoop_staged_location(&metadata_location) {
             ensure_staged_version_absent(existing.file_io(), &metadata_location).await?;
-        } else {
-            metadata
-                .write_commit_metadata(existing.file_io(), &metadata_location)
-                .await?;
         }
 
         let table = Table::builder()
@@ -286,12 +282,10 @@ impl StagedTableTransaction {
         if self.pending_data_files.is_empty() && !self.replace_write {
             let table = self.table;
             let staged_location = table.metadata_location_result()?.to_string();
-            if hadoop_staged_location(&staged_location) {
-                table
-                    .metadata()
-                    .write_commit_metadata(table.file_io(), &staged_location)
-                    .await?;
-            }
+            table
+                .metadata()
+                .write_commit_metadata(table.file_io(), &staged_location)
+                .await?;
             return Ok(table);
         }
         let tx = Transaction::new(&self.table);

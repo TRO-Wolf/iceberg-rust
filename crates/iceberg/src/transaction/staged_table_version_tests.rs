@@ -16,13 +16,26 @@
 // under the License.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::io::FileIO;
-use crate::spec::{NestedField, PrimitiveType, Schema, TableMetadataBuilder, Type};
+use async_trait::async_trait;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+
+use crate::io::{
+    FileIO, FileInfo, FileMetadata, FileRead, FileWrite, InputFile, MemoryStorage, OutputFile,
+    Storage, StorageConfig, StorageFactory,
+};
+use crate::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+use crate::spec::{
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, Operation,
+    PrimitiveType, Schema, Struct, TableMetadataBuilder, Type,
+};
 use crate::table::Table;
 use crate::transaction::{ApplyTransactionAction, StagedTableTransaction, Transaction};
-use crate::{ErrorKind, NamespaceIdent, TableCreation, TableIdent};
+use crate::{
+    Catalog, CatalogBuilder, Error, ErrorKind, NamespaceIdent, Result, TableCreation, TableIdent,
+};
 
 fn schema() -> Schema {
     Schema::builder()
@@ -95,8 +108,8 @@ async fn replace_stages_next_version_after_a_hive_named_pointer() {
     );
     assert!(staged_location.ends_with(".metadata.json"));
     assert!(
-        file_io.exists(&staged_location).await.expect("exists"),
-        "the staged metadata file must be written"
+        !file_io.exists(&staged_location).await.expect("exists"),
+        "the staged metadata file must be written once at commit, not at begin"
     );
 }
 
@@ -219,8 +232,8 @@ async fn concurrent_replaces_from_a_uuid_pointer_stage_distinct_files() {
         "uuid-named base keeps version continuation, got {second}"
     );
     assert_ne!(first, second, "uuid names cannot collide");
-    assert!(file_io.exists(&first).await.expect("first exists"));
-    assert!(file_io.exists(&second).await.expect("second exists"));
+    assert!(!file_io.exists(&first).await.expect("first exists"));
+    assert!(!file_io.exists(&second).await.expect("second exists"));
 }
 
 #[tokio::test]
@@ -376,6 +389,345 @@ async fn replace_stages_uncompressed_next_version_after_a_gzip_hadoop_pointer() 
         !file_io.exists(&staged_location).await.expect("exists"),
         "a Hadoop staged target is written once at commit, not at begin"
     );
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NoOverwriteStorage {
+    #[serde(skip, default = "shared_memory_storage")]
+    inner: Arc<dyn Storage>,
+    #[serde(skip, default = "default_write_counts")]
+    writes: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+fn shared_memory_storage() -> Arc<dyn Storage> {
+    Arc::new(MemoryStorage::default())
+}
+
+fn default_write_counts() -> Arc<Mutex<HashMap<String, usize>>> {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for NoOverwriteStorage {
+    async fn exists(&self, path: &str) -> Result<bool> {
+        self.inner.exists(path).await
+    }
+
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        self.inner.metadata(path).await
+    }
+
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        self.inner.read(path).await
+    }
+
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        self.inner.reader(path).await
+    }
+
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        if self.inner.exists(path).await? {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!("second write of an existing path refused: {path}"),
+            ));
+        }
+        self.inner.write(path, bs).await?;
+        *self
+            .writes
+            .lock()
+            .expect("write counts")
+            .entry(path.to_string())
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    async fn write_new(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.inner.write_new(path, bs).await
+    }
+
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        self.inner.writer(path).await
+    }
+
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.inner.delete(path).await
+    }
+
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        self.inner.delete_prefix(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<FileInfo>> {
+        self.inner.list(prefix).await
+    }
+
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NoOverwriteStorageFactory {
+    #[serde(skip, default = "shared_memory_storage")]
+    inner: Arc<dyn Storage>,
+    #[serde(skip, default = "default_write_counts")]
+    writes: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+#[typetag::serde]
+impl StorageFactory for NoOverwriteStorageFactory {
+    fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
+        Ok(Arc::new(NoOverwriteStorage {
+            inner: self.inner.clone(),
+            writes: self.writes.clone(),
+        }))
+    }
+}
+
+fn single_write_storage() -> (
+    NoOverwriteStorageFactory,
+    Arc<Mutex<HashMap<String, usize>>>,
+) {
+    let writes = default_write_counts();
+    let factory = NoOverwriteStorageFactory {
+        inner: shared_memory_storage(),
+        writes: writes.clone(),
+    };
+    (factory, writes)
+}
+
+async fn single_write_catalog(factory: NoOverwriteStorageFactory) -> MemoryCatalog {
+    MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(factory))
+        .load(
+            "mem",
+            HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                "memory://warehouse".to_string(),
+            )]),
+        )
+        .await
+        .expect("load memory catalog")
+}
+
+async fn seed_single_write_table(catalog: &MemoryCatalog) -> Table {
+    let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
+    catalog
+        .create_namespace(ident.namespace(), HashMap::new())
+        .await
+        .expect("create namespace");
+    catalog
+        .create_table(
+            ident.namespace(),
+            TableCreation::builder()
+                .name(ident.name().to_string())
+                .schema(schema())
+                .build(),
+        )
+        .await
+        .expect("create table")
+}
+
+fn version_data_file(path: &str, records: u64) -> DataFile {
+    DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(path.to_string())
+        .file_format(DataFileFormat::Parquet)
+        .file_size_in_bytes(100)
+        .record_count(records)
+        .partition(Struct::empty())
+        .partition_spec_id(0)
+        .build()
+        .expect("build data file")
+}
+
+fn replace_operation(table: &Table) -> Operation {
+    table
+        .metadata()
+        .current_snapshot()
+        .expect("replace commit must leave a current snapshot")
+        .summary()
+        .operation
+        .clone()
+}
+
+fn assert_metadata_keys_written_once(
+    writes: &Arc<Mutex<HashMap<String, usize>>>,
+    expected: &[String],
+) {
+    let counts = writes.lock().expect("write counts");
+    for path in expected {
+        assert_eq!(
+            counts.get(path),
+            Some(&1),
+            "metadata key must be written exactly once: {path}"
+        );
+    }
+    for (path, count) in counts.iter() {
+        if path.ends_with(".metadata.json") {
+            assert_eq!(*count, 1, "metadata key written {count} times: {path}");
+        }
+    }
+}
+
+async fn assert_two_metadata_versions(table: &Table, metadata_dir: &str) {
+    let listed = table
+        .file_io()
+        .list(metadata_dir)
+        .await
+        .expect("list metadata dir");
+    let versions: Vec<_> = listed
+        .iter()
+        .filter(|entry| entry.location.ends_with(".metadata.json"))
+        .collect();
+    assert_eq!(
+        versions.len(),
+        2,
+        "one replace must leave exactly the seed version plus the staged version, got {:?}",
+        versions
+            .iter()
+            .map(|entry| &entry.location)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn replace_with_files_writes_each_metadata_key_once() {
+    let (factory, writes) = single_write_storage();
+    let catalog = single_write_catalog(factory).await;
+    let table = seed_single_write_table(&catalog).await;
+    let base_location = table
+        .metadata_location_result()
+        .expect("base location")
+        .to_string();
+    let metadata_dir = format!("{}/metadata", table.metadata().location());
+
+    let staged =
+        StagedTableTransaction::begin_replace(&table, replace_creation(table.identifier()))
+            .await
+            .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert!(
+        staged_location.starts_with(&format!("{metadata_dir}/00001-")),
+        "the staged target must be version 00001, got {staged_location}"
+    );
+    assert!(
+        !staged
+            .table()
+            .file_io()
+            .exists(&staged_location)
+            .await
+            .expect("probe staged target"),
+        "begin_replace must not write the staged target; commit writes it once"
+    );
+
+    let committed = staged
+        .with_replace_write(true)
+        .add_data_files(vec![version_data_file(
+            "memory://warehouse/ns/t/data/r.parquet",
+            7,
+        )])
+        .commit(&catalog)
+        .await
+        .expect("replace commit under a no-overwrite store");
+    assert_eq!(
+        committed.metadata_location_result().expect("location"),
+        staged_location.as_str()
+    );
+    assert_eq!(replace_operation(&committed), Operation::Overwrite);
+    assert_metadata_keys_written_once(&writes, &[base_location, staged_location]);
+    assert_two_metadata_versions(&committed, &metadata_dir).await;
+}
+
+#[tokio::test]
+async fn replace_write_without_files_writes_each_metadata_key_once() {
+    let (factory, writes) = single_write_storage();
+    let catalog = single_write_catalog(factory).await;
+    let table = seed_single_write_table(&catalog).await;
+    let base_location = table
+        .metadata_location_result()
+        .expect("base location")
+        .to_string();
+    let metadata_dir = format!("{}/metadata", table.metadata().location());
+
+    let staged =
+        StagedTableTransaction::begin_replace(&table, replace_creation(table.identifier()))
+            .await
+            .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+
+    let committed = staged
+        .with_replace_write(true)
+        .commit(&catalog)
+        .await
+        .expect("empty replace commit under a no-overwrite store");
+    assert_eq!(
+        committed.metadata_location_result().expect("location"),
+        staged_location.as_str()
+    );
+    assert_eq!(replace_operation(&committed), Operation::Delete);
+    assert_metadata_keys_written_once(&writes, &[base_location, staged_location]);
+    assert_two_metadata_versions(&committed, &metadata_dir).await;
+}
+
+#[tokio::test]
+async fn empty_plain_replace_writes_staged_target_once_at_commit() {
+    let (factory, writes) = single_write_storage();
+    let catalog = single_write_catalog(factory).await;
+    let table = seed_single_write_table(&catalog).await;
+    let base_location = table
+        .metadata_location_result()
+        .expect("base location")
+        .to_string();
+    let metadata_dir = format!("{}/metadata", table.metadata().location());
+
+    let staged =
+        StagedTableTransaction::begin_replace(&table, replace_creation(table.identifier()))
+            .await
+            .expect("begin replace");
+    let staged_location = staged
+        .table()
+        .metadata_location_result()
+        .expect("staged location")
+        .to_string();
+    assert!(
+        !staged
+            .table()
+            .file_io()
+            .exists(&staged_location)
+            .await
+            .expect("probe staged target"),
+        "begin_replace must not write the staged target; commit writes it once"
+    );
+
+    let committed = staged
+        .commit(&catalog)
+        .await
+        .expect("empty plain replace commit under a no-overwrite store");
+    assert_eq!(
+        committed.metadata_location_result().expect("location"),
+        staged_location.as_str()
+    );
+    assert!(
+        committed.metadata().current_snapshot().is_none(),
+        "an empty plain replace must leave no current snapshot"
+    );
+    assert_metadata_keys_written_once(&writes, &[base_location, staged_location]);
+    assert_two_metadata_versions(&committed, &metadata_dir).await;
 }
 
 #[tokio::test]
