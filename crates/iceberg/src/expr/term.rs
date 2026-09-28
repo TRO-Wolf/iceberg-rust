@@ -313,7 +313,7 @@ impl Bind for Reference {
         let field = if case_sensitive {
             schema.field_by_name(&self.name)
         } else {
-            schema.field_by_name_case_insensitive(&self.name)
+            schema.try_field_by_name_case_insensitive(&self.name)?
         };
 
         let field = field.ok_or_else(|| {
@@ -448,5 +448,37 @@ mod tests {
         let schema = table_schema_simple();
         let result = Reference::new("bar_non_exist").bind(schema, false);
         assert!(result.is_err());
+    }
+
+    fn twin_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "a", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::required(2, "A", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .expect("case-twin columns must build"),
+        )
+    }
+
+    #[test]
+    fn test_bind_reference_case_insensitive_on_twins_refuses() {
+        let error = Reference::new("a")
+            .bind(twin_schema(), false)
+            .expect_err("case-insensitive bind on twins must refuse");
+        assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
+        assert_eq!(
+            error.message(),
+            "Cannot build lower case index: a and A collide"
+        );
+    }
+
+    #[test]
+    fn test_bind_reference_case_sensitive_on_twins_binds_exactly() {
+        let bound = Reference::new("A")
+            .bind(twin_schema(), true)
+            .expect("case-sensitive bind of A must succeed");
+        assert_eq!(bound.field().id, 2);
     }
 }

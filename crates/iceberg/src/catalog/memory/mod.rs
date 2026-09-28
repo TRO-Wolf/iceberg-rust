@@ -18,6 +18,8 @@
 //! Memory catalog implementation.
 
 mod caches;
+#[cfg(test)]
+mod case_twin_tests;
 mod catalog;
 #[cfg(test)]
 mod hadoop_naming_tests;

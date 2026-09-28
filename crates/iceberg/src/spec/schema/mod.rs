@@ -24,6 +24,8 @@ use std::sync::Arc;
 #[cfg(test)]
 mod accessor_tests;
 mod cache_charge;
+#[cfg(test)]
+mod lowercase_lazy_tests;
 mod utils;
 mod visitor;
 pub use self::visitor::*;
@@ -88,6 +90,7 @@ pub struct Schema {
 
     name_to_id: HashMap<String, i32>,
     lowercase_name_to_id: HashMap<String, i32>,
+    lowercase_collision: Option<(String, String)>,
     id_to_name: HashMap<i32, String>,
 
     field_id_to_accessor: HashMap<i32, Arc<StructAccessor>>,
@@ -113,47 +116,33 @@ pub struct SchemaBuilder {
     reassign_field_ids_from: Option<i32>,
 }
 
-/// Build the case-insensitive (lower-cased) name → field-id index, rejecting any two distinct columns
-/// whose names differ only by case — the Rust mirror of Java `TypeUtil.indexByLowerCaseName`, which
-/// throws `IllegalArgumentException` rather than silently dropping a collision into a `HashMap`.
-///
-/// `name_to_id` is the case-sensitive index and `id_to_name` its inverse (used only to render the
-/// offending full names in the error). A collision between two fields that share a field id (impossible
-/// in a well-formed schema, but cheap to allow) is not an error. To keep the message deterministic
-/// despite `HashMap` iteration order, the field with the smaller id is reported first — matching Java,
-/// where the first-visited (lower-id) name lands in the map before the colliding one.
 fn build_lowercase_name_index(
     name_to_id: &HashMap<String, i32>,
     id_to_name: &HashMap<i32, String>,
-) -> Result<HashMap<String, i32>> {
+) -> (HashMap<String, i32>, Option<(String, String)>) {
+    let mut entries: Vec<(&String, &i32)> = name_to_id.iter().collect();
+    entries.sort_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
     let mut lowercase_name_to_id: HashMap<String, i32> = HashMap::with_capacity(name_to_id.len());
-    for (name, &field_id) in name_to_id {
+    let mut collision = None;
+    for (name, &field_id) in entries {
         let key = name.to_lowercase();
-        if let Some(&existing_id) = lowercase_name_to_id.get(&key)
-            && existing_id != field_id
-        {
-            // Report the smaller-id field first so the message is order-independent.
-            let (first_id, second_id) = if existing_id <= field_id {
-                (existing_id, field_id)
-            } else {
-                (field_id, existing_id)
-            };
-            let first = id_to_name
-                .get(&first_id)
-                .map(String::as_str)
-                .unwrap_or(name);
-            let second = id_to_name
-                .get(&second_id)
-                .map(String::as_str)
-                .unwrap_or(name);
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Cannot build lower case index: {first} and {second} collide"),
-            ));
+        if let Some(&existing_id) = lowercase_name_to_id.get(&key) {
+            if existing_id != field_id && collision.is_none() {
+                let first = id_to_name
+                    .get(&existing_id)
+                    .map(String::as_str)
+                    .unwrap_or(name);
+                let second = id_to_name
+                    .get(&field_id)
+                    .map(String::as_str)
+                    .unwrap_or(name);
+                collision = Some((first.to_string(), second.to_string()));
+            }
+        } else {
+            lowercase_name_to_id.insert(key, field_id);
         }
-        lowercase_name_to_id.insert(key, field_id);
     }
-    Ok(lowercase_name_to_id)
+    (lowercase_name_to_id, collision)
 }
 
 /// The minimum table format version a field's type requires, or `None` if it is valid at every version.
@@ -233,7 +222,7 @@ impl SchemaBuilder {
             index.indexes()
         };
 
-        let lowercase_name_to_id = build_lowercase_name_index(&name_to_id, &id_to_name)?;
+        let lowercase = build_lowercase_name_index(&name_to_id, &id_to_name);
 
         let highest_field_id = id_to_field.keys().max().cloned().unwrap_or(0);
 
@@ -246,7 +235,8 @@ impl SchemaBuilder {
             id_to_field,
 
             name_to_id,
-            lowercase_name_to_id,
+            lowercase_name_to_id: lowercase.0,
+            lowercase_collision: lowercase.1,
             id_to_name,
 
             field_id_to_accessor,
@@ -427,13 +417,26 @@ impl Schema {
             .and_then(|id| self.field_by_id(*id))
     }
 
-    /// Get field by field name, but in case-insensitive way.
-    ///
-    /// Both full name and short name could work here.
+    /// Get field by name case-insensitively; returns None on a collided schema.
     pub fn field_by_name_case_insensitive(&self, field_name: &str) -> Option<&NestedFieldRef> {
+        if self.lowercase_collision.is_some() {
+            return None;
+        }
         self.lowercase_name_to_id
             .get(&field_name.to_lowercase())
             .and_then(|id| self.field_by_id(*id))
+    }
+
+    /// Get field by name case-insensitively, failing on a collided schema.
+    pub fn try_field_by_name_case_insensitive(
+        &self,
+        field_name: &str,
+    ) -> Result<Option<&NestedFieldRef>> {
+        if let Some((first, second)) = &self.lowercase_collision {
+            let message = format!("Cannot build lower case index: {first} and {second} collide");
+            return Err(Error::new(ErrorKind::DataInvalid, message));
+        }
+        Ok(self.field_by_name_case_insensitive(field_name))
     }
 
     /// Get field by alias.
@@ -657,25 +660,22 @@ mod tests {
         assert_eq!(None, schema.field_by_id(3));
     }
 
-    // RISK: two columns whose names differ only by case must be rejected at build time with the exact
-    // Java `TypeUtil.indexByLowerCaseName` message — silently collapsing them into one lowercase index
-    // entry (the old `.collect()` behavior) would let a case-insensitive evolution build an ambiguous
-    // schema where "data" and "DATA" both resolve to the same id.
     #[test]
-    fn test_build_rejects_case_insensitive_name_collision() {
-        let result = Schema::builder()
+    fn test_build_accepts_case_twins_and_lazy_lookup_refuses() {
+        let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
                 NestedField::required(2, "data", Type::Primitive(PrimitiveType::String)).into(),
                 NestedField::required(3, "DATA", Type::Primitive(PrimitiveType::String)).into(),
             ])
-            .build();
-        let error = result.expect_err("case-colliding column names must fail to build");
+            .build()
+            .expect("case-twin columns must build");
+        let lookup = schema.try_field_by_name_case_insensitive("data");
+        let error = lookup.expect_err("case-insensitive lookup on twins must refuse");
         assert_eq!(error.kind(), crate::ErrorKind::DataInvalid);
         assert_eq!(
             error.message(),
-            "Cannot build lower case index: data and DATA collide",
-            "message must mirror Java TypeUtil.indexByLowerCaseName (smaller field id first)"
+            "Cannot build lower case index: data and DATA collide"
         );
     }
 
