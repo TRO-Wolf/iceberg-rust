@@ -312,7 +312,10 @@ fn valid_z_order_columns(table: &Table, spec: &ZOrderSpec) -> Result<Vec<String>
         ));
     }
     let schema = table.metadata().current_schema();
-    if schema.field_by_name_case_insensitive(Z_COLUMN).is_some() {
+    if schema
+        .try_field_by_name_case_insensitive(Z_COLUMN)?
+        .is_some()
+    {
         return Err(Error::new(
             ErrorKind::DataInvalid,
             format!(
@@ -331,15 +334,17 @@ fn valid_z_order_columns(table: &Table, spec: &ZOrderSpec) -> Result<Vec<String>
 
     let mut kept = Vec::with_capacity(spec.columns.len());
     for name in &spec.columns {
-        let field = schema.field_by_name_case_insensitive(name).ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot find column '{name}' in table schema (case sensitive = false): {}",
-                    java_struct_display(schema)
-                ),
-            )
-        })?;
+        let field = schema
+            .try_field_by_name_case_insensitive(name)?
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Cannot find column '{name}' in table schema (case sensitive = false): {}",
+                        java_struct_display(schema)
+                    ),
+                )
+            })?;
         if identity_sources.contains(&field.id) {
             continue;
         }

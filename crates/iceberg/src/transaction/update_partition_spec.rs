@@ -262,13 +262,13 @@ impl<'a> SpecEvolution<'a> {
         }
     }
 
-    /// Resolve a source column name to its field id, honoring the case-sensitivity flag. Mirrors
-    /// Java's `resolve(term)` schema lookup.
+    /// Resolve a source column id by name (Java `resolve`), honoring case sensitivity.
     fn resolve_source_id(&self, source_name: &str) -> Result<i32> {
         let field = if self.case_sensitive {
             self.schema.field_by_name(source_name)
         } else {
-            self.schema.field_by_name_case_insensitive(source_name)
+            self.schema
+                .try_field_by_name_case_insensitive(source_name)?
         };
         field.map(|f| f.id).ok_or_else(|| {
             data_invalid(format!(

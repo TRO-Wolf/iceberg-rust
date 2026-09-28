@@ -443,14 +443,15 @@ impl<'a> SchemaEvolution<'a> {
         })
     }
 
-    /// Resolve a column name to its existing base-schema field, honoring case sensitivity (Java
-    /// `findField`).
-    fn find_field(&self, name: &str) -> Option<NestedFieldRef> {
+    /// Resolve a base-schema column by name (Java `findField`), honoring case sensitivity.
+    fn find_field(&self, name: &str) -> Result<Option<NestedFieldRef>> {
         if self.case_sensitive {
-            self.schema.field_by_name(name).cloned()
-        } else {
-            self.schema.field_by_name_case_insensitive(name).cloned()
+            return Ok(self.schema.field_by_name(name).cloned());
         }
+        Ok(self
+            .schema
+            .try_field_by_name_case_insensitive(name)?
+            .cloned())
     }
 
     /// The case-aware key under which an added column's full name is stored (Java
@@ -469,25 +470,24 @@ impl<'a> SchemaEvolution<'a> {
             .contains_key(&self.case_aware_name(name))
     }
 
-    /// Resolve a column for an update-style op: prefer a pending update over the base field, and fall
-    /// back to an added field (Java `findForUpdate`). Returns the current effective NestedField.
-    fn find_for_update(&self, name: &str) -> Option<NestedField> {
-        if let Some(existing) = self.find_field(name) {
+    /// Resolve a column for update (Java `findForUpdate`): pending, base, then added.
+    fn find_for_update(&self, name: &str) -> Result<Option<NestedField>> {
+        if let Some(existing) = self.find_field(name)? {
             if let Some(pending) = self.updates.get(&existing.id) {
-                return Some(pending.clone());
+                return Ok(Some(pending.clone()));
             }
-            return Some((*existing).clone());
+            return Ok(Some((*existing).clone()));
         }
-        let added_id = self.added_name_to_id.get(&self.case_aware_name(name))?;
-        self.added_fields.get(added_id).cloned()
+        let added_id = self.added_name_to_id.get(&self.case_aware_name(name));
+        Ok(added_id.and_then(|id| self.added_fields.get(id).cloned()))
     }
 
     /// Resolve a column for a move: an added field wins over a base field (Java `findForMove`).
-    fn find_for_move(&self, name: &str) -> Option<i32> {
+    fn find_for_move(&self, name: &str) -> Result<Option<i32>> {
         if let Some(added_id) = self.added_name_to_id.get(&self.case_aware_name(name)) {
-            return Some(*added_id);
+            return Ok(Some(*added_id));
         }
-        self.find_field(name).map(|field| field.id)
+        Ok(self.find_field(name)?.map(|field| field.id))
     }
 
     /// Assign the next fresh field id (Java `assignNewColumnId`).
@@ -532,7 +532,7 @@ impl<'a> SchemaEvolution<'a> {
 
         if let Some(parent) = parent {
             let parent_field = self
-                .find_field(parent)
+                .find_field(parent)?
                 .ok_or_else(|| data_invalid(format!("Cannot find parent struct: {parent}")))?;
             // If the parent is a list or map, descend into the element / value struct.
             let parent_struct_field = match parent_field.field_type.as_ref() {
@@ -555,7 +555,7 @@ impl<'a> SchemaEvolution<'a> {
             }
 
             let nested_name = format!("{parent}.{name}");
-            let current = self.find_field(&nested_name);
+            let current = self.find_field(&nested_name)?;
             if let Some(current) = current
                 && !self.deletes.contains(&current.id)
             {
@@ -570,7 +570,7 @@ impl<'a> SchemaEvolution<'a> {
                 .unwrap_or_else(|| parent.to_string());
             full_name = format!("{parent_full_name}.{name}");
         } else {
-            let current = self.find_field(name);
+            let current = self.find_field(name)?;
             if let Some(current) = current
                 && !self.deletes.contains(&current.id)
             {
@@ -618,7 +618,7 @@ impl<'a> SchemaEvolution<'a> {
     /// Replay `deleteColumn` (Java `deleteColumn`).
     fn delete_column(&mut self, name: &str) -> Result<()> {
         let field = self
-            .find_field(name)
+            .find_field(name)?
             .ok_or_else(|| data_invalid(format!("Cannot delete missing column: {name}")))?;
         if self.parent_to_added_ids.contains_key(&field.id) {
             return Err(data_invalid(format!(
@@ -637,7 +637,7 @@ impl<'a> SchemaEvolution<'a> {
     /// Replay `renameColumn` (Java `renameColumn`).
     fn rename_column(&mut self, name: &str, new_name: &str) -> Result<()> {
         let field = self
-            .find_field(name)
+            .find_field(name)?
             .ok_or_else(|| data_invalid(format!("Cannot rename missing column: {name}")))?;
         if self.deletes.contains(&field.id) {
             return Err(data_invalid(format!(
@@ -664,7 +664,7 @@ impl<'a> SchemaEvolution<'a> {
     /// Replay `updateColumn` (Java `updateColumn`).
     fn update_column(&mut self, name: &str, new_type: PrimitiveType) -> Result<()> {
         let field = self
-            .find_for_update(name)
+            .find_for_update(name)?
             .ok_or_else(|| data_invalid(format!("Cannot update missing column: {name}")))?;
         if self.deletes.contains(&field.id) {
             return Err(data_invalid(format!(
@@ -695,7 +695,7 @@ impl<'a> SchemaEvolution<'a> {
     /// Replay `updateColumnDoc` (Java `updateColumnDoc`).
     fn update_column_doc(&mut self, name: &str, doc: Option<String>) -> Result<()> {
         let field = self
-            .find_for_update(name)
+            .find_for_update(name)?
             .ok_or_else(|| data_invalid(format!("Cannot update missing column: {name}")))?;
         if self.deletes.contains(&field.id) {
             return Err(data_invalid(format!(
@@ -717,7 +717,7 @@ impl<'a> SchemaEvolution<'a> {
     /// when the write default already equals the requested value.
     fn update_column_default(&mut self, name: &str, default: &Literal) -> Result<()> {
         let field = self
-            .find_for_update(name)
+            .find_for_update(name)?
             .ok_or_else(|| data_invalid(format!("Cannot update missing column: {name}")))?;
         if self.deletes.contains(&field.id) {
             return Err(data_invalid(format!(
@@ -740,7 +740,7 @@ impl<'a> SchemaEvolution<'a> {
     /// Replay `requireColumn` / `makeColumnOptional` (Java `internalUpdateColumnRequirement`).
     fn update_column_requirement(&mut self, name: &str, is_optional: bool) -> Result<()> {
         let field = self
-            .find_for_update(name)
+            .find_for_update(name)?
             .ok_or_else(|| data_invalid(format!("Cannot update missing column: {name}")))?;
 
         // No-op (required -> required, or optional -> optional) is always allowed, even without the flag.
@@ -783,13 +783,13 @@ impl<'a> SchemaEvolution<'a> {
     /// Replay a move (Java `moveFirst` / `moveBefore` / `moveAfter` + `internalMove`).
     fn apply_move(&mut self, name: &str, kind: MoveKind<'_>) -> Result<()> {
         let field_id = self
-            .find_for_move(name)
+            .find_for_move(name)?
             .ok_or_else(|| data_invalid(format!("Cannot move missing column: {name}")))?;
 
         let move_op = match kind {
             MoveKind::First => Move::First { field_id },
             MoveKind::Before(reference) => {
-                let reference_id = self.find_for_move(reference).ok_or_else(|| {
+                let reference_id = self.find_for_move(reference)?.ok_or_else(|| {
                     data_invalid(format!(
                         "Cannot move {name} before missing column: {reference}"
                     ))
@@ -803,7 +803,7 @@ impl<'a> SchemaEvolution<'a> {
                 }
             }
             MoveKind::After(reference) => {
-                let reference_id = self.find_for_move(reference).ok_or_else(|| {
+                let reference_id = self.find_for_move(reference)?.ok_or_else(|| {
                     data_invalid(format!(
                         "Cannot move {name} after missing column: {reference}"
                     ))
@@ -874,7 +874,7 @@ impl<'a> SchemaEvolution<'a> {
     fn apply(self) -> Result<Schema> {
         // 1. Existing identifier fields (and their ancestors) must not be deleted.
         for name in &self.identifier_field_names {
-            let field = self.find_field(name);
+            let field = self.find_field(name)?;
             if let Some(field) = field {
                 if self.deletes.contains(&field.id) {
                     return Err(data_invalid(format!(
@@ -910,7 +910,7 @@ impl<'a> SchemaEvolution<'a> {
             let field = if self.case_sensitive {
                 resolved.field_by_name(name)
             } else {
-                resolved.field_by_name_case_insensitive(name)
+                resolved.try_field_by_name_case_insensitive(name)?
             };
             let field = field.ok_or_else(|| {
                 data_invalid(format!(
@@ -1282,7 +1282,7 @@ impl SchemaEvolution<'_> {
                 Some(parent_path.join("."))
             };
 
-            match self.find_for_update(&full_name) {
+            match self.find_for_update(&full_name)? {
                 None => {
                     // New field: add it (optional, mirroring union's compatible-add policy, no default).
                     // Its own nested fields come along inside `field_type`, so do not also recurse here.
@@ -1378,7 +1378,7 @@ impl SchemaEvolution<'_> {
         let member_full_name = format!("{parent_full_name}.{}", incoming_member.name);
         // The member must exist on the existing side (a list-present/map-present invariant in Java); if
         // it does not resolve, there is nothing to merge against, so skip rather than fabricate a column.
-        if let Some(existing_member) = self.find_for_update(&member_full_name) {
+        if let Some(existing_member) = self.find_for_update(&member_full_name)? {
             self.union_update_existing(&member_full_name, &existing_member, incoming_member)?;
             self.union_recurse_into(&member_full_name, incoming_member)?;
         }

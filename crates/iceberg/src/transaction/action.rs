@@ -26,6 +26,9 @@ use crate::transaction::Transaction;
 use crate::{Result, TableRequirement, TableUpdate};
 
 #[cfg(test)]
+#[path = "case_twin_tests.rs"]
+mod case_twin_tests;
+#[cfg(test)]
 #[path = "occ_scoped_projection_tests.rs"]
 mod occ_scoped_projection_tests;
 #[cfg(test)]
