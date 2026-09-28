@@ -77,7 +77,7 @@ async fn table_at(
         .expect("table")
 }
 
-fn replace_creation(ident: &TableIdent) -> TableCreation {
+pub(super) fn replace_creation(ident: &TableIdent) -> TableCreation {
     TableCreation::builder()
         .name(ident.name().to_string())
         .schema(schema())
@@ -444,7 +444,14 @@ impl Storage for NoOverwriteStorage {
     }
 
     async fn write_new(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.inner.write_new(path, bs).await
+        self.inner.write_new(path, bs).await?;
+        *self
+            .writes
+            .lock()
+            .expect("write counts")
+            .entry(path.to_string())
+            .or_insert(0) += 1;
+        Ok(())
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
@@ -473,7 +480,7 @@ impl Storage for NoOverwriteStorage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NoOverwriteStorageFactory {
+pub(super) struct NoOverwriteStorageFactory {
     #[serde(skip, default = "shared_memory_storage")]
     inner: Arc<dyn Storage>,
     #[serde(skip, default = "default_write_counts")]
@@ -490,7 +497,7 @@ impl StorageFactory for NoOverwriteStorageFactory {
     }
 }
 
-fn single_write_storage() -> (
+pub(super) fn single_write_storage() -> (
     NoOverwriteStorageFactory,
     Arc<Mutex<HashMap<String, usize>>>,
 ) {
@@ -502,7 +509,7 @@ fn single_write_storage() -> (
     (factory, writes)
 }
 
-async fn single_write_catalog(factory: NoOverwriteStorageFactory) -> MemoryCatalog {
+pub(super) async fn single_write_catalog(factory: NoOverwriteStorageFactory) -> MemoryCatalog {
     MemoryCatalogBuilder::default()
         .with_storage_factory(Arc::new(factory))
         .load(
@@ -516,7 +523,7 @@ async fn single_write_catalog(factory: NoOverwriteStorageFactory) -> MemoryCatal
         .expect("load memory catalog")
 }
 
-async fn seed_single_write_table(catalog: &MemoryCatalog) -> Table {
+pub(super) async fn seed_single_write_table(catalog: &MemoryCatalog) -> Table {
     let ident = TableIdent::new(NamespaceIdent::new("ns".into()), "t".into());
     catalog
         .create_namespace(ident.namespace(), HashMap::new())
@@ -534,7 +541,7 @@ async fn seed_single_write_table(catalog: &MemoryCatalog) -> Table {
         .expect("create table")
 }
 
-fn version_data_file(path: &str, records: u64) -> DataFile {
+pub(super) fn version_data_file(path: &str, records: u64) -> DataFile {
     DataFileBuilder::default()
         .content(DataContentType::Data)
         .file_path(path.to_string())
@@ -557,7 +564,7 @@ fn replace_operation(table: &Table) -> Operation {
         .clone()
 }
 
-fn assert_metadata_keys_written_once(
+pub(super) fn assert_metadata_keys_written_once(
     writes: &Arc<Mutex<HashMap<String, usize>>>,
     expected: &[String],
 ) {

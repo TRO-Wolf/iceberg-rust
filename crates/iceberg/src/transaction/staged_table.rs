@@ -477,6 +477,10 @@ async fn ensure_staged_version_absent(file_io: &FileIO, metadata_location: &str)
 mod version_tests;
 
 #[cfg(test)]
+#[path = "staged_table_retry_race_tests.rs"]
+mod retry_race_tests;
+
+#[cfg(test)]
 #[path = "staged_table_rtas_ops_tests.rs"]
 mod rtas_ops_tests;
 
