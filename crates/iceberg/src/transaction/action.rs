@@ -34,6 +34,9 @@ mod occ_scoped_projection_tests;
 #[cfg(test)]
 #[path = "occ_scoped_tests.rs"]
 pub(crate) mod occ_scoped_tests;
+#[cfg(test)]
+#[path = "offset_property_retry_tests.rs"]
+mod offset_property_retry_tests;
 #[path = "publish_changes.rs"]
 mod publish_changes;
 #[cfg(test)]
