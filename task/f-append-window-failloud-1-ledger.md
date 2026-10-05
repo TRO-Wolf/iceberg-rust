@@ -113,3 +113,9 @@ with real exit codes.
   so there is no core oracle to cross-check against.
 - RePark exposure of the skip options is ruled in the MB-1 packet (card: "Whether RePark exposes
   them is ruled in the packet").
+- **A V1 snapshot without a summary** (found by the scoped verifier, V365-S3-1, 2026-10-05). The
+  spec reader treats a V1 snapshot that has no `summary` as an `append` (`crates/iceberg/src/spec/snapshot.rs:435`),
+  so fail-loud lets it through. Java's `BaseSparkMicroBatchPlanner.shouldProcess` would throw a
+  `NullPointerException` there. This predates the PR and is not changed by it: a Bronze table written by any
+  current engine carries a summary on every snapshot. A V1 table without summaries is outside the
+  micro-batch source's contract, and MB-1 refuses V1 sources if the packet rules so.
