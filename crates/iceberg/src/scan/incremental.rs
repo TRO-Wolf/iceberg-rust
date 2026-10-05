@@ -36,6 +36,7 @@ use std::sync::Arc;
 use futures::channel::mpsc::{Sender, channel};
 use futures::{SinkExt, StreamExt, TryStreamExt};
 
+use self::window::NonAppendPolicy;
 use super::context::{ManifestEntryContext, PlanContext, parse_name_mapping};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::events::{self, IncrementalScanEvent};
@@ -73,6 +74,7 @@ pub struct IncrementalAppendScanBuilder<'a> {
     filter: Option<Predicate>,
     concurrency_limit_manifest_entries: usize,
     concurrency_limit_manifest_files: usize,
+    non_append_policy: NonAppendPolicy,
 }
 
 impl<'a> IncrementalAppendScanBuilder<'a> {
@@ -90,6 +92,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
             filter: None,
             concurrency_limit_manifest_entries: num_cpus,
             concurrency_limit_manifest_files: num_cpus,
+            non_append_policy: NonAppendPolicy::default(),
         }
     }
 
@@ -98,6 +101,24 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
     pub fn from_snapshot_id_exclusive(mut self, from_snapshot_id: i64) -> Self {
         self.from_snapshot_id_exclusive = Some(from_snapshot_id);
         self.from_snapshot_id_inclusive = None;
+        self
+    }
+
+    /// Refuses a `delete` or `overwrite` snapshot in the window, Spark `shouldProcess`.
+    pub fn with_fail_on_non_append(mut self, fail_on_non_append: bool) -> Self {
+        self.non_append_policy.fail_loud = fail_on_non_append;
+        self
+    }
+
+    /// Skips `overwrite` snapshots under fail-on-non-append (`streaming-skip-overwrite-snapshots`).
+    pub fn with_skip_overwrite_snapshots(mut self, skip_overwrite_snapshots: bool) -> Self {
+        self.non_append_policy.skip_overwrite = skip_overwrite_snapshots;
+        self
+    }
+
+    /// Skips `delete` snapshots under fail-on-non-append (`streaming-skip-delete-snapshots`).
+    pub fn with_skip_delete_snapshots(mut self, skip_delete_snapshots: bool) -> Self {
+        self.non_append_policy.skip_delete = skip_delete_snapshots;
         self
     }
 
@@ -195,6 +216,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
                         file_io: self.table.file_io().clone(),
                         concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+                        non_append_policy: self.non_append_policy,
                         table_name,
                     });
                 };
@@ -332,6 +354,7 @@ impl<'a> IncrementalAppendScanBuilder<'a> {
             file_io: self.table.file_io().clone(),
             concurrency_limit_manifest_entries: self.concurrency_limit_manifest_entries,
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
+            non_append_policy: self.non_append_policy,
         })
     }
 }
@@ -356,6 +379,7 @@ pub struct IncrementalAppendScan {
     concurrency_limit_manifest_files: usize,
     /// Captured at build time for the [`IncrementalScanEvent`].
     table_name: String,
+    non_append_policy: NonAppendPolicy,
 }
 
 impl IncrementalAppendScan {
@@ -376,10 +400,11 @@ impl IncrementalAppendScan {
         self.notify_incremental_scan_event(plan_context, to_snapshot_id);
 
         // Java `appendsBetween`.
-        let append_snapshots = self.appends_between(
-            plan_context,
+        let append_snapshots = window::appends_between(
+            &plan_context.table_metadata,
             self.from_snapshot_id_exclusive,
             to_snapshot_id,
+            self.non_append_policy,
         )?;
         if append_snapshots.is_empty() {
             return Ok(Box::pin(futures::stream::empty()));
@@ -502,43 +527,6 @@ impl IncrementalAppendScan {
             };
         }
         oldest
-    }
-
-    /// Returns the APPEND snapshots in `(from_snapshot_id_exclusive, to_snapshot_id]`,
-    /// newest-first (Java `appendsBetween`). `None` walks to the history root.
-    fn appends_between(
-        &self,
-        plan_context: &PlanContext,
-        from_snapshot_id_exclusive: Option<i64>,
-        to_snapshot_id: i64,
-    ) -> Result<Vec<SnapshotRef>> {
-        let metadata = &plan_context.table_metadata;
-
-        // Java `ancestorsBetween`: an equal from/to yields an empty range.
-        if from_snapshot_id_exclusive == Some(to_snapshot_id) {
-            return Ok(vec![]);
-        }
-
-        let mut snapshots = Vec::new();
-        let mut current = metadata.snapshot_by_id(to_snapshot_id).cloned();
-
-        while let Some(snapshot) = current {
-            // Stop BEFORE the exclusive start (Java's lookup returns null for the start id).
-            if Some(snapshot.snapshot_id()) == from_snapshot_id_exclusive {
-                break;
-            }
-
-            if snapshot.summary().operation == Operation::Append {
-                snapshots.push(snapshot.clone());
-            }
-
-            current = match snapshot.parent_snapshot_id() {
-                Some(parent_id) => metadata.snapshot_by_id(parent_id).cloned(),
-                None => None,
-            };
-        }
-
-        Ok(snapshots)
     }
 
     /// Processes one data-manifest entry. Keeps `Added` entries only (Java
@@ -1426,6 +1414,10 @@ fn is_parent_ancestor_of(table: &Table, snapshot_id: i64, parent_ancestor_id: i6
     }
     false
 }
+
+mod window;
+#[cfg(test)]
+mod window_tests;
 
 #[cfg(test)]
 mod tests {
