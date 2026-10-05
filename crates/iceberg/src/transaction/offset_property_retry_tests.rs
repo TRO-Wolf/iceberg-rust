@@ -211,6 +211,14 @@ async fn retried_commit_carries_both_exactly_once(writer: Writer) {
             .additional_properties
             .contains_key(EPOCH_KEY)
     );
+    assert_ne!(
+        Some(parent.snapshot_id()),
+        base.metadata().current_snapshot_id()
+    );
+    assert_eq!(
+        parent.parent_snapshot_id(),
+        base.metadata().current_snapshot_id()
+    );
     assert_offset_commit(&committed);
     let live = live_file_paths(&committed).await;
     assert!(live.contains("test/concurrent.parquet"));

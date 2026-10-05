@@ -49,8 +49,12 @@ other OCC batteries are (`mod.rs` sits at its legacy ceiling). It reuses `occ_sc
 - **The racer:** `MockCatalog`. It sends `load_table` straight to the memory catalog. On the
   FIRST `update_table` it commits a prepared racer transaction to the memory catalog, then
   forwards the offset commit. That puts the racer after this attempt's load and before its
-  commit, so the memory catalog's location CAS (`check_no_concurrent_modification`, Java
-  `InMemoryTableOperations.doCommit`) returns a retryable `CatalogCommitConflicts`.
+  commit, so the first attempt fails with a retryable `CatalogCommitConflicts`. Which check
+  fires depends on the racer (corrected after the scoped verifier's probe, 2026-10-05):
+  - When the racer appends (the two retry pins and the append-plus-property race), the
+    branch-snapshot requirement fails first: "Branch or tag `main`'s snapshot has changed".
+  - Only the property-only racer reaches the memory catalog's location CAS
+    (`check_no_concurrent_modification`, Java `InMemoryTableOperations.doCommit`).
   `Transaction::commit` then retries: `do_commit` reloads, re-bases and re-applies every
   action.
 
@@ -65,7 +69,7 @@ recorded.
 |---|---|
 | `row_delta_and_property_update_commit_as_one_metadata_version` | `metadata_log` +1, snapshots +1, metadata location moved once; current snapshot `overwrite` with both summary keys; table property `src=42`; exactly 1 snapshot carries the epoch key; the same on a fresh `load_table` |
 | `overwrite_and_property_update_commit_as_one_metadata_version` | the same, for `overwrite_files()` |
-| `row_delta_property_commit_survives_a_retry_over_an_unrelated_append` | `update_table` called 2× (conflict, then commit); `metadata_log` +2 and snapshots +2 (racer + ours); our snapshot's parent is the racer's append and carries no epoch key; both summary keys and the property are present once; the racer's file and ours are both live |
+| `row_delta_property_commit_survives_a_retry_over_an_unrelated_append` | `update_table` called 2× (conflict, then commit); `metadata_log` +2 and snapshots +2 (racer + ours); our snapshot's parent is the racer's append: its parent is the base snapshot, and it carries no epoch key; both summary keys and the property are present once; the racer's file and ours are both live |
 | `overwrite_property_commit_survives_a_retry_over_an_unrelated_append` | the same, for `overwrite_files()` |
 | `retried_commit_overwrites_a_concurrent_same_key_property_without_notice` | racer = property-only `streaming.offsets=src=99`; `update_table` 2×, no error; the final value is OURS (`src=42`); the racer's version in `metadata_log` holds `src=99` — clobbered silently |
 | `retried_commit_overwrites_a_concurrent_append_and_same_key_property_without_notice` | racer = append + `src=99`; the same result |
@@ -84,8 +88,8 @@ re-applying on a re-based (stale) base. Exit 101, 4 failed, 2 passed:
 ## Same-key race — the finding for MB-2c
 
 - **What happens today.** A retried commit re-applies `UpdatePropertiesAction` on the refreshed
-  base, and `SetProperties` overwrites the key. The location CAS only forces the re-base; it never
-  surfaces the overwrite. With a property-only racer, nothing else can conflict either. The
+  base, and `SetProperties` overwrites the key. The conflict check (the branch-snapshot requirement, or the location CAS for
+  a property-only racer) only forces the re-base; it never surfaces the overwrite. With a property-only racer, nothing else can conflict either. The
   row-delta and overwrite actions validate data conflicts only, and only when asked.
 - **Why the preferred refusal can't be built.** The card wants a typed conflict naming the key.
   `UpdatePropertiesAction::commit` emits `ActionCommit::new(updates, vec![])`, with no
