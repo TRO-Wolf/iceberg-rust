@@ -56,8 +56,11 @@ RePark owner ruling 84 (2026-10-15), verbatim:
   the SDK retry off for that operation only. After a reset the endpoint sees one commit
   request, and the outcome matches cell U-1 (landed: `Ok`, rows once) or U-4 (absent:
   `CommitStateUnknown`, pre-state rows). Reads keep their retries.
-- **Open (Q1).** With the SDK retry off, a lost reply on a normally closed connection (FIN,
-  not a reset) is classified never-sent and fails as `Unexpected`, although it landed.
+- **Q1 (fixed, commit `3aeb2928`).** With the SDK retry off, a lost reply on a normally closed
+  connection (FIN, not a reset) was classified never-sent and failed as `Unexpected`, although
+  it landed. The classifier now treats it as maybe-sent, so it reaches the reconciliation: U-1
+  and U-4 hold for a close as well as a reset. A refused commit connection is never-sent and is
+  not reconciled.
 
 ## The drill
 
@@ -73,7 +76,12 @@ RePark owner ruling 84 (2026-10-15), verbatim:
 - **The scripts for the commit call.** `ApplyThenReset` applies the commit, then resets the
   connection (`SO_LINGER` 0, so the client reads `ECONNRESET`) before the reply. `DropThenReset`
   reads the commit, does not apply it, and resets. `ApplyThenConflict` applies the commit and
-  answers the conflict error. Reads can be reset too (`reset_next_reads`).
+  answers the conflict error. `ApplyThenClose` and `DropThenClose` do the same as the reset
+  scripts but close the connection normally (FIN), with no reply. Reads can be reset too
+  (`reset_next_reads`). In the one-request-per-connection mode, every reply carries
+  `connection: close`; `refuse_the_commit_connection(2)` closes the listener before it answers
+  the second read after arming (the commit base read), so the commit's connect is refused. The
+  listener comes back one second later, so a reconciliation read, if any, reaches the log.
 - **The client.** The catalog the crate builds through its public builder:
   `GlueCatalogBuilder` / `S3TablesCatalogBuilder` with `uri` / `endpoint_url` set to the
   endpoint, static dummy credentials, `us-east-1`, and the memory storage factory. So the real
@@ -202,14 +210,16 @@ GetTable              → answered             GetTable              → answere
    Ok, rows once)                               CommitStateUnknown, rows as before)
 ```
 
-## Finding — a lost reply on a closed connection is "never sent" once the SDK retry is off
+## Q1 — a lost reply on a closed connection was "never sent" once the SDK retry was off
 
-Probe only, not committed: the same drill with the connection closed normally (FIN) instead
-of reset. hyper reports `IncompleteMessage`. `aws-smithy-http-client` 1.2.0 maps that to
-`ConnectorError::other(…, Some(ErrorKind::TransientError))` (`src/client.rs`,
-`to_connector_error`). The fork's `classify_commit_send_disposition` (Glue `src/error.rs`, S3
-Tables `src/commit_transport.rs`) maps every `DispatchFailure` with `is_other()` to
-`NeverSent`.
+The ruling on Q1, quoted: "Q1 (a), orchestrator, provisional pending the owner".
+
+**The measurement that raised it** (an uncommitted probe on `aa0decf8`: the U-1 drill with the
+connection closed normally instead of reset, check on). hyper reports `IncompleteMessage`.
+`aws-smithy-http-client` 1.2.0 maps that to `ConnectorError::other(…,
+Some(ErrorKind::TransientError))` (`src/client.rs` and `src/hyper_legacy.rs`,
+`to_connector_error`). The fork's `classify_commit_send_disposition` mapped every
+`DispatchFailure` with `is_other()` to `NeverSent`.
 
 | Code | Glue, `ApplyThenReset` with FIN, check on | S3 Tables, the same |
 |---|---|---|
@@ -217,11 +227,63 @@ Tables `src/commit_transport.rs`) maps every `DispatchFailure` with `is_other()`
 | step 1 (SDK retry on) | commits `[1 → applied; 1 → stale]`; `Ok`; 1 snapshot; 3 rows | the same with `v1` |
 | step 2 (SDK retry off) | commits `[1 → applied]`; `Err(Unexpected)` "… before the update request was sent"; no reconciliation read; 1 snapshot; 3 rows | the same with `v1` |
 
-So with step 2, a commit that landed and lost its reply on a closed connection fails as a
-definite, never-sent error. No rows are duplicated by the fork. A caller that retries the
-statement appends the rows again. Under step 1 alone, the SDK re-send and the guard resolve
-the same case to `Ok`. This is the hand-back's question Q1. The unit did not change the
-classifier.
+**The signals the SDK gives** (`aws-smithy-runtime-api` 1.14.0 `ConnectorError`): the kind
+(`is_io`, `is_timeout`, `is_user`, `is_other`), `as_other() -> Option<ErrorKind>`, and
+`connection_metadata()`. The connection status `NeverConnected` exists but has no public
+accessor; `connection_metadata()` is `None` for "never connected" and for "unknown" alike.
+
+- A narrower signal than `is_other()` exists for the closed connection: `as_other() ==
+  Some(ErrorKind::TransientError)`. In `aws-smithy-http-client` 1.2.0 only `IncompleteMessage`
+  produces it, in both client implementations. `ErrorKind` is reached as
+  `aws_config::retry::ErrorKind`; `aws-config` is already a dependency of both crates.
+- A refused connect has no typed signal. The SDK maps every `hyper_util` connect error to
+  `ConnectorError::io` (`src/client.rs`, `downcast_error`), the same kind as a reset after the
+  request. The connect error keeps the OS error in its source chain
+  (`hyper_util::client::legacy::Error` → `ConnectError` → `std::io::Error`), so the fork reads
+  `std::io::ErrorKind::ConnectionRefused` there. `ECONNREFUSED` comes only from `connect`, so the
+  request was never written. With the SDK retry off there is exactly one attempt.
+- DNS failures and connect timeouts were not drilled: the drill reaches `127.0.0.1` only. Both
+  stay `MaybeSent`. The timeout error type (`HttpTimeoutError`) is crate-private, so no typed
+  signal separates a connect timeout from a read timeout.
+
+**The change** (commit `3aeb2928`, Glue `src/error.rs` and S3 Tables `src/commit_transport.rs`):
+
+| `DispatchFailure` | Before (`cb9b46f3`) | After |
+|---|---|---|
+| `as_other() == Some(TransientError)` (closed connection) | NeverSent | **MaybeSent** |
+| `is_io()` with `ConnectionRefused` in the source chain | MaybeSent | **NeverSent** |
+| any other `is_user()` / `is_other()` | NeverSent | NeverSent |
+| any other `is_io()` / `is_timeout()` | MaybeSent | MaybeSent |
+
+The brief said a refused connect "stays" NeverSent. On `cb9b46f3` it was MaybeSent: the
+refused-connection pin is red there (`left: 3, right: 2` reads, `CommitStateUnknown`). The
+change makes it NeverSent, as the brief's rule asks.
+
+**The cells** (per catalog, `tests/commit_lost_reply_drill.rs`, check on):
+
+| Pin | Asserts | Helper at `cb9b46f3` | On `3aeb2928` |
+|---|---|---|---|
+| `*_lost_reply_on_a_closed_connection_reconciles_as_landed` (U-1, FIN) | `ApplyThenClose`: one commit request; `Ok`; 1 snapshot; 3 rows | red: `left: Err(Unexpected), right: Ok(())` | green |
+| `*_unapplied_commit_on_a_closed_connection_is_unknown_and_keeps_the_pre_state` (U-4, FIN) | `DropThenClose`: one commit request; `Err(CommitStateUnknown)`; 0 snapshots; 0 rows | red: `left: Err(Unexpected), right: Err(CommitStateUnknown)` | green |
+| `*_refused_commit_connection_is_never_sent_and_not_reconciled` | no commit request; 2 reads; `Err(Unexpected)`; 0 snapshots; 0 rows | red: `left: 3, right: 2` (a reconciliation read; the outcome was `CommitStateUnknown`) | green |
+
+Request logs on `3aeb2928` (S3 Tables has the same shape with `UpdateTableMetadataLocation v1`):
+
+```
+U-1, ApplyThenClose            U-4, DropThenClose             refused commit connection
+GetTable → answered            GetTable → answered            GetTable → answered
+GetTable → answered            GetTable → answered            GetTable → answered (listener closed)
+UpdateTable 1 → applied, FIN   UpdateTable 1 → dropped, FIN   (UpdateTable connect refused)
+GetTable → answered (found)    GetTable → answered (absent)   (no reconciliation read)
+Ok, rows 3                     CommitStateUnknown, rows 0     Unexpected, rows 0
+```
+
+On `cb9b46f3` the FIN logs stop after the commit request (no reconciliation read), and the
+refused log has a third `GetTable` (the reconciliation).
+
+Unit pins: Glue `error::tests::test_incomplete_message_classifies_maybe_sent_and_unclassified_other_stays_never_sent`
+and `…::test_refused_connection_classifies_never_sent_and_reset_stays_maybe_sent`; S3 Tables
+`test_commit_send_disposition_split` gains the same four cases.
 
 ## Residue (not changed here)
 
@@ -246,6 +308,9 @@ was restored afterwards.
 | Fork `076d5f98` (the pin) | exit 0: 5905 passed, 0 failed, 11 ignored |
 | Fork `aa0decf8` (this branch) | exit 0: 5905 passed, 0 failed, 11 ignored; no test green before and red after |
 | P17 `append_midflight_commit_conflict_retries_and_both_appends_land` on `aa0decf8` | exit 0, green |
+| Fork `3aeb2928` (Q1 (a)) | exit 101: 5904 passed, 1 failed, 11 ignored. The red test is `repark-core` `microbatch::lifecycle_tests::two_sessions_on_one_sink_wait_for_the_scope`: its 10-second bound expired (`the query ends within the bound: Elapsed(())`). Re-run on the same tree: the test alone 8 of 8 green with the override and 8 of 8 without, and its module `microbatch::lifecycle_tests` green with the override. `crates/iceberg`, `crates/integrations` and `crates/storage` are byte-identical between `aa0decf8` (where it was green with the override) and `3aeb2928`, and the test runs on the memory catalog, which never reaches the changed classifiers. Read: a timing flake under load (the 15-minute load average was 12.8 just after the run), not a regression. |
+| Fork `3aeb2928`, full re-run | exit 0: 5905 passed, 0 failed, 11 ignored; no test green before and red after |
+| P17 on `3aeb2928` | exit 0, green |
 
 ## Mutations
 
@@ -260,9 +325,24 @@ transaction::action::rebase_landed_tests`, and reverted (`git diff` empty afterw
 
 ## Gates (fork, on `aa0decf8`)
 
+The gates on `3aeb2928` follow this table.
+
 | Command | Exit |
 |---|---|
 | `cargo test --no-fail-fast -p iceberg -p iceberg-catalog-glue -p iceberg-catalog-s3tables` | 101: 5122 passed, 14 failed, 21 ignored. The 14 are `tests/glue_catalog_test.rs`, which needs the Docker moto endpoint on `127.0.0.1:5001`; they fail the same way on `076d5f98` (5116 passed, 14 failed). Every test green on `076d5f98` is green here, except the six step-0 tests that steps 1 and 2 replaced. |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
+| `make check-rust-file-size`, `make check-comment-blocks`, `make check-agent-artifacts`, `make check-matrix-anchors` | 0 |
+| `typos` on the changed paths | 0 |
+
+## Gates (fork, on `3aeb2928`)
+
+| Command | Exit |
+|---|---|
+| `cargo test --no-fail-fast -p iceberg-catalog-glue -p iceberg-catalog-s3tables --test commit_lost_reply_drill` with the helper at `cb9b46f3` | 101: per catalog, the FIN U-1, FIN U-4 and refused pins red, the other 4 green |
+| the same on `3aeb2928` | 0: 7 + 7 passed |
+| `cargo test --no-fail-fast -p iceberg-catalog-glue -p iceberg-catalog-s3tables --lib` | 0: 71 + 62 passed |
+| `cargo test --no-fail-fast -p iceberg -p iceberg-catalog-glue -p iceberg-catalog-s3tables` | 101: 5130 passed, 14 failed, 21 ignored; the 14 are the Docker-only `tests/glue_catalog_test.rs`. Every test green on `cb9b46f3` is green here. |
 | `cargo fmt --all -- --check` | 0 |
 | `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
 | `make check-rust-file-size`, `make check-comment-blocks`, `make check-agent-artifacts`, `make check-matrix-anchors` | 0 |
