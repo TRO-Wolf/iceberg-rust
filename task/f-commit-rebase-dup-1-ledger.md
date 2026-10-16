@@ -61,6 +61,9 @@ RePark owner ruling 84 (2026-10-15), verbatim:
   it landed. The classifier now treats it as maybe-sent, so it reaches the reconciliation: U-1
   and U-4 hold for a close as well as a reset. A refused commit connection is never-sent and is
   not reconciled.
+- **Owner ruling 115 (fixed, commit `9830e241`).** Every outcome the owner lists as ambiguous now
+  reaches the reconciliation: a 5xx reply, modeled or not, and every dispatch failure but a user
+  error or a refused connect. The table is in the ruling-115 section below.
 
 ## The drill
 
@@ -347,3 +350,147 @@ The gates on `3aeb2928` follow this table.
 | `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
 | `make check-rust-file-size`, `make check-comment-blocks`, `make check-agent-artifacts`, `make check-matrix-anchors` | 0 |
 | `typos` on the changed paths | 0 |
+
+## Owner ruling 115, 2026-10-16
+
+The ruling, verbatim:
+
+```
+115: (a), keep. A lost reply on a closed connection is "may have been
+     sent": read the table back for our own snapshot id before any
+     retry. The card lists the ambiguous outcomes (connection closed
+     before reply, timeout, server error or unknown) against the
+     definitive ones (a CAS conflict, which takes the re-base path with
+     the same check). The id checked is the one chosen before sending.
+```
+
+### What disagreed, measured before the change
+
+Both shapes were drilled through the real SDK client on both catalogs, with the classifier at
+`3aeb2928`:
+
+- **A 5xx reply with a code the SDK does not model** arrives as `ServiceError(Unhandled { code:
+  Some("InternalFailure") })` with reply status 500. The classifier said ResponseReceived, and the
+  service-error mapper's last arm said `Unexpected`, so it was not reconciled.
+- **An unparsable reply** arrives as `DispatchFailure(ConnectorError { kind: Other(None), source:
+  hyper_util::client::legacy::Error(SendRequest, hyper::Error(Parse(Status))) })`, after the
+  endpoint had read the whole request. The classifier's `is_other()` arm said NeverSent, so the
+  commit failed with `Unexpected` "… before the update request was sent".
+
+Does `aws-smithy-http-client` 1.2.0 produce `other(None)` only before a request byte is written?
+No. It builds the shape in seven places:
+
+- `src/client.rs:579` and `src/hyper_legacy.rs:374`: `HttpResponse::try_from(response)` failed,
+  after a response arrived.
+- `src/client.rs:642` and `src/hyper_legacy.rs:426`: `to_connector_error`'s last line, for a
+  hyper error it does not recognise. A response parse error is one of these, as measured.
+- `src/client.rs:614` and `src/hyper_legacy.rs:399` (`downcast_error`, "we have no idea"): any
+  other error.
+
+Only `src/hyper_legacy.rs:355` (the request failed to convert to an HTTP 0.2 request) is
+provably before the write. So the shape is ambiguous, and it now reconciles. The change needed only
+the two classifiers. The service-error mappers are unchanged: a 5xx now reaches the classifier's
+`MaybeSent` before the mapper runs.
+
+### The change (commit `9830e241`)
+
+`classify_commit_send_disposition`, Glue `src/error.rs` and S3 Tables `src/commit_transport.rs`,
+now takes `SdkError<E, HttpResponse>` and reads the reply status:
+
+| `SdkError` | `3aeb2928` | `9830e241` |
+|---|---|---|
+| `ConstructionFailure` | NeverSent | NeverSent |
+| `DispatchFailure`, `is_user()` or `ConnectionRefused` in the source chain | NeverSent | NeverSent |
+| `DispatchFailure`, `other(Some(TransientError))` | MaybeSent | MaybeSent (now through the general rule) |
+| `DispatchFailure`, any other `is_other()` | NeverSent | **MaybeSent** |
+| `DispatchFailure`, `is_io()` / `is_timeout()` | MaybeSent | MaybeSent |
+| `ServiceError`, reply status 5xx | ResponseReceived | **MaybeSent** |
+| `ServiceError`, any other status | ResponseReceived | ResponseReceived |
+| `TimeoutError`, `ResponseError`, future variants | MaybeSent | MaybeSent |
+
+Commit `1d3a17da` adds the one missing unit pin, a dispatch timeout on S3 Tables.
+
+### The outcome table
+
+Both catalogs share every row. "Glue / S3 Tables" names the catalog-specific code where they
+differ. "Reconciled" means `Transaction::commit` takes its `CommitStateUnknown` arm
+(`crates/iceberg/src/transaction/mod.rs:416`): it reloads the table and searches it for the
+snapshot ids this attempt chose before sending (`latest_attempt_snapshot_ids`). Found gives `Ok`
+with no re-apply; absent gives the original `CommitStateUnknown`. Drill pins live in each
+catalog's `tests/commit_lost_reply_drill.rs`, named here without the `glue_` / `s3tables_`
+prefix. They run the real SDK client against an in-process endpoint, and the shapes are measured
+there. Unit pins live in Glue `src/error.rs` / `src/commit_transport.rs` and S3 Tables
+`src/commit_transport.rs`.
+
+**Ambiguous: may have been sent**
+
+| Outcome | `SdkError` shape | Classifier → `ErrorKind` | Reconciled | Pin |
+|---|---|---|---|---|
+| Connection closed before the reply (FIN) | `DispatchFailure(ConnectorError { kind: Other(Some(TransientError)), source: hyper_util::client::legacy::Error(SendRequest, hyper::Error(IncompleteMessage)) })` (measured) | MaybeSent → `CommitStateUnknown` | yes | drill `lost_reply_on_a_closed_connection_reconciles_as_landed` (U-1; it also checks the found id against the request's), `unapplied_commit_on_a_closed_connection_is_unknown_and_keeps_the_pre_state` (U-4); unit Glue `test_closed_and_unclassified_dispatch_failures_classify_maybe_sent`, S3 Tables `test_commit_send_disposition_split` |
+| Connection reset before the reply (RST) | `DispatchFailure(ConnectorError { kind: Io, source: … hyper::Error(Io, Os { kind: ConnectionReset }) })` (measured) | MaybeSent → `CommitStateUnknown` | yes | drill `lost_reply_is_not_resent_and_reconciles_as_landed` (U-1), `lost_unapplied_commit_is_unknown_and_keeps_the_pre_state` (U-4); unit Glue `test_refused_connection_classifies_never_sent_and_reset_stays_maybe_sent`, S3 Tables `test_commit_send_disposition_split` |
+| Timeout, the operation | `SdkError::TimeoutError` (not drilled: the fork's clients set no operation timeout) | `_` arm: MaybeSent → `CommitStateUnknown` | yes | unit Glue `test_post_send_ambiguous_sdk_failures_classify_maybe_sent`, S3 Tables `test_commit_send_disposition_split`; transport (scripted `MaybeSentLost` = `SdkError::timeout_error`) `commit_outcome_tests::maybe_sent_is_unknown_without_a_second_commit_for_every_commit_class` |
+| Timeout, the dispatch | `DispatchFailure(ConnectorError { kind: Timeout })` (not drilled: no read timeout is set, and a connect to 127.0.0.1 does not time out) | `_` arm: MaybeSent → `CommitStateUnknown` | yes | unit Glue `test_post_send_ambiguous_sdk_failures_classify_maybe_sent`, S3 Tables `test_commit_send_disposition_split` (assertion added in `1d3a17da`) |
+| Server error, modeled | `ServiceError(InternalServiceException)` (Glue) / `ServiceError(InternalServerErrorException)` (S3 Tables), reply status 500 (measured) | MaybeSent (5xx arm) → `CommitStateUnknown`. Glue `OperationTimeoutException`: the mapper gives `CommitStateUnknown` for any status. | yes | drill `modeled_server_error_after_the_commit_reconciles_as_landed`; unit Glue `test_internal_service_and_operation_timeout_map_to_unknown_outcome`, S3 Tables `test_internal_server_error_maps_to_unknown_outcome_but_not_found_stays_terminal`; classifier Glue `test_server_error_reply_is_maybe_sent_and_client_error_reply_is_received`, S3 Tables `test_commit_send_disposition_split` |
+| Server error, a code the SDK does not model | `ServiceError(Unhandled { code: Some("InternalFailure") })`, reply status 500 (measured) | **MaybeSent (5xx arm) → `CommitStateUnknown`** | **yes** | drill `server_error_with_an_unmodeled_code_after_the_commit_reconciles_as_landed`, `server_error_with_an_unmodeled_code_before_the_commit_is_unknown_and_keeps_the_pre_state`; unit as the row above |
+| Unknown: dispatch `is_other()` with no kind | `DispatchFailure(ConnectorError { kind: Other(None), source: hyper_util::client::legacy::Error(SendRequest, hyper::Error(Parse(Status))) })`, an unparsable reply (measured) | **MaybeSent → `CommitStateUnknown`** | **yes** | drill `unparsable_reply_after_the_commit_reconciles_as_landed`, `unparsable_reply_before_the_commit_is_unknown_and_keeps_the_pre_state`; unit Glue `test_closed_and_unclassified_dispatch_failures_classify_maybe_sent`, S3 Tables `test_commit_send_disposition_split` |
+| Unknown: a reply the SDK cannot read | `SdkError::ResponseError` (not drilled) | `_` arm: MaybeSent → `CommitStateUnknown` | yes | unit Glue `test_post_send_ambiguous_sdk_failures_classify_maybe_sent`, S3 Tables `test_commit_send_disposition_split` |
+| Unknown: the `_` arm | `TimeoutError`, `ResponseError`, every dispatch failure but a user error or a refused connect, and any future variant of the `#[non_exhaustive]` `SdkError` | MaybeSent → `CommitStateUnknown` | yes | the rows above that reach `_`. A future variant cannot be built, so it has no pin of its own. |
+
+**Definitive**
+
+| Outcome | `SdkError` shape | Classifier → `ErrorKind` | Reconciled | Pin |
+|---|---|---|---|---|
+| CAS conflict | `ServiceError(ConcurrentModificationException)` 400 (Glue) / `ServiceError(ConflictException)` 409 (S3 Tables) (measured) | ResponseReceived → `CatalogCommitConflicts`, retryable | no. `Transaction::commit` retries; each retry refreshes and returns the refreshed table when it holds any id in `sent_ids` (every id an attempt chose before sending, `014136fe`); otherwise it re-bases | drill `landed_commit_answered_conflict_lands_once`, `an_earlier_attempt_that_lands_late_is_found_before_the_rebase` (two sent ids, the first lands late); core `transaction::action::rebase_landed_tests::*`; unit Glue `test_concurrent_modification_stays_retryable_conflict`, S3 Tables `test_conflict_exception_stays_retryable_conflict`; transport `cas_conflict_rebases_when_the_append_validation_contract_permits` |
+| Connect refused | `DispatchFailure(ConnectorError { kind: Io, source: hyper_util::client::legacy::Error(Connect, ConnectError("tcp connect error", Os { kind: ConnectionRefused })) })` (measured) | NeverSent → `Unexpected` | no | drill `refused_commit_connection_is_never_sent_and_not_reconciled` (no commit request, no reconciliation read); unit Glue `test_refused_connection_classifies_never_sent_and_reset_stays_maybe_sent`, S3 Tables `test_commit_send_disposition_split` |
+| Construction failure | `SdkError::ConstructionFailure` | NeverSent → `Unexpected` | no | unit Glue / S3 Tables `test_never_sent_sdk_error_maps_terminal_unexpected`, Glue `test_never_sent_and_service_response_do_not_classify_maybe_sent`; transport `never_sent_is_terminal_for_every_commit_class_on_the_shared_glue_path` / `…_s3tables_path` |
+| Dispatch user error | `DispatchFailure(ConnectorError { kind: User })` | NeverSent → `Unexpected` | no | unit Glue `test_never_sent_and_service_response_do_not_classify_maybe_sent`, S3 Tables `test_commit_send_disposition_split` |
+| 4xx refusal, modeled | Glue: `AccessDeniedException` → `Unexpected`, `EntityNotFoundException` → `TableNotFound`, `InvalidInputException` and the rest → `Unexpected`. S3 Tables: `ForbiddenException` → `Unexpected`, `NotFoundException` → `TableNotFound`, `BadRequestException` / `TooManyRequestsException` → `Unexpected` | ResponseReceived → the service-error mapping above | no | unit Glue `test_access_denied_is_terminal_not_unknown`, `test_definite_service_rejections_stay_terminal`; S3 Tables `test_forbidden_is_terminal_not_unknown`, `test_internal_server_error_maps_to_unknown_outcome_but_not_found_stays_terminal`; transport `permanent_authorization_denial_is_terminal_and_does_not_clean_staged_files` |
+| 4xx refusal, a code the SDK does not model | `ServiceError(Unhandled { code: Some("ValidationException") })`, reply status 400 (measured) | ResponseReceived → `Unexpected` | no | drill `client_error_with_an_unmodeled_code_is_definitive_and_not_reconciled` (no reconciliation read) |
+
+**Changed by `9830e241`** (before at `3aeb2928`, after at `9830e241`; both catalogs)
+
+| Outcome | Before | After | Red at `3aeb2928` |
+|---|---|---|---|
+| 5xx reply, unmodeled code | ResponseReceived → mapper's last arm → `Unexpected` "Operation failed … for hitting aws sdk error"; not reconciled | MaybeSent → `CommitStateUnknown`; reconciled | `server_error_with_an_unmodeled_code_after_…`: `left: Err(Unexpected), right: Ok(())`; `…_before_…`: `left: Err(Unexpected), right: Err(CommitStateUnknown)` |
+| Dispatch `is_other()` with no kind | NeverSent → `Unexpected` "… before the update request was sent"; not reconciled | MaybeSent → `CommitStateUnknown`; reconciled | `unparsable_reply_after_…`: `left: Err(Unexpected), right: Ok(())`; `…_before_…`: `left: Err(Unexpected), right: Err(CommitStateUnknown)` |
+| 5xx reply, modeled | ResponseReceived → mapper → `CommitStateUnknown` | MaybeSent → `CommitStateUnknown` (same kind; the message is the classifier's "may have reached Glue / S3 Tables before the failure") | none (the kind is unchanged) |
+
+### The id checked is the one chosen before sending
+
+- **U-1 on a closed connection.** `*_lost_reply_on_a_closed_connection_reconciles_as_landed` reads
+  the metadata file that the one commit request names (Glue `TableInput.Parameters.metadata_location`,
+  S3 Tables `metadataLocation`; the drill logs it). It asserts that the snapshot the reconciliation
+  found is that file's current snapshot: `marked_snapshot_ids == [sent]`. The fork writes that file
+  before it sends the request, so the id was chosen before sending.
+- **The re-base path after a CAS conflict.** `*_an_earlier_attempt_that_lands_late_is_found_before_the_rebase`:
+  the first commit request is held and answered with a conflict. The second is answered with a
+  conflict after the endpoint lands the first. Two ids were sent, and the one found is the first:
+  `marked_snapshot_ids == [first]`, with no third commit request. A mutation that checks only the
+  previous attempt's ids (`mem::take` of `latest_attempt_snapshot_ids`) turns it red on both
+  catalogs: `left: [(Some("1"), DeferredThenConflict), (Some("1"), LandedDeferredThenConflict),
+  (Some("2"), Answered)]` (S3 Tables: `v1`, `v1`, `v2`). The existing
+  `landed_attempt_is_found_after_a_failed_refresh` covers only one sent id, so it did not prove
+  "every id already sent".
+
+### Gates (fork, on `9830e241`)
+
+| Command | Exit |
+|---|---|
+| drills at the `3aeb2928` classifier (`cargo test --no-fail-fast -p iceberg-catalog-glue -p iceberg-catalog-s3tables --test commit_lost_reply_drill`) | 101: per catalog the four unmodeled-5xx and unparsable-reply pins red, the other 10 green |
+| the same on `9830e241` | 0: 14 + 14 passed |
+| `cargo test --no-fail-fast -p iceberg-catalog-glue -p iceberg-catalog-s3tables --lib` | 0 |
+| the late-landing pins under the previous-attempt-only mutation | 101 (both red) |
+| `cargo test --no-fail-fast -p iceberg -p iceberg-catalog-glue -p iceberg-catalog-s3tables` | 101: 5145 passed, 14 failed (the Docker-only `tests/glue_catalog_test.rs`), 21 ignored. Every test green at `3aeb2928` is green here except the one unit test this change renamed and flipped (`test_incomplete_message_classifies_maybe_sent_and_unclassified_other_stays_never_sent`, now `test_closed_and_unclassified_dispatch_failures_classify_maybe_sent`) |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
+| `make check-rust-file-size`, `make check-comment-blocks`, `make check-agent-artifacts`, `make check-matrix-anchors`; `typos` | 0 |
+| comment gate, base `origin/main` (`076d5f98`) | 0 |
+
+RePark never worse on `1d3a17da`, with the same command-line override as before (`cargo tree -i
+iceberg` resolved to the fork path): `cargo test --no-fail-fast -p repark-iceberg -p repark-core
+-p repark-spark -p repark-sql` exit 0, 5905 passed, 0 failed, 11 ignored, the same as the
+`076d5f98` baseline, with no test green before and red after. P17
+`append_midflight_commit_conflict_retries_and_both_appends_land` exit 0. RePark's `Cargo.lock`
+was restored, and its tree is clean. On `1d3a17da` the fork also ran `cargo test -p
+iceberg-catalog-s3tables --lib` (exit 0, 62 passed) and `cargo clippy -p iceberg-catalog-s3tables
+--all-targets --all-features -- -D warnings` (exit 0).
