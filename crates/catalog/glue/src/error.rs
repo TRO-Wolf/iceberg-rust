@@ -18,6 +18,7 @@
 use std::fmt::Debug;
 
 use anyhow::anyhow;
+use aws_sdk_glue::config::http::HttpResponse;
 use iceberg::{Error, ErrorKind};
 
 /// Format AWS SDK error into iceberg error
@@ -50,31 +51,19 @@ pub(crate) enum CommitSendDisposition {
     ResponseReceived,
 }
 
-/// Classify the transport layer of a failed SDK call on the COMMIT path (`update_table`).
-///
-/// Java analogue: `GlueTableOperations.doCommit` (iceberg-aws 1.10.0, L162-191) rethrows
-/// `CommitFailedException`, reconciles every other `RuntimeException` via `checkCommitStatus`
-/// (`BaseMetastoreOperations.CommitStatus {SUCCESS, FAILURE, UNKNOWN}`), and surfaces
-/// `CommitStateUnknownException(persistFailure)` when the outcome cannot be confirmed. This
-/// offline slice ports the CLASSIFICATION (which failures are ambiguous); the
-/// reconciliation-by-refresh step needs a live catalog and stays with the credentialed slice.
-pub(crate) fn classify_commit_send_disposition<E, R>(
-    error: &aws_sdk_glue::error::SdkError<E, R>,
+pub(crate) fn classify_commit_send_disposition<E>(
+    error: &aws_sdk_glue::error::SdkError<E, HttpResponse>,
 ) -> CommitSendDisposition {
     use aws_sdk_glue::error::SdkError;
     match error {
         SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
         SdkError::DispatchFailure(dispatch)
-            if dispatch.as_other() == Some(aws_config::retry::ErrorKind::TransientError) =>
-        {
-            CommitSendDisposition::MaybeSent
-        }
-        SdkError::DispatchFailure(dispatch)
-            if dispatch.is_user()
-                || dispatch.is_other()
-                || connection_refused(dispatch.as_connector_error()) =>
+            if dispatch.is_user() || connection_refused(dispatch.as_connector_error()) =>
         {
             CommitSendDisposition::NeverSent
+        }
+        SdkError::ServiceError(context) if context.raw().status().is_server_error() => {
+            CommitSendDisposition::MaybeSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
         _ => CommitSendDisposition::MaybeSent,
@@ -97,7 +86,11 @@ mod tests {
 
     use super::*;
 
-    type TestSdkError = aws_sdk_glue::error::SdkError<(), ()>;
+    type TestSdkError = aws_sdk_glue::error::SdkError<(), HttpResponse>;
+
+    fn response(status: u16) -> HttpResponse {
+        HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into())
+    }
 
     fn boxed(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
         msg.to_string().into()
@@ -121,7 +114,7 @@ mod tests {
             ),
             (
                 "response-error",
-                TestSdkError::response_error(boxed("unparsable response"), ()),
+                TestSdkError::response_error(boxed("unparsable response"), response(200)),
             ),
         ];
         for (label, sdk_error) in ambiguous {
@@ -140,7 +133,7 @@ mod tests {
     /// service response — is classified ambiguous, sending callers into needless commit
     /// reconciliation. Pins the never-sent and response-received sides of the split.
     #[test]
-    fn test_incomplete_message_classifies_maybe_sent_and_unclassified_other_stays_never_sent() {
+    fn test_closed_and_unclassified_dispatch_failures_classify_maybe_sent() {
         let closed = TestSdkError::dispatch_failure(ConnectorError::other(
             boxed("connection closed before message completed"),
             Some(aws_config::retry::ErrorKind::TransientError),
@@ -153,8 +146,30 @@ mod tests {
             TestSdkError::dispatch_failure(ConnectorError::other(boxed("unrecognized"), None));
         assert!(matches!(
             classify_commit_send_disposition(&unclassified),
-            CommitSendDisposition::NeverSent
+            CommitSendDisposition::MaybeSent
         ));
+    }
+
+    #[test]
+    fn test_server_error_reply_is_maybe_sent_and_client_error_reply_is_received() {
+        for status in [500, 503] {
+            assert!(matches!(
+                classify_commit_send_disposition(&TestSdkError::service_error(
+                    (),
+                    response(status)
+                )),
+                CommitSendDisposition::MaybeSent
+            ));
+        }
+        for status in [400, 403, 409] {
+            assert!(matches!(
+                classify_commit_send_disposition(&TestSdkError::service_error(
+                    (),
+                    response(status)
+                )),
+                CommitSendDisposition::ResponseReceived
+            ));
+        }
     }
 
     #[test]
@@ -190,7 +205,7 @@ mod tests {
             CommitSendDisposition::NeverSent
         ));
         assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::service_error((), ())),
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(400))),
             CommitSendDisposition::ResponseReceived
         ));
     }

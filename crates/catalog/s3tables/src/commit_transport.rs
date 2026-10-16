@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use aws_sdk_s3tables::config::http::HttpResponse;
 use aws_sdk_s3tables::config::retry::RetryConfig;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
 #[cfg(test)]
@@ -61,23 +62,19 @@ pub(crate) enum CommitSendDisposition {
     ResponseReceived,
 }
 
-pub(crate) fn classify_commit_send_disposition<E, R>(
-    error: &aws_sdk_s3tables::error::SdkError<E, R>,
+pub(crate) fn classify_commit_send_disposition<E>(
+    error: &aws_sdk_s3tables::error::SdkError<E, HttpResponse>,
 ) -> CommitSendDisposition {
     use aws_sdk_s3tables::error::SdkError;
     match error {
         SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
         SdkError::DispatchFailure(dispatch)
-            if dispatch.as_other() == Some(aws_config::retry::ErrorKind::TransientError) =>
-        {
-            CommitSendDisposition::MaybeSent
-        }
-        SdkError::DispatchFailure(dispatch)
-            if dispatch.is_user()
-                || dispatch.is_other()
-                || connection_refused(dispatch.as_connector_error()) =>
+            if dispatch.is_user() || connection_refused(dispatch.as_connector_error()) =>
         {
             CommitSendDisposition::NeverSent
+        }
+        SdkError::ServiceError(context) if context.raw().status().is_server_error() => {
+            CommitSendDisposition::MaybeSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
         _ => CommitSendDisposition::MaybeSent,
@@ -504,7 +501,10 @@ mod tests {
     #[test]
     fn test_commit_send_disposition_split() {
         use aws_sdk_s3tables::error::ConnectorError;
-        type TestSdkError = aws_sdk_s3tables::error::SdkError<(), ()>;
+        type TestSdkError = aws_sdk_s3tables::error::SdkError<(), HttpResponse>;
+        fn response(status: u16) -> HttpResponse {
+            HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into())
+        }
         fn boxed(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
             msg.to_string().into()
         }
@@ -522,7 +522,7 @@ mod tests {
         assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::response_error(
                 boxed("unparsable response"),
-                ()
+                response(200)
             )),
             CommitSendDisposition::MaybeSent
         ));
@@ -539,8 +539,20 @@ mod tests {
             CommitSendDisposition::NeverSent
         ));
         assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::service_error((), ())),
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(400))),
             CommitSendDisposition::ResponseReceived
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(409))),
+            CommitSendDisposition::ResponseReceived
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(500))),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(503))),
+            CommitSendDisposition::MaybeSent
         ));
         assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::dispatch_failure(
@@ -555,7 +567,7 @@ mod tests {
             classify_commit_send_disposition(&TestSdkError::dispatch_failure(
                 ConnectorError::other(boxed("unrecognized"), None)
             )),
-            CommitSendDisposition::NeverSent
+            CommitSendDisposition::MaybeSent
         ));
         assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(

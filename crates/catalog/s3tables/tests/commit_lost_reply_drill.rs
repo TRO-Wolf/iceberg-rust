@@ -22,7 +22,7 @@ use std::time::Duration;
 use iceberg::io::MemoryStorageFactory;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
-    Struct, Type,
+    Struct, TableMetadata, Type,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -52,6 +52,12 @@ enum CommitScript {
     DropThenReset,
     ApplyThenClose,
     DropThenClose,
+    ApplyThenError(u16, &'static str),
+    DropThenError(u16, &'static str),
+    ApplyThenGarbage,
+    DropThenGarbage,
+    DeferThenConflict,
+    LandDeferredThenConflict,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,6 +68,12 @@ enum Answer {
     DroppedThenReset,
     AppliedThenClosed,
     DroppedThenClosed,
+    AppliedThenError(u16),
+    DroppedThenError(u16),
+    AppliedThenGarbage,
+    DroppedThenGarbage,
+    DeferredThenConflict,
+    LandedDeferredThenConflict,
     RejectedStale,
     Reset,
 }
@@ -70,6 +82,7 @@ enum Answer {
 struct Logged {
     operation: &'static str,
     version_sent: Option<String>,
+    metadata_sent: Option<String>,
     answer: Answer,
 }
 
@@ -81,6 +94,7 @@ enum Reply {
     },
     Reset,
     Close,
+    Garbage,
 }
 
 #[derive(Clone, Copy)]
@@ -105,6 +119,7 @@ struct S3TablesState {
     close_connections: bool,
     refuse_after_reads: Option<usize>,
     refusing: bool,
+    deferred: Option<String>,
     log: Vec<Logged>,
 }
 
@@ -148,9 +163,13 @@ impl S3TablesState {
             "UpdateTableMetadataLocation" => self.update_metadata_location(body),
             _ => (Answer::Answered, None, rejected(400, "BadRequestException")),
         };
+        let metadata_sent = (operation == "UpdateTableMetadataLocation")
+            .then(|| json_string(body, "metadataLocation"))
+            .flatten();
         self.log.push(Logged {
             operation,
             version_sent,
+            metadata_sent,
             answer,
         });
         reply
@@ -185,6 +204,33 @@ impl S3TablesState {
             Some(CommitScript::DropThenClose) => {
                 return (Answer::DroppedThenClosed, version_sent, Reply::Close);
             }
+            Some(CommitScript::DropThenError(status, code)) => {
+                return (
+                    Answer::DroppedThenError(status),
+                    version_sent,
+                    rejected(status, code),
+                );
+            }
+            Some(CommitScript::DropThenGarbage) => {
+                return (Answer::DroppedThenGarbage, version_sent, Reply::Garbage);
+            }
+            Some(CommitScript::DeferThenConflict) => {
+                self.deferred = json_string(body, "metadataLocation");
+                return (
+                    Answer::DeferredThenConflict,
+                    version_sent,
+                    rejected(409, "ConflictException"),
+                );
+            }
+            Some(CommitScript::LandDeferredThenConflict) => {
+                self.metadata_location = self.deferred.take();
+                self.version += 1;
+                return (
+                    Answer::LandedDeferredThenConflict,
+                    version_sent,
+                    rejected(409, "ConflictException"),
+                );
+            }
             _ => {}
         }
         self.metadata_location = json_string(body, "metadataLocation");
@@ -195,6 +241,14 @@ impl S3TablesState {
             }
             Some(CommitScript::ApplyThenClose) => {
                 (Answer::AppliedThenClosed, version_sent, Reply::Close)
+            }
+            Some(CommitScript::ApplyThenError(status, code)) => (
+                Answer::AppliedThenError(status),
+                version_sent,
+                rejected(status, code),
+            ),
+            Some(CommitScript::ApplyThenGarbage) => {
+                (Answer::AppliedThenGarbage, version_sent, Reply::Garbage)
             }
             Some(CommitScript::ApplyThenConflict) => (
                 Answer::AppliedThenConflict,
@@ -310,6 +364,10 @@ async fn write_reply(stream: &mut TcpStream, reply: Reply, close_after: bool) ->
             return false;
         }
         Reply::Close => return false,
+        Reply::Garbage => {
+            let _ = stream.write_all(b"HTTP/1.1 abc\r\n\r\n").await;
+            return false;
+        }
     };
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
@@ -542,6 +600,8 @@ async fn live_rows(table: &Table) -> u64 {
 struct Measured {
     outcome: Result<(), ErrorKind>,
     marked_snapshots: usize,
+    marked_snapshot_ids: Vec<i64>,
+    sent_snapshot_ids: Vec<Option<i64>>,
     rows: u64,
     log: Vec<Logged>,
 }
@@ -596,7 +656,10 @@ async fn measure(
 ) -> Measured {
     let result = append(table, check_duplicate).commit(catalog).await;
     if let Err(error) = &result {
-        println!("s3tables drill {label}: commit error {error:?}");
+        println!(
+            "s3tables drill {label}: commit error {error:?}; source {:?}",
+            std::error::Error::source(error)
+        );
     }
     let outcome = result.map(|_| ()).map_err(|error| error.kind());
     let log = endpoint.log();
@@ -612,18 +675,32 @@ async fn measure(
         .load_table(table.identifier())
         .await
         .expect("reload the drill table");
+    let marked_snapshot_ids: Vec<i64> = reloaded
+        .metadata()
+        .snapshots()
+        .filter(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .contains_key(MARKER)
+        })
+        .map(|snapshot| snapshot.snapshot_id())
+        .collect();
+    let mut sent_snapshot_ids = Vec::new();
+    for location in log
+        .iter()
+        .filter_map(|logged| logged.metadata_sent.as_deref())
+    {
+        let sent = TableMetadata::read_from(reloaded.file_io(), location)
+            .await
+            .expect("read the metadata file a commit request named");
+        sent_snapshot_ids.push(sent.current_snapshot_id());
+    }
     let measured = Measured {
         outcome,
-        marked_snapshots: reloaded
-            .metadata()
-            .snapshots()
-            .filter(|snapshot| {
-                snapshot
-                    .summary()
-                    .additional_properties
-                    .contains_key(MARKER)
-            })
-            .count(),
+        marked_snapshots: marked_snapshot_ids.len(),
+        marked_snapshot_ids,
+        sent_snapshot_ids,
         rows: live_rows(&reloaded).await,
         log,
     };
@@ -690,6 +767,10 @@ async fn s3tables_reads_keep_their_sdk_retry() {
 #[tokio::test]
 async fn s3tables_lost_reply_on_a_closed_connection_reconciles_as_landed() {
     let measured = drill(&[CommitScript::ApplyThenClose], true).await;
+    let &[Some(sent)] = measured.sent_snapshot_ids.as_slice() else {
+        panic!("one commit request naming one snapshot");
+    };
+    assert_eq!(measured.marked_snapshot_ids, vec![sent]);
     assert_eq!(measured.commits(), vec![(
         Some("v1"),
         Answer::AppliedThenClosed
@@ -719,4 +800,116 @@ async fn s3tables_refused_commit_connection_is_never_sent_and_not_reconciled() {
     assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
     assert_eq!(measured.marked_snapshots, 0);
     assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn s3tables_server_error_with_an_unmodeled_code_after_the_commit_reconciles_as_landed() {
+    let measured = drill(
+        &[CommitScript::ApplyThenError(500, "InternalFailure")],
+        true,
+    )
+    .await;
+    assert_eq!(measured.commits(), vec![(
+        Some("v1"),
+        Answer::AppliedThenError(500)
+    )]);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn s3tables_server_error_with_an_unmodeled_code_before_the_commit_is_unknown_and_keeps_the_pre_state()
+ {
+    let measured = drill(&[CommitScript::DropThenError(500, "InternalFailure")], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("v1"),
+        Answer::DroppedThenError(500)
+    )]);
+    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn s3tables_modeled_server_error_after_the_commit_reconciles_as_landed() {
+    let measured = drill(
+        &[CommitScript::ApplyThenError(
+            500,
+            "InternalServerErrorException",
+        )],
+        true,
+    )
+    .await;
+    assert_eq!(measured.commits(), vec![(
+        Some("v1"),
+        Answer::AppliedThenError(500)
+    )]);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn s3tables_unparsable_reply_after_the_commit_reconciles_as_landed() {
+    let measured = drill(&[CommitScript::ApplyThenGarbage], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("v1"),
+        Answer::AppliedThenGarbage
+    )]);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn s3tables_unparsable_reply_before_the_commit_is_unknown_and_keeps_the_pre_state() {
+    let measured = drill(&[CommitScript::DropThenGarbage], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("v1"),
+        Answer::DroppedThenGarbage
+    )]);
+    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn s3tables_client_error_with_an_unmodeled_code_is_definitive_and_not_reconciled() {
+    let measured = drill(
+        &[CommitScript::DropThenError(400, "ValidationException")],
+        true,
+    )
+    .await;
+    assert_eq!(measured.commits(), vec![(
+        Some("v1"),
+        Answer::DroppedThenError(400)
+    )]);
+    assert_eq!(measured.reads(), 2);
+    assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn s3tables_an_earlier_attempt_that_lands_late_is_found_before_the_rebase() {
+    let measured = drill(
+        &[
+            CommitScript::DeferThenConflict,
+            CommitScript::LandDeferredThenConflict,
+        ],
+        false,
+    )
+    .await;
+    assert_eq!(measured.commits(), vec![
+        (Some("v1"), Answer::DeferredThenConflict),
+        (Some("v1"), Answer::LandedDeferredThenConflict),
+    ]);
+    let &[Some(first), Some(second)] = measured.sent_snapshot_ids.as_slice() else {
+        panic!("two commit requests, each naming one snapshot");
+    };
+    assert_ne!(first, second);
+    assert_eq!(measured.marked_snapshot_ids, vec![first]);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
 }
