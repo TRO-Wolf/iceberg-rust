@@ -59,7 +59,6 @@ pub(crate) enum CommitScript {
     LandDeferredThenConflict,
     LandDeferredThenReset,
     ApplyThenUnreadable,
-    DropThenUnreadable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,7 +77,6 @@ pub(crate) enum Answer {
     LandedDeferredThenConflict,
     LandedDeferredThenReset,
     AppliedThenUnreadable,
-    DroppedThenUnreadable,
     RejectedStale,
     Reset,
 }
@@ -215,13 +213,6 @@ impl GlueState {
             }
             Some(CommitScript::DropThenGarbage) => {
                 return (Answer::DroppedThenGarbage, version_sent, Reply::Garbage);
-            }
-            Some(CommitScript::DropThenUnreadable) => {
-                return (
-                    Answer::DroppedThenUnreadable,
-                    version_sent,
-                    Reply::Unreadable,
-                );
             }
             Some(CommitScript::LandDeferredThenReset) => {
                 self.metadata_location = self.deferred.take();

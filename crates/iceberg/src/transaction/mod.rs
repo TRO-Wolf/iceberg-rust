@@ -143,14 +143,6 @@ pub struct Transaction {
     starting_snapshot_id: Option<i64>,
     starting_ref_snapshot_ids: HashMap<String, i64>,
     actions: Vec<BoxedTransactionAction>,
-    /// The snapshot ids the MOST RECENT `do_commit` attempt handed to `Catalog::update_table`
-    /// (one per `AddSnapshot` update, client-generated before the request). This is the
-    /// reconciliation evidence for an `ErrorKind::CommitStateUnknown` outcome: the commit landed
-    /// iff any of these ids is present in a reloaded table's snapshot set (the Rust equivalent of
-    /// Java `checkCurrentMetadataLocation`'s current-or-`previousFiles()` search — see
-    /// [`commit_status`]). Cleared at the top of every attempt so a failure BEFORE `update_table`
-    /// can never leak a previous attempt's ids into reconciliation; empty means the attempt
-    /// carried no snapshot evidence (metadata-only commit) and is not reconciled.
     latest_attempt_snapshot_ids: Vec<i64>,
     sent_ids: Vec<i64>,
 }
@@ -434,7 +426,7 @@ impl Transaction {
         catalog: &dyn Catalog,
         original_error: Error,
     ) -> Result<Table> {
-        if self.latest_attempt_snapshot_ids.is_empty() {
+        if self.sent_ids.is_empty() {
             // No snapshot was attempted (metadata-only commit) — there is no client-visible
             // marker to look for, so the outcome stays unknown. (Named divergence: Java's
             // location-based check covers these; the metadata location is catalog-assigned and
@@ -474,7 +466,7 @@ impl Transaction {
         match commit_status::check_commit_status_strict(
             catalog,
             self.table.identifier(),
-            &self.latest_attempt_snapshot_ids,
+            &self.sent_ids,
             &config,
         )
         .await

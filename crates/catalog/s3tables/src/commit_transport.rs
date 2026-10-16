@@ -18,13 +18,16 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::hash::BuildHasher;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_sdk_s3tables::config::AsyncSleep;
 use aws_sdk_s3tables::config::http::HttpResponse;
 use aws_sdk_s3tables::config::retry::RetryConfig;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
@@ -47,6 +50,38 @@ pub(crate) enum S3TablesCommitSend {
     Transport(Box<aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>>),
     #[allow(dead_code)]
     ModeledService(UpdateTableMetadataLocationError),
+    RefusedBeforeProcessing(
+        Box<aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>>,
+    ),
+}
+
+pub(crate) const THROTTLE_ATTEMPTS: u32 = 3;
+
+const THROTTLE_FIRST_BACKOFF: Duration = Duration::from_secs(1);
+
+pub(crate) fn throttle_backoff(sends: u32, fraction: f64) -> Duration {
+    THROTTLE_FIRST_BACKOFF
+        .saturating_mul(2u32.saturating_pow(sends.saturating_sub(1)))
+        .mul_f64(fraction)
+}
+
+pub(crate) fn jitter_fraction() -> f64 {
+    let bits = std::collections::hash_map::RandomState::new().hash_one(());
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+pub(crate) fn refused_before_processing(
+    error: &aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>,
+) -> bool {
+    matches!(
+        error,
+        aws_sdk_s3tables::error::SdkError::ServiceError(context)
+            if context.raw().status().is_client_error()
+                && matches!(
+                    context.err(),
+                    UpdateTableMetadataLocationError::TooManyRequestsException(_)
+                )
+    )
 }
 
 #[async_trait]
@@ -73,7 +108,9 @@ pub(crate) fn classify_commit_send_disposition<E>(
         {
             CommitSendDisposition::NeverSent
         }
-        SdkError::ServiceError(context) if context.raw().status().is_server_error() => {
+        SdkError::ServiceError(context)
+            if context.raw().status().is_success() || context.raw().status().is_server_error() =>
+        {
             CommitSendDisposition::MaybeSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
@@ -111,27 +148,51 @@ impl LiveS3TablesCommitTransport {
             attempts: AtomicU64::new(0),
         }
     }
+
+    async fn send_once(
+        &self,
+        call: &S3TablesUpdateCall,
+    ) -> std::result::Result<
+        String,
+        aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>,
+    > {
+        self.client
+            .update_table_metadata_location()
+            .table_bucket_arn(call.table_bucket_arn.clone())
+            .namespace(call.namespace.clone())
+            .name(call.name.clone())
+            .version_token(call.version_token.clone())
+            .metadata_location(call.metadata_location.clone())
+            .customize()
+            .config_override(
+                aws_sdk_s3tables::config::Builder::default().retry_config(RetryConfig::disabled()),
+            )
+            .send()
+            .await
+            .map(|output| output.version_token)
+    }
 }
 
 #[async_trait]
 impl S3TablesCommitTransport for LiveS3TablesCommitTransport {
     async fn send_update_metadata_location(&self, call: S3TablesUpdateCall) -> S3TablesCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        let builder = self
-            .client
-            .update_table_metadata_location()
-            .table_bucket_arn(call.table_bucket_arn)
-            .namespace(call.namespace)
-            .name(call.name)
-            .version_token(call.version_token)
-            .metadata_location(call.metadata_location)
-            .customize()
-            .config_override(
-                aws_sdk_s3tables::config::Builder::default().retry_config(RetryConfig::disabled()),
-            );
-        match builder.send().await {
-            Ok(output) => S3TablesCommitSend::Success(Some(output.version_token)),
-            Err(error) => S3TablesCommitSend::Transport(Box::new(error)),
+        let sleep = self.client.config().sleep_impl();
+        let mut sends = 0;
+        loop {
+            sends += 1;
+            match self.send_once(&call).await {
+                Ok(version_token) => return S3TablesCommitSend::Success(Some(version_token)),
+                Err(error) if refused_before_processing(&error) => match &sleep {
+                    Some(sleep) if sends < THROTTLE_ATTEMPTS => {
+                        sleep
+                            .sleep(throttle_backoff(sends, jitter_fraction()))
+                            .await;
+                    }
+                    _ => return S3TablesCommitSend::RefusedBeforeProcessing(Box::new(error)),
+                },
+                Err(error) => return S3TablesCommitSend::Transport(Box::new(error)),
+            }
         }
     }
 
@@ -314,6 +375,14 @@ pub(crate) fn map_s3tables_commit_send(
         S3TablesCommitSend::ModeledService(error) => Err(
             map_update_table_metadata_location_service_error(error, table_ident),
         ),
+        S3TablesCommitSend::RefusedBeforeProcessing(error) => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!(
+                "Commit refused for table {table_ident}: S3 Tables throttled the update on each \
+                 of {THROTTLE_ATTEMPTS} sends, and nothing was applied"
+            ),
+        )
+        .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))),
     }
 }
 
@@ -444,6 +513,57 @@ impl S3TablesCommitHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_throttled_commit_schedule_is_three_sends_with_full_jitter_from_one_second() {
+        assert_eq!(THROTTLE_ATTEMPTS, 3);
+        assert_eq!(throttle_backoff(1, 0.0), Duration::ZERO);
+        assert_eq!(throttle_backoff(1, 0.5), Duration::from_millis(500));
+        assert_eq!(throttle_backoff(2, 0.5), Duration::from_secs(1));
+        assert_eq!(throttle_backoff(2, 0.75), Duration::from_millis(1500));
+        assert!(throttle_backoff(1, 0.999_999) < Duration::from_secs(1));
+        assert!(throttle_backoff(2, 0.999_999) < Duration::from_secs(2));
+        for _ in 0..1000 {
+            assert!((0.0..1.0).contains(&jitter_fraction()));
+        }
+    }
+
+    #[test]
+    fn test_only_a_throttle_reply_is_refused_before_processing() {
+        let reply = |status: u16, error: UpdateTableMetadataLocationError| {
+            aws_sdk_s3tables::error::SdkError::service_error(
+                error,
+                HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into()),
+            )
+        };
+        let throttle = || {
+            UpdateTableMetadataLocationError::TooManyRequestsException(
+                aws_sdk_s3tables::types::error::TooManyRequestsException::builder().build(),
+            )
+        };
+        assert!(refused_before_processing(&reply(429, throttle())));
+        assert!(!refused_before_processing(&reply(503, throttle())));
+        assert!(!refused_before_processing(&reply(
+            409,
+            UpdateTableMetadataLocationError::ConflictException(
+                aws_sdk_s3tables::types::error::ConflictException::builder().build(),
+            )
+        )));
+    }
+
+    #[test]
+    fn test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied() {
+        let error = map_s3tables_commit_send(
+            S3TablesCommitSend::RefusedBeforeProcessing(Box::new(
+                aws_sdk_s3tables::error::SdkError::timeout_error(boxed_err("throttled")),
+            )),
+            &test_table_ident(),
+        )
+        .expect_err("an exhausted throttle fails");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(!error.retryable());
+        assert!(error.message().contains("nothing was applied"));
+    }
 
     fn test_table_ident() -> TableIdent {
         TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")

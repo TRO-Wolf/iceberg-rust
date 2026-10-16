@@ -62,7 +62,9 @@ pub(crate) fn classify_commit_send_disposition<E>(
         {
             CommitSendDisposition::NeverSent
         }
-        SdkError::ServiceError(context) if context.raw().status().is_server_error() => {
+        SdkError::ServiceError(context)
+            if context.raw().status().is_success() || context.raw().status().is_server_error() =>
+        {
             CommitSendDisposition::MaybeSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,

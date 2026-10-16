@@ -18,14 +18,17 @@
 #[cfg(test)]
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
+use std::hash::BuildHasher;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_sdk_glue::config::AsyncSleep;
 use aws_sdk_glue::config::retry::RetryConfig;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
@@ -50,6 +53,33 @@ pub(crate) enum GlueCommitSend {
     Transport(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>),
     #[allow(dead_code)]
     ModeledService(UpdateTableError),
+    RefusedBeforeProcessing(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>),
+}
+
+pub(crate) const THROTTLE_ATTEMPTS: u32 = 3;
+
+const THROTTLE_FIRST_BACKOFF: Duration = Duration::from_secs(1);
+
+pub(crate) fn throttle_backoff(sends: u32, fraction: f64) -> Duration {
+    THROTTLE_FIRST_BACKOFF
+        .saturating_mul(2u32.saturating_pow(sends.saturating_sub(1)))
+        .mul_f64(fraction)
+}
+
+pub(crate) fn jitter_fraction() -> f64 {
+    let bits = std::collections::hash_map::RandomState::new().hash_one(());
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+pub(crate) fn refused_before_processing(
+    error: &aws_sdk_glue::error::SdkError<UpdateTableError>,
+) -> bool {
+    matches!(
+        error,
+        aws_sdk_glue::error::SdkError::ServiceError(context)
+            if context.raw().status().is_client_error()
+                && context.err().code() == Some("ThrottlingException")
+    )
 }
 
 #[async_trait]
@@ -82,35 +112,55 @@ impl LiveGlueCommitTransport {
             attempts: AtomicU64::new(0),
         }
     }
-}
 
-#[async_trait]
-impl GlueCommitTransport for LiveGlueCommitTransport {
-    async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend {
-        self.attempts.fetch_add(1, Ordering::SeqCst);
+    async fn send_once(
+        &self,
+        call: &GlueUpdateTableCall,
+    ) -> std::result::Result<(), aws_sdk_glue::error::SdkError<UpdateTableError>> {
         let mut builder = self
             .client
             .update_table()
-            .database_name(call.database_name)
+            .database_name(call.database_name.clone())
             .set_skip_archive(Some(true))
-            .table_input(call.table_input);
-        if let Some(version_id) = call.version_id {
+            .table_input(call.table_input.clone());
+        if let Some(version_id) = &call.version_id {
             builder = builder.version_id(version_id);
         }
-        let catalog_id = call.catalog_id.or_else(|| self.catalog_id.clone());
+        let catalog_id = call.catalog_id.clone().or_else(|| self.catalog_id.clone());
         if let Some(catalog_id) = catalog_id {
             builder = builder.catalog_id(catalog_id);
         }
-        match builder
+        builder
             .customize()
             .config_override(
                 aws_sdk_glue::config::Builder::default().retry_config(RetryConfig::disabled()),
             )
             .send()
             .await
-        {
-            Ok(_) => GlueCommitSend::Success,
-            Err(error) => GlueCommitSend::Transport(Box::new(error)),
+            .map(|_| ())
+    }
+}
+
+#[async_trait]
+impl GlueCommitTransport for LiveGlueCommitTransport {
+    async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        let sleep = self.client.config().sleep_impl();
+        let mut sends = 0;
+        loop {
+            sends += 1;
+            match self.send_once(&call).await {
+                Ok(()) => return GlueCommitSend::Success,
+                Err(error) if refused_before_processing(&error) => match &sleep {
+                    Some(sleep) if sends < THROTTLE_ATTEMPTS => {
+                        sleep
+                            .sleep(throttle_backoff(sends, jitter_fraction()))
+                            .await;
+                    }
+                    _ => return GlueCommitSend::RefusedBeforeProcessing(Box::new(error)),
+                },
+                Err(error) => return GlueCommitSend::Transport(Box::new(error)),
+            }
         }
     }
 
@@ -308,6 +358,14 @@ pub(crate) fn map_glue_commit_send(send: GlueCommitSend, table_ident: &TableIden
         GlueCommitSend::ModeledService(error) => {
             Err(map_update_table_service_error(error, table_ident))
         }
+        GlueCommitSend::RefusedBeforeProcessing(error) => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!(
+                "Commit refused for table {table_ident}: Glue throttled the update on each of \
+                 {THROTTLE_ATTEMPTS} sends, and nothing was applied"
+            ),
+        )
+        .with_source(anyhow!("aws sdk error: {error:?}"))),
     }
 }
 
@@ -449,7 +507,67 @@ impl GlueCommitHarness {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_glue::config::http::HttpResponse;
+
     use super::*;
+
+    #[test]
+    fn test_throttled_commit_schedule_is_three_sends_with_full_jitter_from_one_second() {
+        assert_eq!(THROTTLE_ATTEMPTS, 3);
+        assert_eq!(throttle_backoff(1, 0.0), Duration::ZERO);
+        assert_eq!(throttle_backoff(1, 0.5), Duration::from_millis(500));
+        assert_eq!(throttle_backoff(2, 0.5), Duration::from_secs(1));
+        assert_eq!(throttle_backoff(2, 0.75), Duration::from_millis(1500));
+        assert!(throttle_backoff(1, 0.999_999) < Duration::from_secs(1));
+        assert!(throttle_backoff(2, 0.999_999) < Duration::from_secs(2));
+        for _ in 0..1000 {
+            assert!((0.0..1.0).contains(&jitter_fraction()));
+        }
+    }
+
+    #[test]
+    fn test_only_a_throttle_reply_is_refused_before_processing() {
+        let reply = |status: u16, code: &str| {
+            aws_sdk_glue::error::SdkError::service_error(
+                UpdateTableError::generic(
+                    aws_sdk_glue::error::ErrorMetadata::builder()
+                        .code(code)
+                        .build(),
+                ),
+                HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into()),
+            )
+        };
+        assert!(refused_before_processing(&reply(
+            400,
+            "ThrottlingException"
+        )));
+        assert!(!refused_before_processing(&reply(
+            500,
+            "ThrottlingException"
+        )));
+        assert!(!refused_before_processing(&reply(
+            400,
+            "ValidationException"
+        )));
+        assert!(!refused_before_processing(&reply(
+            400,
+            "ConcurrentModificationException"
+        )));
+    }
+
+    #[test]
+    fn test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied() {
+        let error = map_glue_commit_send(
+            GlueCommitSend::RefusedBeforeProcessing(Box::new(
+                aws_sdk_glue::error::SdkError::timeout_error(boxed_err("throttled")),
+            )),
+            &test_table_ident(),
+        )
+        .expect_err("an exhausted throttle fails");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(!error.retryable());
+        assert!(error.message().contains("nothing was applied"));
+    }
 
     fn test_table_ident() -> TableIdent {
         TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
