@@ -553,6 +553,10 @@ mod tests {
             CommitSendDisposition::ResponseReceived
         ));
         assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(200))),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::service_error((), response(500))),
             CommitSendDisposition::MaybeSent
         ));

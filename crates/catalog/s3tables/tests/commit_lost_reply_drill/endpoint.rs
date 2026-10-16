@@ -27,25 +27,26 @@ use iceberg::spec::{
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation};
-use iceberg_catalog_glue::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, GLUE_CATALOG_PROP_URI,
-    GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalog, GlueCatalogBuilder,
+use iceberg_catalog_s3tables::{
+    S3TABLES_CATALOG_PROP_ENDPOINT_URL, S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN, S3TablesCatalog,
+    S3TablesCatalogBuilder,
 };
-use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-const NAMESPACE: &str = "drill";
-const TABLE: &str = "t";
-const LOCATION: &str = "memory://warehouse/drill.db/t";
-const MARKER: &str = "drill.append";
-const ROWS_PER_APPEND: u64 = 3;
-const REFUSAL_WINDOW: Duration = Duration::from_secs(1);
-const LISTENER_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const BUCKET_ARN: &str = "arn:aws:s3tables:us-east-1:123456789012:bucket/drill";
+pub(crate) const TABLE_ARN: &str = "arn:aws:s3tables:us-east-1:123456789012:bucket/drill/table/t";
+pub(crate) const NAMESPACE: &str = "drill";
+pub(crate) const TABLE: &str = "t";
+pub(crate) const WAREHOUSE: &str = "memory://warehouse/drill/t";
+pub(crate) const MARKER: &str = "drill.append";
+pub(crate) const ROWS_PER_APPEND: u64 = 3;
+pub(crate) const REFUSAL_WINDOW: Duration = Duration::from_secs(1);
+pub(crate) const LISTENER_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CommitScript {
+pub(crate) enum CommitScript {
     ApplyThenReset,
     ApplyThenConflict,
     DropThenReset,
@@ -57,10 +58,13 @@ enum CommitScript {
     DropThenGarbage,
     DeferThenConflict,
     LandDeferredThenConflict,
+    LandDeferredThenReset,
+    ApplyThenUnreadable,
+    DropThenUnreadable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Answer {
+pub(crate) enum Answer {
     Answered,
     AppliedThenReset,
     AppliedThenConflict,
@@ -73,19 +77,22 @@ enum Answer {
     DroppedThenGarbage,
     DeferredThenConflict,
     LandedDeferredThenConflict,
+    LandedDeferredThenReset,
+    AppliedThenUnreadable,
+    DroppedThenUnreadable,
     RejectedStale,
     Reset,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Logged {
-    operation: String,
-    version_sent: Option<String>,
-    metadata_sent: Option<String>,
-    answer: Answer,
+pub(crate) struct Logged {
+    pub(crate) operation: &'static str,
+    pub(crate) version_sent: Option<String>,
+    pub(crate) metadata_sent: Option<String>,
+    pub(crate) answer: Answer,
 }
 
-enum Reply {
+pub(crate) enum Reply {
     Json {
         status: u16,
         error_type: Option<&'static str>,
@@ -94,36 +101,37 @@ enum Reply {
     Reset,
     Close,
     Garbage,
+    Unreadable,
 }
 
 #[derive(Clone, Copy)]
-enum Connections {
+pub(crate) enum Connections {
     KeepAlive,
     OnePerRequest,
 }
 
 #[derive(Default)]
-struct Refusal {
-    close_listener: Notify,
-    listener_closed: Notify,
-    listening_again: Notify,
+pub(crate) struct Refusal {
+    pub(crate) close_listener: Notify,
+    pub(crate) listener_closed: Notify,
+    pub(crate) listening_again: Notify,
 }
 
 #[derive(Default)]
-struct GlueState {
-    metadata_location: Option<String>,
-    version: u64,
-    commit_scripts: VecDeque<CommitScript>,
-    read_resets: usize,
-    close_connections: bool,
-    refuse_after_reads: Option<usize>,
-    refusing: bool,
-    deferred: Option<String>,
-    log: Vec<Logged>,
+pub(crate) struct S3TablesState {
+    pub(crate) metadata_location: Option<String>,
+    pub(crate) version: u64,
+    pub(crate) commit_scripts: VecDeque<CommitScript>,
+    pub(crate) read_resets: usize,
+    pub(crate) close_connections: bool,
+    pub(crate) refuse_after_reads: Option<usize>,
+    pub(crate) refusing: bool,
+    pub(crate) deferred: Option<String>,
+    pub(crate) log: Vec<Logged>,
 }
 
-impl GlueState {
-    fn count_down_refusal(&mut self) {
+impl S3TablesState {
+    pub(crate) fn count_down_refusal(&mut self) {
         match self.refuse_after_reads {
             Some(remaining) if remaining <= 1 => {
                 self.refuse_after_reads = None;
@@ -134,12 +142,22 @@ impl GlueState {
         }
     }
 
-    fn handle(&mut self, operation: &str, body: &Value) -> Reply {
+    pub(crate) fn version_token(&self) -> String {
+        format!("v{}", self.version)
+    }
+
+    pub(crate) fn handle(&mut self, operation: &'static str, body: &str) -> Reply {
         let (answer, version_sent, reply) = match operation {
             "CreateTable" => {
-                self.metadata_location = new_metadata_location(body);
-                self.version = 1;
-                (Answer::Answered, None, answered(json!({})))
+                self.version = 0;
+                (
+                    Answer::Answered,
+                    None,
+                    answered(format!(
+                        r#"{{"tableARN":"{TABLE_ARN}","versionToken":"{}"}}"#,
+                        self.version_token()
+                    )),
+                )
             }
             "GetTable" if self.read_resets > 0 => {
                 self.read_resets -= 1;
@@ -149,18 +167,14 @@ impl GlueState {
                 self.count_down_refusal();
                 (Answer::Answered, None, self.get_table())
             }
-            "UpdateTable" => self.update_table(body),
-            _ => (
-                Answer::Answered,
-                None,
-                rejected("InvalidInputException", "unsupported by the drill endpoint"),
-            ),
+            "UpdateTableMetadataLocation" => self.update_metadata_location(body),
+            _ => (Answer::Answered, None, rejected(400, "BadRequestException")),
         };
-        let metadata_sent = (operation == "UpdateTable")
-            .then(|| new_metadata_location(body))
+        let metadata_sent = (operation == "UpdateTableMetadataLocation")
+            .then(|| json_string(body, "metadataLocation"))
             .flatten();
         self.log.push(Logged {
-            operation: operation.to_string(),
+            operation,
             version_sent,
             metadata_sent,
             answer,
@@ -168,27 +182,28 @@ impl GlueState {
         reply
     }
 
-    fn get_table(&self) -> Reply {
-        match &self.metadata_location {
-            Some(location) => answered(json!({
-                "Table": {
-                    "Name": TABLE,
-                    "DatabaseName": NAMESPACE,
-                    "VersionId": self.version.to_string(),
-                    "Parameters": {"metadata_location": location, "table_type": "ICEBERG"},
-                }
-            })),
-            None => rejected("EntityNotFoundException", "no drill table"),
-        }
+    pub(crate) fn get_table(&self) -> Reply {
+        let metadata_location = self
+            .metadata_location
+            .as_ref()
+            .map(|location| format!(r#""metadataLocation":"{location}","#))
+            .unwrap_or_default();
+        answered(format!(
+            r#"{{"name":"{TABLE}","type":"customer","tableARN":"{TABLE_ARN}","namespace":["{NAMESPACE}"],"versionToken":"{}",{metadata_location}"warehouseLocation":"{WAREHOUSE}","format":"ICEBERG"}}"#,
+            self.version_token()
+        ))
     }
 
-    fn update_table(&mut self, body: &Value) -> (Answer, Option<String>, Reply) {
-        let version_sent = body["VersionId"].as_str().map(str::to_string);
-        if version_sent.as_deref() != Some(self.version.to_string().as_str()) {
+    pub(crate) fn update_metadata_location(
+        &mut self,
+        body: &str,
+    ) -> (Answer, Option<String>, Reply) {
+        let version_sent = json_string(body, "versionToken");
+        if version_sent.as_deref() != Some(self.version_token().as_str()) {
             return (
                 Answer::RejectedStale,
                 version_sent,
-                rejected("ConcurrentModificationException", "stale VersionId"),
+                rejected(409, "ConflictException"),
             );
         }
         let script = self.commit_scripts.pop_front();
@@ -203,18 +218,30 @@ impl GlueState {
                 return (
                     Answer::DroppedThenError(status),
                     version_sent,
-                    failed(status, code),
+                    rejected(status, code),
                 );
             }
             Some(CommitScript::DropThenGarbage) => {
                 return (Answer::DroppedThenGarbage, version_sent, Reply::Garbage);
             }
+            Some(CommitScript::DropThenUnreadable) => {
+                return (
+                    Answer::DroppedThenUnreadable,
+                    version_sent,
+                    Reply::Unreadable,
+                );
+            }
+            Some(CommitScript::LandDeferredThenReset) => {
+                self.metadata_location = self.deferred.take();
+                self.version += 1;
+                return (Answer::LandedDeferredThenReset, version_sent, Reply::Reset);
+            }
             Some(CommitScript::DeferThenConflict) => {
-                self.deferred = new_metadata_location(body);
+                self.deferred = json_string(body, "metadataLocation");
                 return (
                     Answer::DeferredThenConflict,
                     version_sent,
-                    rejected("ConcurrentModificationException", "stale VersionId"),
+                    rejected(409, "ConflictException"),
                 );
             }
             Some(CommitScript::LandDeferredThenConflict) => {
@@ -223,12 +250,12 @@ impl GlueState {
                 return (
                     Answer::LandedDeferredThenConflict,
                     version_sent,
-                    rejected("ConcurrentModificationException", "stale VersionId"),
+                    rejected(409, "ConflictException"),
                 );
             }
             _ => {}
         }
-        self.metadata_location = new_metadata_location(body);
+        self.metadata_location = json_string(body, "metadataLocation");
         self.version += 1;
         match script {
             Some(CommitScript::ApplyThenReset) => {
@@ -240,58 +267,63 @@ impl GlueState {
             Some(CommitScript::ApplyThenError(status, code)) => (
                 Answer::AppliedThenError(status),
                 version_sent,
-                failed(status, code),
+                rejected(status, code),
             ),
             Some(CommitScript::ApplyThenGarbage) => {
                 (Answer::AppliedThenGarbage, version_sent, Reply::Garbage)
             }
+            Some(CommitScript::ApplyThenUnreadable) => (
+                Answer::AppliedThenUnreadable,
+                version_sent,
+                Reply::Unreadable,
+            ),
             Some(CommitScript::ApplyThenConflict) => (
                 Answer::AppliedThenConflict,
                 version_sent,
-                rejected("ConcurrentModificationException", "stale VersionId"),
+                rejected(409, "ConflictException"),
             ),
-            _ => (Answer::Answered, version_sent, answered(json!({}))),
+            _ => (
+                Answer::Answered,
+                version_sent,
+                answered(format!(
+                    r#"{{"name":"{TABLE}","tableARN":"{TABLE_ARN}","namespace":["{NAMESPACE}"],"versionToken":"{}","metadataLocation":"{}"}}"#,
+                    self.version_token(),
+                    self.metadata_location.as_deref().unwrap_or_default()
+                )),
+            ),
         }
     }
 }
 
-fn new_metadata_location(body: &Value) -> Option<String> {
-    body["TableInput"]["Parameters"]["metadata_location"]
-        .as_str()
-        .map(str::to_string)
+pub(crate) fn json_string(body: &str, key: &str) -> Option<String> {
+    let start = body.find(&format!(r#""{key}":""#))? + key.len() + 4;
+    let length = body[start..].find('"')?;
+    Some(body[start..start + length].to_string())
 }
 
-fn answered(body: Value) -> Reply {
+pub(crate) fn answered(body: String) -> Reply {
     Reply::Json {
         status: 200,
         error_type: None,
-        body: body.to_string(),
+        body,
     }
 }
 
-fn failed(status: u16, error_type: &'static str) -> Reply {
+pub(crate) fn rejected(status: u16, error_type: &'static str) -> Reply {
     Reply::Json {
         status,
         error_type: Some(error_type),
-        body: json!({"__type": error_type, "Message": "failed by the drill endpoint"}).to_string(),
+        body: r#"{"message":"rejected by the drill endpoint"}"#.to_string(),
     }
 }
 
-fn rejected(error_type: &'static str, message: &str) -> Reply {
-    Reply::Json {
-        status: 400,
-        error_type: Some(error_type),
-        body: json!({"__type": error_type, "Message": message}).to_string(),
-    }
-}
-
-struct Request {
-    head: String,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub(crate) head: String,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.head.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
             key.trim()
@@ -299,9 +331,21 @@ impl Request {
                 .then_some(value.trim())
         })
     }
+
+    pub(crate) fn operation(&self) -> &'static str {
+        let mut request_line = self.head.split_whitespace();
+        let method = request_line.next().unwrap_or("");
+        let path = request_line.next().unwrap_or("");
+        match method {
+            "GET" if path.starts_with("/get-table") => "GetTable",
+            "PUT" if path.ends_with("/metadata-location") => "UpdateTableMetadataLocation",
+            "PUT" if path.starts_with("/tables/") => "CreateTable",
+            _ => "Unsupported",
+        }
+    }
 }
 
-async fn read_more(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<()> {
+pub(crate) async fn read_more(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<()> {
     let mut chunk = [0u8; 8192];
     let read = stream
         .read(&mut chunk)
@@ -312,7 +356,7 @@ async fn read_more(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Option<()> {
     Some(())
 }
 
-async fn read_request(stream: &mut TcpStream) -> Option<Request> {
+pub(crate) async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut buffer = Vec::new();
     let head_end = loop {
         if let Some(index) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -335,7 +379,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     Some(request)
 }
 
-async fn write_reply(stream: &mut TcpStream, reply: Reply, close_after: bool) -> bool {
+pub(crate) async fn write_reply(stream: &mut TcpStream, reply: Reply, close_after: bool) -> bool {
     let (status, error_type, body) = match reply {
         Reply::Json {
             status,
@@ -351,10 +395,18 @@ async fn write_reply(stream: &mut TcpStream, reply: Reply, close_after: bool) ->
             let _ = stream.write_all(b"HTTP/1.1 abc\r\n\r\n").await;
             return false;
         }
+        Reply::Unreadable => {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 9\r\n\r\n{not json",
+                )
+                .await;
+            return false;
+        }
     };
     let mut head = format!(
-        "HTTP/1.1 {status} {}\r\ncontent-type: application/x-amz-json-1.1\r\ncontent-length: {}\r\n",
-        if status == 200 { "OK" } else { "Bad Request" },
+        "HTTP/1.1 {status} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
+        if status == 200 { "OK" } else { "Error" },
         body.len()
     );
     if let Some(error_type) = error_type {
@@ -369,22 +421,17 @@ async fn write_reply(stream: &mut TcpStream, reply: Reply, close_after: bool) ->
     written && !close_after
 }
 
-async fn serve_connection(
+pub(crate) async fn serve_connection(
     mut stream: TcpStream,
-    state: Arc<Mutex<GlueState>>,
+    state: Arc<Mutex<S3TablesState>>,
     refusal: Arc<Refusal>,
 ) {
     while let Some(request) = read_request(&mut stream).await {
-        let operation = request
-            .header("x-amz-target")
-            .and_then(|target| target.strip_prefix("AWSGlue."))
-            .unwrap_or("")
-            .to_string();
-        let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+        let body = String::from_utf8_lossy(&request.body).into_owned();
         let reply = state
             .lock()
             .expect("drill endpoint state")
-            .handle(&operation, &body);
+            .handle(request.operation(), &body);
         let (close_after, refuse) = {
             let mut state = state.lock().expect("drill endpoint state");
             (state.close_connections, std::mem::take(&mut state.refusing))
@@ -399,9 +446,9 @@ async fn serve_connection(
     }
 }
 
-async fn accept_loop(
+pub(crate) async fn accept_loop(
     mut listener: TcpListener,
-    state: Arc<Mutex<GlueState>>,
+    state: Arc<Mutex<S3TablesState>>,
     refusal: Arc<Refusal>,
 ) {
     let Ok(address) = listener.local_addr() else {
@@ -435,21 +482,21 @@ async fn accept_loop(
     }
 }
 
-struct FakeGlue {
-    url: String,
-    state: Arc<Mutex<GlueState>>,
-    refusal: Arc<Refusal>,
+pub(crate) struct FakeS3Tables {
+    pub(crate) url: String,
+    pub(crate) state: Arc<Mutex<S3TablesState>>,
+    pub(crate) refusal: Arc<Refusal>,
 }
 
-impl FakeGlue {
-    async fn start(connections: Connections) -> Self {
+impl FakeS3Tables {
+    pub(crate) async fn start(connections: Connections) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the drill endpoint");
         let address = listener.local_addr().expect("drill endpoint address");
-        let state = Arc::new(Mutex::new(GlueState {
+        let state = Arc::new(Mutex::new(S3TablesState {
             close_connections: matches!(connections, Connections::OnePerRequest),
-            ..GlueState::default()
+            ..S3TablesState::default()
         }));
         let refusal = Arc::new(Refusal::default());
         tokio::spawn(accept_loop(
@@ -464,60 +511,63 @@ impl FakeGlue {
         }
     }
 
-    fn arm(&self, scripts: &[CommitScript]) {
+    pub(crate) fn arm(&self, scripts: &[CommitScript]) {
         let mut state = self.state.lock().expect("drill endpoint state");
         state.commit_scripts = scripts.iter().copied().collect();
         state.log.clear();
     }
 
-    fn reset_next_reads(&self, count: usize) {
+    pub(crate) fn reset_next_reads(&self, count: usize) {
         let mut state = self.state.lock().expect("drill endpoint state");
         state.read_resets = count;
         state.log.clear();
     }
 
-    fn refuse_the_commit_connection(&self, reads_before_commit: usize) {
+    pub(crate) fn refuse_the_commit_connection(&self, reads_before_commit: usize) {
         let mut state = self.state.lock().expect("drill endpoint state");
         state.refuse_after_reads = Some(reads_before_commit);
         state.log.clear();
     }
 
-    async fn listening_again(&self) {
+    pub(crate) async fn listening_again(&self) {
         tokio::time::timeout(LISTENER_DEADLINE, self.refusal.listening_again.notified())
             .await
             .expect("the drill endpoint listens again after the refusal window");
     }
 
-    fn log(&self) -> Vec<Logged> {
+    pub(crate) fn log(&self) -> Vec<Logged> {
         self.state.lock().expect("drill endpoint state").log.clone()
     }
 }
 
-async fn glue_catalog(url: &str) -> GlueCatalog {
+pub(crate) async fn s3tables_catalog(url: &str) -> S3TablesCatalog {
     let props = HashMap::from([
-        (GLUE_CATALOG_PROP_URI.to_string(), url.to_string()),
         (
-            GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
-            "memory://warehouse".to_string(),
+            S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+            BUCKET_ARN.to_string(),
         ),
         (
-            AWS_ACCESS_KEY_ID.to_string(),
+            S3TABLES_CATALOG_PROP_ENDPOINT_URL.to_string(),
+            url.to_string(),
+        ),
+        (
+            "aws_access_key_id".to_string(),
             "drill-access-key".to_string(),
         ),
         (
-            AWS_SECRET_ACCESS_KEY.to_string(),
+            "aws_secret_access_key".to_string(),
             "drill-secret-key".to_string(),
         ),
-        (AWS_REGION_NAME.to_string(), "us-east-1".to_string()),
+        ("region_name".to_string(), "us-east-1".to_string()),
     ]);
-    GlueCatalogBuilder::default()
+    S3TablesCatalogBuilder::default()
         .with_storage_factory(Arc::new(MemoryStorageFactory))
         .load("drill", props)
         .await
-        .expect("build the Glue catalog against the drill endpoint")
+        .expect("build the S3 Tables catalog against the drill endpoint")
 }
 
-async fn seeded_table(catalog: &GlueCatalog) -> Table {
+pub(crate) async fn seeded_table(catalog: &S3TablesCatalog) -> Table {
     let schema = Schema::builder()
         .with_fields(vec![
             NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
@@ -526,7 +576,6 @@ async fn seeded_table(catalog: &GlueCatalog) -> Table {
         .expect("drill schema");
     let creation = TableCreation::builder()
         .name(TABLE.to_string())
-        .location(LOCATION.to_string())
         .schema(schema)
         .build();
     catalog
@@ -535,10 +584,10 @@ async fn seeded_table(catalog: &GlueCatalog) -> Table {
         .expect("create the drill table")
 }
 
-fn data_file() -> DataFile {
+pub(crate) fn data_file() -> DataFile {
     DataFileBuilder::default()
         .content(DataContentType::Data)
-        .file_path(format!("{LOCATION}/data/drill-0.parquet"))
+        .file_path(format!("{WAREHOUSE}/data/drill-0.parquet"))
         .file_format(DataFileFormat::Parquet)
         .file_size_in_bytes(100)
         .record_count(ROWS_PER_APPEND)
@@ -548,7 +597,7 @@ fn data_file() -> DataFile {
         .expect("drill data file")
 }
 
-fn append(table: &Table, check_duplicate: bool) -> Transaction {
+pub(crate) fn append(table: &Table, check_duplicate: bool) -> Transaction {
     let tx = Transaction::new(table);
     tx.fast_append()
         .with_check_duplicate(check_duplicate)
@@ -558,7 +607,7 @@ fn append(table: &Table, check_duplicate: bool) -> Transaction {
         .expect("stage the drill append")
 }
 
-async fn live_rows(table: &Table) -> u64 {
+pub(crate) async fn live_rows(table: &Table) -> u64 {
     let Some(current) = table.metadata().current_snapshot() else {
         return 0;
     };
@@ -583,44 +632,69 @@ async fn live_rows(table: &Table) -> u64 {
 }
 
 #[derive(Debug)]
-struct Measured {
-    outcome: Result<(), ErrorKind>,
-    marked_snapshots: usize,
-    marked_snapshot_ids: Vec<i64>,
-    sent_snapshot_ids: Vec<Option<i64>>,
-    rows: u64,
-    log: Vec<Logged>,
+pub(crate) struct Measured {
+    pub(crate) outcome: Result<(), ErrorKind>,
+    pub(crate) message: Option<String>,
+    pub(crate) marked_snapshots: usize,
+    pub(crate) marked_snapshot_ids: Vec<i64>,
+    pub(crate) sent_snapshot_ids: Vec<Option<i64>>,
+    pub(crate) rows: u64,
+    pub(crate) log: Vec<Logged>,
 }
 
 impl Measured {
-    fn reads(&self) -> usize {
+    pub(crate) fn reads_between_commits(&self) -> usize {
+        let commits: Vec<usize> = self
+            .log
+            .iter()
+            .enumerate()
+            .filter(|(_, logged)| logged.metadata_sent.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        match (commits.first(), commits.last()) {
+            (Some(first), Some(last)) => self.log[*first..*last]
+                .iter()
+                .filter(|logged| logged.operation == "GetTable")
+                .count(),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn metadata_sent(&self) -> Vec<&str> {
+        self.log
+            .iter()
+            .filter_map(|logged| logged.metadata_sent.as_deref())
+            .collect()
+    }
+
+    pub(crate) fn reads(&self) -> usize {
         self.log
             .iter()
             .filter(|logged| logged.operation == "GetTable")
             .count()
     }
 
-    fn commits(&self) -> Vec<(Option<&str>, Answer)> {
+    pub(crate) fn commits(&self) -> Vec<(Option<&str>, Answer)> {
         self.log
             .iter()
-            .filter(|logged| logged.operation == "UpdateTable")
+            .filter(|logged| logged.operation == "UpdateTableMetadataLocation")
             .map(|logged| (logged.version_sent.as_deref(), logged.answer))
             .collect()
     }
 }
 
-async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Measured {
-    let endpoint = FakeGlue::start(Connections::KeepAlive).await;
-    let catalog = glue_catalog(&endpoint.url).await;
+pub(crate) async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Measured {
+    let endpoint = FakeS3Tables::start(Connections::KeepAlive).await;
+    let catalog = s3tables_catalog(&endpoint.url).await;
     let table = seeded_table(&catalog).await;
     endpoint.arm(scripts);
     let label = format!("{scripts:?} check_duplicate={check_duplicate}");
     measure(&endpoint, &catalog, &table, check_duplicate, &label).await
 }
 
-async fn drill_refused_commit_connection() -> Measured {
-    let endpoint = FakeGlue::start(Connections::OnePerRequest).await;
-    let catalog = glue_catalog(&endpoint.url).await;
+pub(crate) async fn drill_refused_commit_connection() -> Measured {
+    let endpoint = FakeS3Tables::start(Connections::OnePerRequest).await;
+    let catalog = s3tables_catalog(&endpoint.url).await;
     let table = seeded_table(&catalog).await;
     endpoint.refuse_the_commit_connection(2);
     measure(
@@ -633,9 +707,9 @@ async fn drill_refused_commit_connection() -> Measured {
     .await
 }
 
-async fn measure(
-    endpoint: &FakeGlue,
-    catalog: &GlueCatalog,
+pub(crate) async fn measure(
+    endpoint: &FakeS3Tables,
+    catalog: &S3TablesCatalog,
     table: &Table,
     check_duplicate: bool,
     label: &str,
@@ -643,10 +717,14 @@ async fn measure(
     let result = append(table, check_duplicate).commit(catalog).await;
     if let Err(error) = &result {
         println!(
-            "glue drill {label}: commit error {error:?}; source {:?}",
+            "s3tables drill {label}: commit error {error:?}; source {:?}",
             std::error::Error::source(error)
         );
     }
+    let message = result
+        .as_ref()
+        .err()
+        .map(|error| error.message().to_string());
     let outcome = result.map(|_| ()).map_err(|error| error.kind());
     let log = endpoint.log();
     if endpoint
@@ -684,218 +762,13 @@ async fn measure(
     }
     let measured = Measured {
         outcome,
+        message,
         marked_snapshots: marked_snapshot_ids.len(),
         marked_snapshot_ids,
         sent_snapshot_ids,
         rows: live_rows(&reloaded).await,
         log,
     };
-    println!("glue drill {label}: {measured:#?}");
+    println!("s3tables drill {label}: {measured:#?}");
     measured
-}
-
-#[tokio::test]
-async fn glue_lost_reply_is_not_resent_and_reconciles_as_landed() {
-    let measured = drill(&[CommitScript::ApplyThenReset], true).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::AppliedThenReset
-    )]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_lost_unapplied_commit_is_unknown_and_keeps_the_pre_state() {
-    let measured = drill(&[CommitScript::DropThenReset], true).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::DroppedThenReset
-    )]);
-    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
-    assert_eq!(measured.marked_snapshots, 0);
-    assert_eq!(measured.rows, 0);
-}
-
-#[tokio::test]
-async fn glue_landed_commit_answered_conflict_lands_once() {
-    let measured = drill(&[CommitScript::ApplyThenConflict], false).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::AppliedThenConflict
-    )]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_reads_keep_their_sdk_retry() {
-    let endpoint = FakeGlue::start(Connections::KeepAlive).await;
-    let catalog = glue_catalog(&endpoint.url).await;
-    let table = seeded_table(&catalog).await;
-    endpoint.reset_next_reads(1);
-    let reloaded = catalog
-        .load_table(table.identifier())
-        .await
-        .expect("a reset read is retried by the SDK");
-    assert_eq!(reloaded.metadata_location(), table.metadata_location());
-    let reads: Vec<Answer> = endpoint
-        .log()
-        .iter()
-        .filter(|logged| logged.operation == "GetTable")
-        .map(|logged| logged.answer)
-        .collect();
-    assert_eq!(reads, vec![Answer::Reset, Answer::Answered]);
-}
-
-#[tokio::test]
-async fn glue_lost_reply_on_a_closed_connection_reconciles_as_landed() {
-    let measured = drill(&[CommitScript::ApplyThenClose], true).await;
-    let &[Some(sent)] = measured.sent_snapshot_ids.as_slice() else {
-        panic!("one commit request naming one snapshot");
-    };
-    assert_eq!(measured.marked_snapshot_ids, vec![sent]);
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::AppliedThenClosed
-    )]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_unapplied_commit_on_a_closed_connection_is_unknown_and_keeps_the_pre_state() {
-    let measured = drill(&[CommitScript::DropThenClose], true).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::DroppedThenClosed
-    )]);
-    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
-    assert_eq!(measured.marked_snapshots, 0);
-    assert_eq!(measured.rows, 0);
-}
-
-#[tokio::test]
-async fn glue_refused_commit_connection_is_never_sent_and_not_reconciled() {
-    let measured = drill_refused_commit_connection().await;
-    assert!(measured.commits().is_empty());
-    assert_eq!(measured.reads(), 2);
-    assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
-    assert_eq!(measured.marked_snapshots, 0);
-    assert_eq!(measured.rows, 0);
-}
-
-#[tokio::test]
-async fn glue_server_error_with_an_unmodeled_code_after_the_commit_reconciles_as_landed() {
-    let measured = drill(
-        &[CommitScript::ApplyThenError(500, "InternalFailure")],
-        true,
-    )
-    .await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::AppliedThenError(500)
-    )]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_server_error_with_an_unmodeled_code_before_the_commit_is_unknown_and_keeps_the_pre_state()
- {
-    let measured = drill(&[CommitScript::DropThenError(500, "InternalFailure")], true).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::DroppedThenError(500)
-    )]);
-    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
-    assert_eq!(measured.marked_snapshots, 0);
-    assert_eq!(measured.rows, 0);
-}
-
-#[tokio::test]
-async fn glue_modeled_server_error_after_the_commit_reconciles_as_landed() {
-    let measured = drill(
-        &[CommitScript::ApplyThenError(
-            500,
-            "InternalServiceException",
-        )],
-        true,
-    )
-    .await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::AppliedThenError(500)
-    )]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_unparsable_reply_after_the_commit_reconciles_as_landed() {
-    let measured = drill(&[CommitScript::ApplyThenGarbage], true).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::AppliedThenGarbage
-    )]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_unparsable_reply_before_the_commit_is_unknown_and_keeps_the_pre_state() {
-    let measured = drill(&[CommitScript::DropThenGarbage], true).await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::DroppedThenGarbage
-    )]);
-    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
-    assert_eq!(measured.marked_snapshots, 0);
-    assert_eq!(measured.rows, 0);
-}
-
-#[tokio::test]
-async fn glue_client_error_with_an_unmodeled_code_is_definitive_and_not_reconciled() {
-    let measured = drill(
-        &[CommitScript::DropThenError(400, "ValidationException")],
-        true,
-    )
-    .await;
-    assert_eq!(measured.commits(), vec![(
-        Some("1"),
-        Answer::DroppedThenError(400)
-    )]);
-    assert_eq!(measured.reads(), 2);
-    assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
-    assert_eq!(measured.marked_snapshots, 0);
-    assert_eq!(measured.rows, 0);
-}
-
-#[tokio::test]
-async fn glue_an_earlier_attempt_that_lands_late_is_found_before_the_rebase() {
-    let measured = drill(
-        &[
-            CommitScript::DeferThenConflict,
-            CommitScript::LandDeferredThenConflict,
-        ],
-        false,
-    )
-    .await;
-    assert_eq!(measured.commits(), vec![
-        (Some("1"), Answer::DeferredThenConflict),
-        (Some("1"), Answer::LandedDeferredThenConflict),
-    ]);
-    let &[Some(first), Some(second)] = measured.sent_snapshot_ids.as_slice() else {
-        panic!("two commit requests, each naming one snapshot");
-    };
-    assert_ne!(first, second);
-    assert_eq!(measured.marked_snapshot_ids, vec![first]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
 }

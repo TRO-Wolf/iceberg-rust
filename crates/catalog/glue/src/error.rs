@@ -116,6 +116,10 @@ mod tests {
                 "response-error",
                 TestSdkError::response_error(boxed("unparsable response"), response(200)),
             ),
+            (
+                "service-error-2xx",
+                TestSdkError::service_error((), response(200)),
+            ),
         ];
         for (label, sdk_error) in ambiguous {
             assert!(
