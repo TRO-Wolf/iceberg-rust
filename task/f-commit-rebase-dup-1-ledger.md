@@ -291,6 +291,9 @@ and `…::test_refused_connection_classifies_never_sent_and_reset_stays_maybe_se
 ## Residue (not changed here)
 
 - The unknown-outcome reconciliation still searches only the latest attempt's snapshot ids.
+- 2026-10-16, owner ruling 127 (commit `9a9f91baf920`): answered. The unknown-outcome read-back now
+  searches `sent_ids`, every snapshot id this transaction has sent. Pin:
+  `*_a_late_landing_attempt_is_found_by_the_unknown_outcome_read_back`.
 - A commit found by the guard fires no `CreateSnapshotEvent`, as the reconciliation path.
 - Glue `CreateTable` and the S3 Tables create path's own `UpdateTableMetadataLocation` keep
   the SDK retry. A re-sent create fails as a plain error after it landed. No rows are involved.
@@ -494,3 +497,138 @@ iceberg` resolved to the fork path): `cargo test --no-fail-fast -p repark-iceber
 was restored, and its tree is clean. On `1d3a17da` the fork also ran `cargo test -p
 iceberg-catalog-s3tables --lib` (exit 0, 62 passed) and `cargo clippy -p iceberg-catalog-s3tables
 --all-targets --all-features -- -D warnings` (exit 0).
+
+## Owner ruling 127, 2026-10-16
+
+The ruling, verbatim:
+
+```
+Q127 → (a). One Opus xhigh round on the same session, pins red on d36896aa
+first, then the scoped re-verifier. Three precisions:
+
+F2. A throttle reply (Glue code ThrottlingException on a 400, S3 Tables
+    TooManyRequestsException 429) is a fourth disposition: refused before
+    processing. The transport resends the SAME request — same metadata
+    location, same version token or id, same snapshot ids — on the SDK
+    schedule it replaces: three attempts, full-jitter exponential backoff
+    from one second. Not a retryable error into the transaction loop:
+    that path re-bases, re-writes metadata.json and reloads from the
+    catalog that is throttling us. Exhausted → terminal, as base, and the
+    message says nothing was applied. Drill cell on both catalogs:
+    throttle, throttle, success → one commit, rows once, three sends.
+
+F1. On BOTH catalogs. The SDK turns a 2xx with an unreadable body into a
+    service error that still carries the 200. A service error whose raw
+    status is 2xx classifies may-have-been-sent → CommitStateUnknown →
+    read-back → landed. New drill cell on both catalogs: well-formed 200,
+    JSON content type, body that is not JSON. The existing glue unit pin
+    at 200 tests a shape the SDK does not produce here; add the service
+    error shape beside it.
+
+F3. The unknown-outcome read-back searches every id this transaction has
+    sent, not the latest attempt's.
+
+F4. The test moves so the doc comment re-attaches to its item.
+
+Ledger: the outcome table gains the two rows (throttle; 2xx unreadable)
+with the measured SdkError shape, before and after.
+
+Re-verifier: scoped to F1–F4 plus the classifier mutants. PASS → the fork
+push and rev bump come to me as a question. Not green → park; no second
+round without Fable's look.
+```
+
+Commits: `66e85940` (the pins, red on `d36896aa`), `9a9f91baf920` (the fix), `64a37273` (F4).
+
+### Red first, on `d36896aa`
+
+| Pin (per catalog unless named) | Red on `d36896aa` |
+|---|---|
+| `*_throttled_commit_is_resent_unchanged_and_lands_once` | `left: [(Some("1"), DroppedThenError(400))]`, `right:` three sends (S3 Tables: `v1`, 429) |
+| `*_throttled_on_every_send_fails_terminally_after_three_sends` | `left: [(Some("1"), DroppedThenError(400))]`, `right:` three sends (S3 Tables: `v1`, 429) |
+| `*_a_late_landing_attempt_is_found_by_the_unknown_outcome_read_back` | `left: Err(CommitStateUnknown), right: Ok(())` |
+| `s3tables_unreadable_success_reply_after_the_commit_reconciles_as_landed` | `left: 2, right: 3` (reads: no read-back; the outcome was `Err(Unexpected)`) |
+| `s3tables_unreadable_success_reply_before_the_commit_is_unknown_and_keeps_the_pre_state` | `left: 2, right: 3` (the outcome was `Err(Unexpected)`) |
+| Glue unit `test_post_send_ambiguous_sdk_failures_classify_maybe_sent` (new case `service-error-2xx`) | `service-error-2xx: a post-send failure must classify as MaybeSent (unknown outcome)` |
+| S3 Tables unit `test_commit_send_disposition_split` (new 200 assertion) | `assertion failed: matches!(classify_commit_send_disposition(&TestSdkError::service_error((), response(200))), CommitSendDisposition::MaybeSent)` |
+| `glue_unreadable_success_reply_after_the_commit_is_success_without_a_read_back` | green: Ok, one snapshot, 3 rows, 2 reads. The Glue SDK reads an empty `UpdateTable` output and reports success, so no `SdkError` forms. |
+
+Measured with an uncommitted probe on `d36896aa`: on Glue, the same unreadable 200 **without
+applying** also returns Ok, with no read-back and nothing on the table. A 200 is the service's
+success; the classifier never sees an error. This is the hand-back's question Q1.
+
+### The change (commit `9a9f91baf920`)
+
+- **F2, refused before processing.** Each live commit transport (Glue
+  `src/commit_transport.rs` `LiveGlueCommitTransport::send_update_table`, S3 Tables
+  `LiveS3TablesCommitTransport::send_update_metadata_location`) sends through `send_once`. It
+  builds the request from the same call every time, so the metadata location, the version id or
+  token, and the snapshot ids are the same. `refused_before_processing` matches a 4xx
+  `ServiceError` with Glue code `ThrottlingException` or S3 Tables `TooManyRequestsException`
+  only. On that reply the transport sleeps `throttle_backoff(sends, jitter_fraction())`, a
+  uniform draw below 1 s after the first send and below 2 s after the second, on the client's
+  own `sleep_impl`. Then it sends again, up to `THROTTLE_ATTEMPTS = 3` sends. The SDK retry stays
+  off. After the third throttle, `RefusedBeforeProcessing` maps to a terminal `Unexpected`
+  ("… throttled the update on each of 3 sends, and nothing was applied"), as on base. Nothing
+  goes back to the transaction loop, so nothing re-bases, rewrites `metadata.json` or reloads.
+- **F1.** Both classifiers: a `ServiceError` whose raw status is 2xx is MaybeSent, as a 5xx is.
+  `map_*_commit_sdk_error` gives `CommitStateUnknown`.
+- **F3.** `Transaction::reconcile_unknown_commit_outcome` searches `sent_ids`. The field doc of
+  `latest_attempt_snapshot_ids`, which described it as the reconciliation evidence, is deleted.
+  `mod.rs` loses those 8 lines, and its file-size ceiling drops to 1928.
+- **F4 (commit `64a37273`).** The three tests between the "Risk (… the over-broadening
+  direction)" doc comment and `test_never_sent_and_service_response_do_not_classify_maybe_sent`
+  move below that test. The comment keeps its text and its lines.
+
+### The outcome table, two new rows
+
+| Outcome | `SdkError` shape (measured) | `d36896aa` | `9a9f91baf920` | Pins |
+|---|---|---|---|---|
+| Throttle | Glue: `ServiceError(Unhandled { code: Some("ThrottlingException") })`, status 400. S3 Tables: `ServiceError(TooManyRequestsException)`, status 429 | ResponseReceived → `Unexpected` after one send; not reconciled, not resent (base `076d5f98`: the SDK resent and committed) | **Refused before processing**: the transport resends the same request, three sends, full-jitter backoff from 1 s. Landed → Ok, rows once. Exhausted → terminal `Unexpected`, "nothing was applied", no read-back | drill `*_throttled_commit_is_resent_unchanged_and_lands_once`, `*_throttled_on_every_send_fails_terminally_after_three_sends`; unit `test_throttled_commit_schedule_is_three_sends_with_full_jitter_from_one_second`, `test_only_a_throttle_reply_is_refused_before_processing`, `test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied` |
+| 2xx reply with an unreadable body | S3 Tables: `ServiceError(Unhandled { source: DeserializeError { kind: UnexpectedToken('n', …) }, code: None })`, status 200. Glue: no `SdkError`; the SDK reports success | S3 Tables: ResponseReceived → `Unexpected`; not reconciled. Glue: Ok | S3 Tables: **MaybeSent → `CommitStateUnknown`; reconciled** (landed → Ok; absent → `CommitStateUnknown`). Glue: Ok, unchanged (no error forms) | drill `s3tables_unreadable_success_reply_after_the_commit_reconciles_as_landed`, `s3tables_unreadable_success_reply_before_the_commit_is_unknown_and_keeps_the_pre_state`, `glue_unreadable_success_reply_after_the_commit_is_success_without_a_read_back`; unit Glue `test_post_send_ambiguous_sdk_failures_classify_maybe_sent` (`service-error-2xx`), S3 Tables `test_commit_send_disposition_split` |
+
+In the ruling-115 table above, the reconciliation note names `latest_attempt_snapshot_ids`.
+Since `9a9f91baf920` the read-back searches `sent_ids` (F3). The clerk's card copy carries the
+updated note.
+
+### Mutants (each applied, run, restored; the tree was clean after each)
+
+| Mutant | Killed by |
+|---|---|
+| Throttle as a retryable conflict into the transaction loop (Glue, S3 Tables) | `*_throttled_commit_is_resent_unchanged_and_lands_once`, `*_throttled_on_every_send_fails_terminally_after_three_sends`, `test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied` |
+| The resend rebuilds the request with a new metadata location (Glue, S3 Tables) | `*_throttled_commit_is_resent_unchanged_and_lands_once`, `*_throttled_on_every_send_fails_terminally_after_three_sends` |
+| Four sends (Glue, S3 Tables) | `test_throttled_commit_schedule_…`, `*_throttled_on_every_send_fails_terminally_after_three_sends` |
+| Two sends (Glue, S3 Tables) | `test_throttled_commit_schedule_…`, both throttle drills |
+| A 2xx `ServiceError` back to ResponseReceived, Glue | `test_post_send_ambiguous_sdk_failures_classify_maybe_sent` |
+| The same, S3 Tables | `test_commit_send_disposition_split`, both `s3tables_unreadable_success_reply_*` drills |
+| The read-back on `latest_attempt_snapshot_ids` | `glue_` / `s3tables_a_late_landing_attempt_is_found_by_the_unknown_outcome_read_back` |
+| Verifier M1 (5xx → ResponseReceived), Glue / S3 Tables | the 5xx classifier unit pins and both unmodeled-5xx drills |
+| Verifier M2 (`other(None)` → NeverSent), Glue / S3 Tables | the closed-and-unclassified unit pins and both unparsable-reply drills |
+| Verifier M7 (refused connect → MaybeSent), Glue / S3 Tables | the refused-connection unit pins and `*_refused_commit_connection_is_never_sent_and_not_reconciled` |
+| Verifier M8 (4xx → MaybeSent), Glue / S3 Tables | the never-sent / response-received unit pins, `*_client_error_with_an_unmodeled_code_is_definitive_and_not_reconciled`, both late-landing drills |
+
+19 mutants, 19 killed.
+
+### Gates (fork, on `64a37273`)
+
+| Command | Exit |
+|---|---|
+| `cargo test --no-fail-fast -p iceberg -p iceberg-catalog-glue -p iceberg-catalog-s3tables` | 101: 5160 passed, 14 failed (the Docker-only `tests/glue_catalog_test.rs`), 21 ignored. Every test green on `d36896aa` is green here (the drill cells moved from `tests/commit_lost_reply_drill.rs` to `tests/commit_lost_reply_drill/main.rs`; same target, same names). |
+| `cargo fmt --all -- --check` | 0 |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
+| `make check-rust-file-size check-comment-blocks check-agent-artifacts check-matrix-anchors` | 0 |
+| comment gate, base `076d5f98` | 0 |
+
+RePark never worse, on `64a37273`. The earlier rounds' RePark clone was gone, so this ran in a
+fresh clone of RePark main `ae880bf6`, which pins the fork at `076d5f98`, with the same
+command-line override as before. `cargo tree -i iceberg` resolved to the fork path. `cargo test
+--no-fail-fast -p repark-iceberg -p repark-core -p repark-spark -p repark-sql`:
+
+- without the override: exit 101, 5913 passed, 1 failed, 11 ignored. The failure is
+  `repark-core` `microbatch::lifecycle_tests::two_sessions_on_one_sink_wait_for_the_scope`, the
+  known load-sensitive timing flake.
+- with it: exit 0, 5914 passed, 0 failed, 11 ignored.
+
+No test is green without the override and red with it. P17
+`append_midflight_commit_conflict_retries_and_both_appends_land` exit 0. RePark's `Cargo.lock`
+was restored, and the clone is clean.
