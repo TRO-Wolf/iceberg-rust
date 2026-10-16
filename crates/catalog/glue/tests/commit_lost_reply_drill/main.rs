@@ -315,3 +315,31 @@ async fn glue_unreadable_success_reply_after_the_commit_is_success_without_a_rea
     assert_eq!(measured.marked_snapshots, 1);
     assert_eq!(measured.rows, ROWS_PER_APPEND);
 }
+
+#[tokio::test]
+async fn glue_slow_down_on_a_503_is_resent_unchanged_and_lands_once() {
+    let measured = drill(
+        &[
+            CommitScript::DropThenError(503, "SlowDown"),
+            CommitScript::DropThenError(503, "SlowDown"),
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(measured.commits(), vec![
+        (Some("1"), Answer::DroppedThenError(503)),
+        (Some("1"), Answer::DroppedThenError(503)),
+        (Some("1"), Answer::Answered),
+    ]);
+    let sent = measured.metadata_sent();
+    assert!(sent.iter().all(|location| *location == sent[0]));
+    let &[Some(first), Some(second), Some(third)] = measured.sent_snapshot_ids.as_slice() else {
+        panic!("three commit requests, each naming one snapshot");
+    };
+    assert_eq!((first, second), (third, third));
+    assert_eq!(measured.reads_between_commits(), 0);
+    assert_eq!(measured.reads(), 2);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshot_ids, vec![first]);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}

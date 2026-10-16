@@ -525,23 +525,24 @@ mod tests {
         }
     }
 
+    fn reply(status: u16, code: &str) -> aws_sdk_glue::error::SdkError<UpdateTableError> {
+        aws_sdk_glue::error::SdkError::service_error(
+            UpdateTableError::generic(
+                aws_sdk_glue::error::ErrorMetadata::builder()
+                    .code(code)
+                    .build(),
+            ),
+            HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into()),
+        )
+    }
+
     #[test]
     fn test_only_a_throttle_reply_is_refused_before_processing() {
-        let reply = |status: u16, code: &str| {
-            aws_sdk_glue::error::SdkError::service_error(
-                UpdateTableError::generic(
-                    aws_sdk_glue::error::ErrorMetadata::builder()
-                        .code(code)
-                        .build(),
-                ),
-                HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into()),
-            )
-        };
         assert!(refused_before_processing(&reply(
             400,
             "ThrottlingException"
         )));
-        assert!(!refused_before_processing(&reply(
+        assert!(refused_before_processing(&reply(
             500,
             "ThrottlingException"
         )));
@@ -553,6 +554,45 @@ mod tests {
             400,
             "ConcurrentModificationException"
         )));
+    }
+
+    #[test]
+    fn test_every_sdk_throttling_code_is_refused_before_processing_on_a_4xx_and_a_5xx() {
+        for code in aws_runtime::retries::classifiers::THROTTLING_ERRORS {
+            for status in [400, 503] {
+                assert!(
+                    refused_before_processing(&reply(status, code)),
+                    "{code} on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_sdk_transient_codes_are_not_refused_before_processing() {
+        for code in ["RequestTimeout", "RequestTimeoutException"] {
+            for status in [400, 503] {
+                assert!(
+                    !refused_before_processing(&reply(status, code)),
+                    "{code} on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_503_slow_down_is_resent_and_a_503_internal_failure_is_maybe_sent() {
+        assert!(refused_before_processing(&reply(503, "SlowDown")));
+        let internal_failure = reply(503, "InternalFailure");
+        assert!(!refused_before_processing(&internal_failure));
+        assert!(matches!(
+            classify_commit_send_disposition(&internal_failure),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert_eq!(
+            map_glue_commit_sdk_error(internal_failure, &test_table_ident()).kind(),
+            ErrorKind::CommitStateUnknown
+        );
     }
 
     #[test]
