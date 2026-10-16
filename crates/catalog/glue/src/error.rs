@@ -58,28 +58,37 @@ pub(crate) enum CommitSendDisposition {
 /// `CommitStateUnknownException(persistFailure)` when the outcome cannot be confirmed. This
 /// offline slice ports the CLASSIFICATION (which failures are ambiguous); the
 /// reconciliation-by-refresh step needs a live catalog and stays with the credentialed slice.
-///
-/// The `ConnectorError` split: an `is_user()` / `is_other()` dispatch failure is a client-side
-/// setup problem (the request was never written); an `is_io()` / `is_timeout()` dispatch
-/// failure can occur mid-exchange, after the request bytes reached the service — the AWS SDK
-/// does not distinguish connect-refused from reset-after-send, so the ambiguous side is chosen
-/// (needless reconciliation is safe; a duplicate commit is not). Unknown future variants of the
-/// `#[non_exhaustive]` `SdkError` also classify ambiguous for the same reason.
 pub(crate) fn classify_commit_send_disposition<E, R>(
     error: &aws_sdk_glue::error::SdkError<E, R>,
 ) -> CommitSendDisposition {
     use aws_sdk_glue::error::SdkError;
     match error {
         SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
-        SdkError::DispatchFailure(dispatch) if dispatch.is_user() || dispatch.is_other() => {
+        SdkError::DispatchFailure(dispatch)
+            if dispatch.as_other() == Some(aws_config::retry::ErrorKind::TransientError) =>
+        {
+            CommitSendDisposition::MaybeSent
+        }
+        SdkError::DispatchFailure(dispatch)
+            if dispatch.is_user()
+                || dispatch.is_other()
+                || connection_refused(dispatch.as_connector_error()) =>
+        {
             CommitSendDisposition::NeverSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
-        // TimeoutError (the operation timed out awaiting completion), io/timeout dispatch
-        // failures, ResponseError (a response arrived but could not be understood), and any
-        // future variant: the request may have reached the service.
         _ => CommitSendDisposition::MaybeSent,
     }
+}
+
+const MAX_SOURCE_DEPTH: usize = 16;
+
+fn connection_refused(error: Option<&aws_sdk_glue::error::ConnectorError>) -> bool {
+    let first = error.and_then(std::error::Error::source);
+    std::iter::successors(first, |error| error.source())
+        .take(MAX_SOURCE_DEPTH)
+        .filter_map(|error| error.downcast_ref::<std::io::Error>())
+        .any(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 #[cfg(test)]
@@ -130,6 +139,42 @@ mod tests {
     /// sent the request (request construction, client-side dispatch setup) — or a definitive
     /// service response — is classified ambiguous, sending callers into needless commit
     /// reconciliation. Pins the never-sent and response-received sides of the split.
+    #[test]
+    fn test_incomplete_message_classifies_maybe_sent_and_unclassified_other_stays_never_sent() {
+        let closed = TestSdkError::dispatch_failure(ConnectorError::other(
+            boxed("connection closed before message completed"),
+            Some(aws_config::retry::ErrorKind::TransientError),
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&closed),
+            CommitSendDisposition::MaybeSent
+        ));
+        let unclassified =
+            TestSdkError::dispatch_failure(ConnectorError::other(boxed("unrecognized"), None));
+        assert!(matches!(
+            classify_commit_send_disposition(&unclassified),
+            CommitSendDisposition::NeverSent
+        ));
+    }
+
+    #[test]
+    fn test_refused_connection_classifies_never_sent_and_reset_stays_maybe_sent() {
+        let refused = TestSdkError::dispatch_failure(ConnectorError::io(Box::new(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        )));
+        assert!(matches!(
+            classify_commit_send_disposition(&refused),
+            CommitSendDisposition::NeverSent
+        ));
+        let reset = TestSdkError::dispatch_failure(ConnectorError::io(Box::new(
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )));
+        assert!(matches!(
+            classify_commit_send_disposition(&reset),
+            CommitSendDisposition::MaybeSent
+        ));
+    }
+
     #[test]
     fn test_never_sent_and_service_response_do_not_classify_maybe_sent() {
         assert!(matches!(

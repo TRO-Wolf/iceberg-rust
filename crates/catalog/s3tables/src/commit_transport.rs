@@ -67,12 +67,31 @@ pub(crate) fn classify_commit_send_disposition<E, R>(
     use aws_sdk_s3tables::error::SdkError;
     match error {
         SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
-        SdkError::DispatchFailure(dispatch) if dispatch.is_user() || dispatch.is_other() => {
+        SdkError::DispatchFailure(dispatch)
+            if dispatch.as_other() == Some(aws_config::retry::ErrorKind::TransientError) =>
+        {
+            CommitSendDisposition::MaybeSent
+        }
+        SdkError::DispatchFailure(dispatch)
+            if dispatch.is_user()
+                || dispatch.is_other()
+                || connection_refused(dispatch.as_connector_error()) =>
+        {
             CommitSendDisposition::NeverSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
         _ => CommitSendDisposition::MaybeSent,
     }
+}
+
+const MAX_SOURCE_DEPTH: usize = 16;
+
+fn connection_refused(error: Option<&aws_sdk_s3tables::error::ConnectorError>) -> bool {
+    let first = error.and_then(std::error::Error::source);
+    std::iter::successors(first, |error| error.source())
+        .take(MAX_SOURCE_DEPTH)
+        .filter_map(|error| error.downcast_ref::<std::io::Error>())
+        .any(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 pub(crate) struct LiveS3TablesCommitTransport {
@@ -522,6 +541,33 @@ mod tests {
         assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::service_error((), ())),
             CommitSendDisposition::ResponseReceived
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::other(
+                    boxed("connection closed before message completed"),
+                    Some(aws_config::retry::ErrorKind::TransientError),
+                )
+            )),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::other(boxed("unrecognized"), None)
+            )),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(
+                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            ))),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(
+                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            ))),
+            CommitSendDisposition::MaybeSent
         ));
     }
 

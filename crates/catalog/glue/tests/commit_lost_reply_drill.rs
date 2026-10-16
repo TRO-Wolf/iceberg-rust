@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iceberg::io::MemoryStorageFactory;
 use iceberg::spec::{
@@ -33,18 +34,23 @@ use iceberg_catalog_glue::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 
 const NAMESPACE: &str = "drill";
 const TABLE: &str = "t";
 const LOCATION: &str = "memory://warehouse/drill.db/t";
 const MARKER: &str = "drill.append";
 const ROWS_PER_APPEND: u64 = 3;
+const REFUSAL_WINDOW: Duration = Duration::from_secs(1);
+const LISTENER_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum CommitScript {
     ApplyThenReset,
     ApplyThenConflict,
     DropThenReset,
+    ApplyThenClose,
+    DropThenClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,6 +59,8 @@ enum Answer {
     AppliedThenReset,
     AppliedThenConflict,
     DroppedThenReset,
+    AppliedThenClosed,
+    DroppedThenClosed,
     RejectedStale,
     Reset,
 }
@@ -71,6 +79,20 @@ enum Reply {
         body: String,
     },
     Reset,
+    Close,
+}
+
+#[derive(Clone, Copy)]
+enum Connections {
+    KeepAlive,
+    OnePerRequest,
+}
+
+#[derive(Default)]
+struct Refusal {
+    close_listener: Notify,
+    listener_closed: Notify,
+    listening_again: Notify,
 }
 
 #[derive(Default)]
@@ -79,10 +101,24 @@ struct GlueState {
     version: u64,
     commit_scripts: VecDeque<CommitScript>,
     read_resets: usize,
+    close_connections: bool,
+    refuse_after_reads: Option<usize>,
+    refusing: bool,
     log: Vec<Logged>,
 }
 
 impl GlueState {
+    fn count_down_refusal(&mut self) {
+        match self.refuse_after_reads {
+            Some(remaining) if remaining <= 1 => {
+                self.refuse_after_reads = None;
+                self.refusing = true;
+            }
+            Some(remaining) => self.refuse_after_reads = Some(remaining - 1),
+            None => {}
+        }
+    }
+
     fn handle(&mut self, operation: &str, body: &Value) -> Reply {
         let (answer, version_sent, reply) = match operation {
             "CreateTable" => {
@@ -94,7 +130,10 @@ impl GlueState {
                 self.read_resets -= 1;
                 (Answer::Reset, None, Reply::Reset)
             }
-            "GetTable" => (Answer::Answered, None, self.get_table()),
+            "GetTable" => {
+                self.count_down_refusal();
+                (Answer::Answered, None, self.get_table())
+            }
             "UpdateTable" => self.update_table(body),
             _ => (
                 Answer::Answered,
@@ -134,14 +173,23 @@ impl GlueState {
             );
         }
         let script = self.commit_scripts.pop_front();
-        if script == Some(CommitScript::DropThenReset) {
-            return (Answer::DroppedThenReset, version_sent, Reply::Reset);
+        match script {
+            Some(CommitScript::DropThenReset) => {
+                return (Answer::DroppedThenReset, version_sent, Reply::Reset);
+            }
+            Some(CommitScript::DropThenClose) => {
+                return (Answer::DroppedThenClosed, version_sent, Reply::Close);
+            }
+            _ => {}
         }
         self.metadata_location = new_metadata_location(body);
         self.version += 1;
         match script {
             Some(CommitScript::ApplyThenReset) => {
                 (Answer::AppliedThenReset, version_sent, Reply::Reset)
+            }
+            Some(CommitScript::ApplyThenClose) => {
+                (Answer::AppliedThenClosed, version_sent, Reply::Close)
             }
             Some(CommitScript::ApplyThenConflict) => (
                 Answer::AppliedThenConflict,
@@ -225,15 +273,18 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     Some(request)
 }
 
-async fn write_reply(stream: &mut TcpStream, reply: Reply) -> bool {
-    let Reply::Json {
-        status,
-        error_type,
-        body,
-    } = reply
-    else {
-        let _ = stream.set_zero_linger();
-        return false;
+async fn write_reply(stream: &mut TcpStream, reply: Reply, close_after: bool) -> bool {
+    let (status, error_type, body) = match reply {
+        Reply::Json {
+            status,
+            error_type,
+            body,
+        } => (status, error_type, body),
+        Reply::Reset => {
+            let _ = stream.set_zero_linger();
+            return false;
+        }
+        Reply::Close => return false,
     };
     let mut head = format!(
         "HTTP/1.1 {status} {}\r\ncontent-type: application/x-amz-json-1.1\r\ncontent-length: {}\r\n",
@@ -243,12 +294,20 @@ async fn write_reply(stream: &mut TcpStream, reply: Reply) -> bool {
     if let Some(error_type) = error_type {
         head.push_str(&format!("x-amzn-errortype: {error_type}\r\n"));
     }
+    if close_after {
+        head.push_str("connection: close\r\n");
+    }
     head.push_str("\r\n");
-    stream.write_all(head.as_bytes()).await.is_ok()
-        && stream.write_all(body.as_bytes()).await.is_ok()
+    let written = stream.write_all(head.as_bytes()).await.is_ok()
+        && stream.write_all(body.as_bytes()).await.is_ok();
+    written && !close_after
 }
 
-async fn serve_connection(mut stream: TcpStream, state: Arc<Mutex<GlueState>>) {
+async fn serve_connection(
+    mut stream: TcpStream,
+    state: Arc<Mutex<GlueState>>,
+    refusal: Arc<Refusal>,
+) {
     while let Some(request) = read_request(&mut stream).await {
         let operation = request
             .header("x-amz-target")
@@ -260,34 +319,82 @@ async fn serve_connection(mut stream: TcpStream, state: Arc<Mutex<GlueState>>) {
             .lock()
             .expect("drill endpoint state")
             .handle(&operation, &body);
-        if !write_reply(&mut stream, reply).await {
+        let (close_after, refuse) = {
+            let mut state = state.lock().expect("drill endpoint state");
+            (state.close_connections, std::mem::take(&mut state.refusing))
+        };
+        if refuse {
+            refusal.close_listener.notify_one();
+            refusal.listener_closed.notified().await;
+        }
+        if !write_reply(&mut stream, reply, close_after).await {
             return;
         }
     }
 }
 
-async fn accept_loop(listener: TcpListener, state: Arc<Mutex<GlueState>>) {
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(serve_connection(stream, Arc::clone(&state)));
+async fn accept_loop(
+    mut listener: TcpListener,
+    state: Arc<Mutex<GlueState>>,
+    refusal: Arc<Refusal>,
+) {
+    let Ok(address) = listener.local_addr() else {
+        return;
+    };
+    loop {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Some(accepted),
+            () = refusal.close_listener.notified() => None,
+        };
+        match accepted {
+            Some(Ok((stream, _))) => {
+                tokio::spawn(serve_connection(
+                    stream,
+                    Arc::clone(&state),
+                    Arc::clone(&refusal),
+                ));
+            }
+            Some(Err(_)) => return,
+            None => {
+                drop(listener);
+                refusal.listener_closed.notify_one();
+                tokio::time::sleep(REFUSAL_WINDOW).await;
+                let Ok(rebound) = TcpListener::bind(address).await else {
+                    return;
+                };
+                listener = rebound;
+                refusal.listening_again.notify_one();
+            }
+        }
     }
 }
 
 struct FakeGlue {
     url: String,
     state: Arc<Mutex<GlueState>>,
+    refusal: Arc<Refusal>,
 }
 
 impl FakeGlue {
-    async fn start() -> Self {
+    async fn start(connections: Connections) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the drill endpoint");
         let address = listener.local_addr().expect("drill endpoint address");
-        let state = Arc::new(Mutex::new(GlueState::default()));
-        tokio::spawn(accept_loop(listener, Arc::clone(&state)));
+        let state = Arc::new(Mutex::new(GlueState {
+            close_connections: matches!(connections, Connections::OnePerRequest),
+            ..GlueState::default()
+        }));
+        let refusal = Arc::new(Refusal::default());
+        tokio::spawn(accept_loop(
+            listener,
+            Arc::clone(&state),
+            Arc::clone(&refusal),
+        ));
         Self {
             url: format!("http://{address}"),
             state,
+            refusal,
         }
     }
 
@@ -301,6 +408,18 @@ impl FakeGlue {
         let mut state = self.state.lock().expect("drill endpoint state");
         state.read_resets = count;
         state.log.clear();
+    }
+
+    fn refuse_the_commit_connection(&self, reads_before_commit: usize) {
+        let mut state = self.state.lock().expect("drill endpoint state");
+        state.refuse_after_reads = Some(reads_before_commit);
+        state.log.clear();
+    }
+
+    async fn listening_again(&self) {
+        tokio::time::timeout(LISTENER_DEADLINE, self.refusal.listening_again.notified())
+            .await
+            .expect("the drill endpoint listens again after the refusal window");
     }
 
     fn log(&self) -> Vec<Logged> {
@@ -406,6 +525,13 @@ struct Measured {
 }
 
 impl Measured {
+    fn reads(&self) -> usize {
+        self.log
+            .iter()
+            .filter(|logged| logged.operation == "GetTable")
+            .count()
+    }
+
     fn commits(&self) -> Vec<(Option<&str>, Answer)> {
         self.log
             .iter()
@@ -416,16 +542,50 @@ impl Measured {
 }
 
 async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Measured {
-    let endpoint = FakeGlue::start().await;
+    let endpoint = FakeGlue::start(Connections::KeepAlive).await;
     let catalog = glue_catalog(&endpoint.url).await;
     let table = seeded_table(&catalog).await;
     endpoint.arm(scripts);
-    let outcome = append(&table, check_duplicate)
-        .commit(&catalog)
-        .await
-        .map(|_| ())
-        .map_err(|error| error.kind());
+    let label = format!("{scripts:?} check_duplicate={check_duplicate}");
+    measure(&endpoint, &catalog, &table, check_duplicate, &label).await
+}
+
+async fn drill_refused_commit_connection() -> Measured {
+    let endpoint = FakeGlue::start(Connections::OnePerRequest).await;
+    let catalog = glue_catalog(&endpoint.url).await;
+    let table = seeded_table(&catalog).await;
+    endpoint.refuse_the_commit_connection(2);
+    measure(
+        &endpoint,
+        &catalog,
+        &table,
+        true,
+        "refused commit connection",
+    )
+    .await
+}
+
+async fn measure(
+    endpoint: &FakeGlue,
+    catalog: &GlueCatalog,
+    table: &Table,
+    check_duplicate: bool,
+    label: &str,
+) -> Measured {
+    let result = append(table, check_duplicate).commit(catalog).await;
+    if let Err(error) = &result {
+        println!("glue drill {label}: commit error {error:?}");
+    }
+    let outcome = result.map(|_| ()).map_err(|error| error.kind());
     let log = endpoint.log();
+    if endpoint
+        .state
+        .lock()
+        .expect("drill endpoint state")
+        .close_connections
+    {
+        endpoint.listening_again().await;
+    }
     let reloaded = catalog
         .load_table(table.identifier())
         .await
@@ -445,7 +605,7 @@ async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Measured {
         rows: live_rows(&reloaded).await,
         log,
     };
-    println!("glue drill {scripts:?} check_duplicate={check_duplicate}: {measured:#?}");
+    println!("glue drill {label}: {measured:#?}");
     measured
 }
 
@@ -487,7 +647,7 @@ async fn glue_landed_commit_answered_conflict_lands_once() {
 
 #[tokio::test]
 async fn glue_reads_keep_their_sdk_retry() {
-    let endpoint = FakeGlue::start().await;
+    let endpoint = FakeGlue::start(Connections::KeepAlive).await;
     let catalog = glue_catalog(&endpoint.url).await;
     let table = seeded_table(&catalog).await;
     endpoint.reset_next_reads(1);
@@ -503,4 +663,38 @@ async fn glue_reads_keep_their_sdk_retry() {
         .map(|logged| logged.answer)
         .collect();
     assert_eq!(reads, vec![Answer::Reset, Answer::Answered]);
+}
+
+#[tokio::test]
+async fn glue_lost_reply_on_a_closed_connection_reconciles_as_landed() {
+    let measured = drill(&[CommitScript::ApplyThenClose], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("1"),
+        Answer::AppliedThenClosed
+    )]);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn glue_unapplied_commit_on_a_closed_connection_is_unknown_and_keeps_the_pre_state() {
+    let measured = drill(&[CommitScript::DropThenClose], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("1"),
+        Answer::DroppedThenClosed
+    )]);
+    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn glue_refused_commit_connection_is_never_sent_and_not_reconciled() {
+    let measured = drill_refused_commit_connection().await;
+    assert!(measured.commits().is_empty());
+    assert_eq!(measured.reads(), 2);
+    assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
 }
