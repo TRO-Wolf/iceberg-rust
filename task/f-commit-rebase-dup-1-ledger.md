@@ -632,3 +632,132 @@ command-line override as before. `cargo tree -i iceberg` resolved to the fork pa
 No test is green without the override and red with it. P17
 `append_midflight_commit_conflict_retries_and_both_appends_land` exit 0. RePark's `Cargo.lock`
 was restored, and the clone is clean.
+
+## Owner rulings 128, 129 and 130, 2026-10-16
+
+The rulings, verbatim:
+
+```
+Q128 → (a). Glue's SDK builds UpdateTable's output from the request-id
+header and never reads the body. A 200 is Glue's word that the commit
+applied, and a 200 sent without applying is a broken service that no
+client can detect: the valid "{}" version of the same fault is identical
+on the wire. No interceptor card.
+
+Records: the outcome table gets the row, marked as unobservable by any
+client. The Glue F1 drill cell asserts the true shape: applied, then a
+200 with a non-JSON body → success, rows once, no read-back. The S3
+Tables cell keeps may-have-landed → read-back, because that SDK parses
+the body. No pin on dropped-then-200: a pin there would assert a false
+success as the behaviour we want.
+
+Q129 → (b), by reference. The disposition "refused before processing"
+reads the SDK's own public constant
+aws_runtime::retries::classifiers::THROTTLING_ERRORS, the same fourteen
+codes the SDK resent on base. Not a hand copy: a copy drifts on the next
+SDK bump. Every code on that list is the service declining to process the
+request, so the resend is safe for all of them equally, and "wait until
+one is seen live" means the first commit that meets SlowDown fails where
+base committed.
+
+Pins: one classifier test that walks the constant and expects the
+disposition for each code; one drill cell with a code other than the
+primary one (SlowDown on Glue) showing the resend. The two transient
+codes (RequestTimeout, RequestTimeoutException) stay out of this round;
+the outcome table names them as not resent.
+```
+
+```
+Q130 → (a). aws-runtime = "1.9.1" in [workspace.dependencies] and in both
+catalog crates; the lock gains two edges and no version moves. That floor
+is what the lock already holds and what the round tests.
+Your provisional call stands: the error code decides, whatever the HTTP
+status, checked before the 5xx rule. S3's SlowDown arrives as a 503 and
+means not processed. A 5xx with no code, or a code not on the list, stays
+may-have-been-sent. Pin pair: 503 SlowDown → resend; 503 InternalFailure
+→ read-back.
+```
+
+Commits: `932ed2966b1f` (the pins and the dependency lines, red on `c1afd23c`), `7b0b0dd64634`
+(the fix).
+
+### Red first, on `c1afd23c`
+
+| Pin (per catalog unless named) | On `c1afd23c` |
+|---|---|
+| `test_only_a_throttle_reply_is_refused_before_processing` (now: the throttle code is refused on a 5xx too) | Glue red: `assertion failed: refused_before_processing(&reply(500, "ThrottlingException"))`. S3 Tables red: `assertion failed: refused_before_processing(&reply(503, throttle()))` |
+| `test_every_sdk_throttling_code_is_refused_before_processing_on_a_4xx_and_a_5xx` (walks `THROTTLING_ERRORS`, each code on a 400 and a 503) | red on both: `Throttling on 400`, the first code on the list |
+| `test_a_503_slow_down_is_resent_and_a_503_internal_failure_is_maybe_sent` (the Q130 pair: 503 `SlowDown` refused; 503 `InternalFailure` not refused, MaybeSent, mapped to `CommitStateUnknown`) | Glue red: `assertion failed: refused_before_processing(&reply(503, "SlowDown"))`. S3 Tables red: `assertion failed: refused_before_processing(&coded(503, "SlowDown"))` |
+| `glue_slow_down_on_a_503_is_resent_unchanged_and_lands_once` (SlowDown 503, SlowDown 503, then applied: Ok, one new snapshot, rows once, three byte-identical sends, nothing read between them) | red: `left: [(Some("1"), DroppedThenError(503))]`, `right:` the two 503 sends and the answered third |
+| `test_the_sdk_transient_codes_are_not_refused_before_processing` (`RequestTimeout`, `RequestTimeoutException` on a 400 and a 503) | green on both: a guard. The mutant that adds `RequestTimeout` turns it red |
+
+The S3 Tables pins build the modeled `TooManyRequestsException` and `ConflictException` with their
+error metadata code, as the SDK's deserializer does for a real reply. The `aws-runtime` lines are in
+this commit because the tests read the constant.
+
+### The change (commit `7b0b0dd64634`)
+
+- `refused_before_processing` in both commit transports (Glue and S3 Tables
+  `src/commit_transport.rs`) is now `SdkError::ServiceError(context) if
+  context.err().code().is_some_and(|code| THROTTLING_ERRORS.contains(&code))`, where
+  `THROTTLING_ERRORS` is `aws_runtime::retries::classifiers::THROTTLING_ERRORS`. The status check
+  is gone, so the code decides on any status. No code is copied by hand. S3 Tables also imports
+  `ProvideErrorMetadata` for `code()`.
+- The transport checks this before the classifier runs, so a throttle code on a 5xx is resent and
+  never reaches the 5xx rule. A 5xx with no code, or with a code not on the list, still goes to the
+  classifier: MaybeSent → `CommitStateUnknown` → read-back.
+- `Cargo.toml`: `aws-runtime = "1.9.1"` in `[workspace.dependencies]`, and `aws-runtime = {
+  workspace = true }` in `crates/catalog/glue` and `crates/catalog/s3tables`. `Cargo.lock` gains the
+  two `aws-runtime` edges and no version moves.
+
+### Q128, checked
+
+`glue_unreadable_success_reply_after_the_commit_is_success_without_a_read_back` already asserts the
+ruled shape: one commit request, applied, then a 200 with a non-JSON body. The outcome is `Ok`, with
+one new snapshot, 3 rows (rows once) and 2 reads (no read-back). It is unchanged. The S3 Tables
+cells keep may-have-landed → read-back. No dropped-then-200 pin was added.
+
+### The outcome table, rows for rulings 128 to 130
+
+| Outcome | `SdkError` shape (measured) | `c1afd23c` | `7b0b0dd64634` | Pins |
+|---|---|---|---|---|
+| Throttle, widened | `ServiceError` whose error code is on `aws_runtime::retries::classifiers::THROTTLING_ERRORS`, on any status. At `aws-runtime` 1.9.1 the 14 codes are `Throttling`, `ThrottlingException`, `ThrottledException`, `RequestThrottledException`, `TooManyRequestsException`, `ProvisionedThroughputExceededException`, `TransactionInProgressException`, `RequestLimitExceeded`, `BandwidthLimitExceeded`, `LimitExceededException`, `RequestThrottled`, `SlowDown`, `PriorRequestNotComplete`, `EC2ThrottledException`. Glue: `ServiceError(Unhandled { code: Some(…) })`. S3 Tables: the modeled `TooManyRequestsException` carries its code in its metadata; any other code arrives `Unhandled` | Refused only for Glue `ThrottlingException` on a 4xx and S3 Tables `TooManyRequestsException` on a 4xx. Any other code on the list on a 4xx: ResponseReceived → `Unexpected` after one send. On a 5xx: MaybeSent → `CommitStateUnknown` → read-back after one send | **Refused before processing** for every code on the list, on any status, checked before the 5xx rule: the same request is resent, up to three sends, full-jitter backoff from 1 s. Landed → Ok, rows once. Exhausted → terminal `Unexpected`, "nothing was applied", no read-back | unit `test_every_sdk_throttling_code_is_refused_before_processing_on_a_4xx_and_a_5xx`, `test_only_a_throttle_reply_is_refused_before_processing`, `test_a_503_slow_down_is_resent_and_a_503_internal_failure_is_maybe_sent` (both catalogs); drill `glue_slow_down_on_a_503_is_resent_unchanged_and_lands_once`, with the ruling-127 throttle drills |
+| 5xx, no code or a code not on the list | e.g. `ServiceError(Unhandled { code: Some("InternalFailure") })`, status 503 | MaybeSent → `CommitStateUnknown` → read-back | unchanged | unit `test_a_503_slow_down_is_resent_and_a_503_internal_failure_is_maybe_sent` (both catalogs); drill `server_error_with_an_unmodeled_code_*` |
+| `RequestTimeout`, `RequestTimeoutException` (the SDK's `TRANSIENT_ERRORS`) | `ServiceError(Unhandled { code: Some("RequestTimeout") })` / `Some("RequestTimeoutException")` | as after | **Not resent** (owner ruling 129). On a 4xx (400): ResponseReceived → `Unexpected` after one send, no read-back (2 reads). On a 5xx (503): MaybeSent → `CommitStateUnknown` → read-back (3 reads): applied → Ok, rows once; dropped → `CommitStateUnknown`, nothing on the table. Measured on both catalogs and both codes with an uncommitted drill probe on `7b0b0dd64634`. In the same probe, a 400 sent after applying gives `Unexpected` with the snapshot on the table: a 4xx is the service's word that nothing applied, as in the definitive 4xx rows | unit `test_the_sdk_transient_codes_are_not_refused_before_processing` (both catalogs) |
+| Glue: dropped, then a 200 (owner ruling 128) | none: the Glue SDK builds `UpdateTable`'s output from the request-id header and never reads the body | Ok, no read-back, nothing on the table (measured on `d36896aa` with an uncommitted probe; the Glue path has not changed since) | unchanged. **Unobservable by any client**: a valid `{}` 200 from the same fault is identical on the wire | none, by ruling: a pin would assert a false success as the wanted behaviour |
+
+### Mutants (each applied, run, restored; the tree was clean after each)
+
+Each ran `cargo test --no-fail-fast -p <catalog> --lib --test commit_lost_reply_drill`.
+
+| Mutant | Glue killed by | S3 Tables killed by |
+|---|---|---|
+| A hand copy of the list without `SlowDown` | `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…`, `glue_slow_down_on_a_503_…` | `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…` |
+| The client-error check restored | `test_only_a_throttle_reply_…`, `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…`, `glue_slow_down_on_a_503_…` | `test_only_a_throttle_reply_…`, `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…` |
+| `RequestTimeout` added to the disposition | `test_the_sdk_transient_codes_…` | `test_the_sdk_transient_codes_…` |
+| The primary code only (Glue `ThrottlingException`, S3 Tables `TooManyRequestsException`), any status | `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…`, `glue_slow_down_on_a_503_…` | `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…` |
+| The 5xx rule checked before the throttle code | `test_only_a_throttle_reply_…`, `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…`, `glue_slow_down_on_a_503_…` | `test_only_a_throttle_reply_…`, `test_every_sdk_throttling_code_…`, `test_a_503_slow_down_…` |
+
+10 mutants, 10 killed.
+
+### Gates (fork, on `7b0b0dd64634`)
+
+| Command | Exit |
+|---|---|
+| `cargo test --no-fail-fast -p iceberg -p iceberg-catalog-glue -p iceberg-catalog-s3tables` | 101: 5167 passed, 14 failed (the Docker-only `tests/glue_catalog_test.rs`, red on base too), 21 ignored. Every test green on `64a37273` is green here; the seven new tests are the pins above |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
+| `cargo fmt --all -- --check` | 0 |
+| `make check-toml cargo-machete check-rust-file-size check-comment-blocks check-agent-artifacts check-matrix-anchors` | 0 |
+| `cargo deny --frozen check --disable-fetch` (all of it, offline, on the cached advisory database) | 1: `advisories FAILED, bans ok, licenses ok, sources ok`. The four failures are `rustls` 0.23.45, `RUSTSEC-2026-0346` to `RUSTSEC-2026-0349`. The same command on an export of `c1afd23c` exits 1 with the same diagnostics, so this round adds none; `rustls` has not moved in the lock since `076d5f98` |
+| comment gate, base `076d5f98` | 0 |
+
+RePark never worse, on `7b0b0dd64634`, in a fresh clone of RePark main `0f074aff`, which pins the
+fork at `076d5f98`, with the same command-line override as before. `cargo tree -i iceberg` resolved
+to the pinned `076d5f98` without the override and to the fork's local path with it. `cargo test
+--no-fail-fast -p repark-iceberg -p repark-core -p repark-spark -p repark-sql`:
+
+- without the override: exit 0, 5916 passed, 0 failed, 11 ignored.
+- with it: exit 0, 5916 passed, 0 failed, 11 ignored.
+
+No test is green without the override and red with it. RePark's `Cargo.lock` was restored, and the
+clone is clean.
