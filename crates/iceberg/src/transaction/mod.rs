@@ -152,6 +152,7 @@ pub struct Transaction {
     /// can never leak a previous attempt's ids into reconciliation; empty means the attempt
     /// carried no snapshot evidence (metadata-only commit) and is not reconciled.
     latest_attempt_snapshot_ids: Vec<i64>,
+    sent_ids: Vec<i64>,
 }
 
 impl Transaction {
@@ -168,6 +169,7 @@ impl Transaction {
                 .collect(),
             actions: vec![],
             latest_attempt_snapshot_ids: vec![],
+            sent_ids: vec![],
         }
     }
     fn starting_snapshot_for(&self, branch: &str) -> Option<i64> {
@@ -499,11 +501,11 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        // Drop any previous attempt's reconciliation evidence FIRST: if this attempt fails
-        // before its own `update_table` call, stale ids from an attempt that provably did not
-        // land (e.g. a requirement conflict) must not feed reconciliation.
         self.latest_attempt_snapshot_ids.clear();
         let refreshed = catalog.load_table(self.table.identifier()).await?;
+        if commit_status::rejected_attempt_landed(&refreshed, &self.sent_ids) {
+            return Ok(refreshed);
+        }
 
         // Location first (cheap string compare), then deep TableMetadata PartialEq only when
         // the catalog pointer is unchanged. Metadata files are immutable at a given location,
@@ -556,13 +558,11 @@ impl Transaction {
             })
             .collect();
 
-        // Capture the reconciliation evidence BEFORE the request goes out: on an
-        // `ErrorKind::CommitStateUnknown` outcome these ids are what `commit` searches the
-        // reloaded metadata for (see `reconcile_unknown_commit_outcome`).
         self.latest_attempt_snapshot_ids = added_snapshots
             .iter()
             .map(|snapshot| snapshot.snapshot_id())
             .collect();
+        self.sent_ids.extend(&self.latest_attempt_snapshot_ids);
 
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())

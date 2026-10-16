@@ -430,38 +430,37 @@ async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Measured {
 }
 
 #[tokio::test]
-async fn glue_sdk_resend_rejected_stale_rebase_appends_twice_on_076d5f98() {
+async fn glue_sdk_resend_rejected_stale_lands_once_without_the_duplicate_check() {
     let measured = drill(&[CommitScript::ApplyThenReset], false).await;
     assert_eq!(measured.commits(), vec![
         (Some("1"), Answer::AppliedThenReset),
         (Some("1"), Answer::RejectedStale),
-        (Some("2"), Answer::Answered),
     ]);
     assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 2);
-    assert_eq!(measured.rows, 2 * ROWS_PER_APPEND);
-}
-
-#[tokio::test]
-async fn glue_sdk_resend_rejected_stale_rebase_refuses_the_landed_append_on_076d5f98() {
-    let measured = drill(&[CommitScript::ApplyThenReset], true).await;
-    assert_eq!(measured.commits(), vec![
-        (Some("1"), Answer::AppliedThenReset),
-        (Some("1"), Answer::RejectedStale),
-    ]);
-    assert_eq!(measured.outcome, Err(ErrorKind::DataInvalid));
     assert_eq!(measured.marked_snapshots, 1);
     assert_eq!(measured.rows, ROWS_PER_APPEND);
 }
 
 #[tokio::test]
-async fn glue_landed_commit_answered_conflict_rebase_appends_twice_on_076d5f98() {
-    let measured = drill(&[CommitScript::ApplyThenConflict], false).await;
+async fn glue_sdk_resend_rejected_stale_lands_once_under_the_duplicate_check() {
+    let measured = drill(&[CommitScript::ApplyThenReset], true).await;
     assert_eq!(measured.commits(), vec![
-        (Some("1"), Answer::AppliedThenConflict),
-        (Some("2"), Answer::Answered),
+        (Some("1"), Answer::AppliedThenReset),
+        (Some("1"), Answer::RejectedStale),
     ]);
     assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 2);
-    assert_eq!(measured.rows, 2 * ROWS_PER_APPEND);
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn glue_landed_commit_answered_conflict_lands_once() {
+    let measured = drill(&[CommitScript::ApplyThenConflict], false).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("1"),
+        Answer::AppliedThenConflict
+    )]);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
 }
