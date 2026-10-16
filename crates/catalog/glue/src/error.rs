@@ -139,6 +139,26 @@ mod tests {
     /// service response — is classified ambiguous, sending callers into needless commit
     /// reconciliation. Pins the never-sent and response-received sides of the split.
     #[test]
+    fn test_never_sent_and_service_response_do_not_classify_maybe_sent() {
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::construction_failure(boxed(
+                "invalid request"
+            ))),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::user(boxed("client-side setup failure"))
+            )),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(400))),
+            CommitSendDisposition::ResponseReceived
+        ));
+    }
+
+    #[test]
     fn test_closed_and_unclassified_dispatch_failures_classify_maybe_sent() {
         let closed = TestSdkError::dispatch_failure(ConnectorError::other(
             boxed("connection closed before message completed"),
@@ -193,26 +213,6 @@ mod tests {
         assert!(matches!(
             classify_commit_send_disposition(&reset),
             CommitSendDisposition::MaybeSent
-        ));
-    }
-
-    #[test]
-    fn test_never_sent_and_service_response_do_not_classify_maybe_sent() {
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::construction_failure(boxed(
-                "invalid request"
-            ))),
-            CommitSendDisposition::NeverSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
-                ConnectorError::user(boxed("client-side setup failure"))
-            )),
-            CommitSendDisposition::NeverSent
-        ));
-        assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::service_error((), response(400))),
-            CommitSendDisposition::ResponseReceived
         ));
     }
 }
