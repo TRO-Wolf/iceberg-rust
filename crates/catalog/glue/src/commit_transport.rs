@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_runtime::retries::classifiers::THROTTLING_ERRORS;
 use aws_sdk_glue::config::AsyncSleep;
 use aws_sdk_glue::config::retry::RetryConfig;
 use aws_sdk_glue::error::ProvideErrorMetadata;
@@ -77,8 +78,7 @@ pub(crate) fn refused_before_processing(
     matches!(
         error,
         aws_sdk_glue::error::SdkError::ServiceError(context)
-            if context.raw().status().is_client_error()
-                && context.err().code() == Some("ThrottlingException")
+            if context.err().code().is_some_and(|code| THROTTLING_ERRORS.contains(&code))
     )
 }
 

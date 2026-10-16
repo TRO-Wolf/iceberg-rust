@@ -27,9 +27,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_runtime::retries::classifiers::THROTTLING_ERRORS;
 use aws_sdk_s3tables::config::AsyncSleep;
 use aws_sdk_s3tables::config::http::HttpResponse;
 use aws_sdk_s3tables::config::retry::RetryConfig;
+use aws_sdk_s3tables::error::ProvideErrorMetadata;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
 #[cfg(test)]
 use iceberg::table::Table;
@@ -76,11 +78,7 @@ pub(crate) fn refused_before_processing(
     matches!(
         error,
         aws_sdk_s3tables::error::SdkError::ServiceError(context)
-            if context.raw().status().is_client_error()
-                && matches!(
-                    context.err(),
-                    UpdateTableMetadataLocationError::TooManyRequestsException(_)
-                )
+            if context.err().code().is_some_and(|code| THROTTLING_ERRORS.contains(&code))
     )
 }
 
