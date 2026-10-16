@@ -520,6 +520,12 @@ mod tests {
             CommitSendDisposition::MaybeSent
         ));
         assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::timeout(boxed("stalled"))
+            )),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::response_error(
                 boxed("unparsable response"),
                 response(200)
