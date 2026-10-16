@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use aws_sdk_s3tables::config::retry::RetryConfig;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
 #[cfg(test)]
 use iceberg::table::Table;
@@ -107,7 +108,11 @@ impl S3TablesCommitTransport for LiveS3TablesCommitTransport {
             .namespace(call.namespace)
             .name(call.name)
             .version_token(call.version_token)
-            .metadata_location(call.metadata_location);
+            .metadata_location(call.metadata_location)
+            .customize()
+            .config_override(
+                aws_sdk_s3tables::config::Builder::default().retry_config(RetryConfig::disabled()),
+            );
         match builder.send().await {
             Ok(output) => S3TablesCommitSend::Success(Some(output.version_token)),
             Err(error) => S3TablesCommitSend::Transport(Box::new(error)),

@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_sdk_glue::config::retry::RetryConfig;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
@@ -100,7 +101,14 @@ impl GlueCommitTransport for LiveGlueCommitTransport {
         if let Some(catalog_id) = catalog_id {
             builder = builder.catalog_id(catalog_id);
         }
-        match builder.send().await {
+        match builder
+            .customize()
+            .config_override(
+                aws_sdk_glue::config::Builder::default().retry_config(RetryConfig::disabled()),
+            )
+            .send()
+            .await
+        {
             Ok(_) => GlueCommitSend::Success,
             Err(error) => GlueCommitSend::Transport(Box::new(error)),
         }

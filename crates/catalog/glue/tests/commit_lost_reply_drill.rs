@@ -44,6 +44,7 @@ const ROWS_PER_APPEND: u64 = 3;
 enum CommitScript {
     ApplyThenReset,
     ApplyThenConflict,
+    DropThenReset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,7 +52,9 @@ enum Answer {
     Answered,
     AppliedThenReset,
     AppliedThenConflict,
+    DroppedThenReset,
     RejectedStale,
+    Reset,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +78,7 @@ struct GlueState {
     metadata_location: Option<String>,
     version: u64,
     commit_scripts: VecDeque<CommitScript>,
+    read_resets: usize,
     log: Vec<Logged>,
 }
 
@@ -85,6 +89,10 @@ impl GlueState {
                 self.metadata_location = new_metadata_location(body);
                 self.version = 1;
                 (Answer::Answered, None, answered(json!({})))
+            }
+            "GetTable" if self.read_resets > 0 => {
+                self.read_resets -= 1;
+                (Answer::Reset, None, Reply::Reset)
             }
             "GetTable" => (Answer::Answered, None, self.get_table()),
             "UpdateTable" => self.update_table(body),
@@ -125,9 +133,13 @@ impl GlueState {
                 rejected("ConcurrentModificationException", "stale VersionId"),
             );
         }
+        let script = self.commit_scripts.pop_front();
+        if script == Some(CommitScript::DropThenReset) {
+            return (Answer::DroppedThenReset, version_sent, Reply::Reset);
+        }
         self.metadata_location = new_metadata_location(body);
         self.version += 1;
-        match self.commit_scripts.pop_front() {
+        match script {
             Some(CommitScript::ApplyThenReset) => {
                 (Answer::AppliedThenReset, version_sent, Reply::Reset)
             }
@@ -136,7 +148,7 @@ impl GlueState {
                 version_sent,
                 rejected("ConcurrentModificationException", "stale VersionId"),
             ),
-            None => (Answer::Answered, version_sent, answered(json!({}))),
+            _ => (Answer::Answered, version_sent, answered(json!({}))),
         }
     }
 }
@@ -172,7 +184,9 @@ impl Request {
     fn header(&self, name: &str) -> Option<&str> {
         self.head.lines().find_map(|line| {
             let (key, value) = line.split_once(':')?;
-            key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then_some(value.trim())
         })
     }
 }
@@ -280,6 +294,12 @@ impl FakeGlue {
     fn arm(&self, scripts: &[CommitScript]) {
         let mut state = self.state.lock().expect("drill endpoint state");
         state.commit_scripts = scripts.iter().copied().collect();
+        state.log.clear();
+    }
+
+    fn reset_next_reads(&self, count: usize) {
+        let mut state = self.state.lock().expect("drill endpoint state");
+        state.read_resets = count;
         state.log.clear();
     }
 
@@ -430,27 +450,27 @@ async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Measured {
 }
 
 #[tokio::test]
-async fn glue_sdk_resend_rejected_stale_lands_once_without_the_duplicate_check() {
-    let measured = drill(&[CommitScript::ApplyThenReset], false).await;
-    assert_eq!(measured.commits(), vec![
-        (Some("1"), Answer::AppliedThenReset),
-        (Some("1"), Answer::RejectedStale),
-    ]);
+async fn glue_lost_reply_is_not_resent_and_reconciles_as_landed() {
+    let measured = drill(&[CommitScript::ApplyThenReset], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("1"),
+        Answer::AppliedThenReset
+    )]);
     assert_eq!(measured.outcome, Ok(()));
     assert_eq!(measured.marked_snapshots, 1);
     assert_eq!(measured.rows, ROWS_PER_APPEND);
 }
 
 #[tokio::test]
-async fn glue_sdk_resend_rejected_stale_lands_once_under_the_duplicate_check() {
-    let measured = drill(&[CommitScript::ApplyThenReset], true).await;
-    assert_eq!(measured.commits(), vec![
-        (Some("1"), Answer::AppliedThenReset),
-        (Some("1"), Answer::RejectedStale),
-    ]);
-    assert_eq!(measured.outcome, Ok(()));
-    assert_eq!(measured.marked_snapshots, 1);
-    assert_eq!(measured.rows, ROWS_PER_APPEND);
+async fn glue_lost_unapplied_commit_is_unknown_and_keeps_the_pre_state() {
+    let measured = drill(&[CommitScript::DropThenReset], true).await;
+    assert_eq!(measured.commits(), vec![(
+        Some("1"),
+        Answer::DroppedThenReset
+    )]);
+    assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
 }
 
 #[tokio::test]
@@ -463,4 +483,24 @@ async fn glue_landed_commit_answered_conflict_lands_once() {
     assert_eq!(measured.outcome, Ok(()));
     assert_eq!(measured.marked_snapshots, 1);
     assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn glue_reads_keep_their_sdk_retry() {
+    let endpoint = FakeGlue::start().await;
+    let catalog = glue_catalog(&endpoint.url).await;
+    let table = seeded_table(&catalog).await;
+    endpoint.reset_next_reads(1);
+    let reloaded = catalog
+        .load_table(table.identifier())
+        .await
+        .expect("a reset read is retried by the SDK");
+    assert_eq!(reloaded.metadata_location(), table.metadata_location());
+    let reads: Vec<Answer> = endpoint
+        .log()
+        .iter()
+        .filter(|logged| logged.operation == "GetTable")
+        .map(|logged| logged.answer)
+        .collect();
+    assert_eq!(reads, vec![Answer::Reset, Answer::Answered]);
 }

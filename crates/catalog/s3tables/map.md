@@ -28,7 +28,8 @@ S3 Tables catalog implementation. PR-5A owns the commit-transport seam on `Updat
 | File | What it does |
 |---|---|
 | `src/catalog.rs` | S3 Tables `Catalog` impl. Commit CAS goes through `S3TablesCommitTransport`. |
-| `src/commit_transport.rs` | Narrow seam around the completed `UpdateTableMetadataLocation` SDK call. Classifier, mapping, live / discarding / scripted transports. |
+| `src/commit_transport.rs` | Narrow seam around the completed `UpdateTableMetadataLocation` SDK call. Classifier, mapping, live / discarding / scripted transports. The live transport sends the call with the SDK retry off for that one operation (`customize().config_override(... RetryConfig::disabled())`), so a lost reply reaches the fork as an unknown outcome, never as an SDK re-send; reads keep the client's retry (ICE-COMMIT-REBASE-DUP-1). |
+| `tests/commit_lost_reply_drill.rs` | The lost-reply drill (ICE-COMMIT-REBASE-DUP-1): an in-process S3 Tables endpoint with a version-token CAS, driven by the real SDK client the catalog builds with dummy credentials. It applies a commit and then resets the connection, drops a commit and resets, or applies and answers `ConflictException`, and logs every request. |
 | `src/commit_outcome_tests.rs` | Offline outcome proofs for the seven commit classes on this one path. |
 | `src/utils.rs` | SDK config. |
 
@@ -43,6 +44,7 @@ S3 Tables service-side maintenance is a concurrent committer even under one appl
 | Inject a never-sent / lost-response / conflict / forbidden commit | `src/commit_transport.rs` `S3TablesCommitScript` |
 | Classify an S3 Tables SDK commit failure | `classify_commit_send_disposition` then `map_s3tables_commit_sdk_error` |
 | Run credentialed smokes | `dev/pr5a-catalog-commit-outcomes.sh` |
+| Drill a lost commit reply through the real SDK, offline | `tests/commit_lost_reply_drill.rs` |
 
 ## Pointers
 
@@ -56,6 +58,7 @@ S3 Tables service-side maintenance is a concurrent committer even under one appl
 | Symptom | Likely cause | First check |
 |---|---|---|
 | Duplicate commit after response loss | Retry of `CommitStateUnknown` | `catalog_commit_attempts == 1` |
+| Duplicate rows after a lost reply | The SDK re-sent `UpdateTableMetadataLocation` and the re-base re-applied the append | `tests/commit_lost_reply_drill.rs`: one commit request per lost reply |
 | Conflict treated as terminal | `ConflictException` lost `retryable` | `map_update_table_metadata_location_service_error` |
 | Forbidden retried | Auth mapped unknown | Forbidden arm stays `Unexpected` |
 
