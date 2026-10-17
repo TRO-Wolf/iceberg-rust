@@ -737,6 +737,18 @@ mod tests {
             classify_commit_send_disposition(&TestSdkError::service_error((), response(200))),
             CommitSendDisposition::MaybeSent
         ));
+        for status in [201, 299] {
+            assert!(
+                matches!(
+                    classify_commit_send_disposition(&TestSdkError::service_error(
+                        (),
+                        response(status)
+                    )),
+                    CommitSendDisposition::MaybeSent
+                ),
+                "{status}"
+            );
+        }
         assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::service_error((), response(500))),
             CommitSendDisposition::MaybeSent

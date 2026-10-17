@@ -609,6 +609,140 @@ mod tests {
         assert!(error.message().contains("nothing was applied"));
     }
 
+    async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < head_end + length {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        Some(buffer[head_end..head_end + length].to_vec())
+    }
+
+    async fn throttling_endpoint(throttles: usize) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local endpoint");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the local endpoint address")
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    while let Some(body) = read_request_body(&mut stream).await {
+                        let count = {
+                            let mut seen = seen.lock().expect("the request log");
+                            seen.push(body);
+                            seen.len()
+                        };
+                        let (status, error_type, body) = if count <= throttles {
+                            (
+                                "400 Bad Request",
+                                "x-amzn-errortype: ThrottlingException\r\n",
+                                r#"{"__type":"ThrottlingException","message":"Rate exceeded"}"#,
+                            )
+                        } else {
+                            ("200 OK", "", "{}")
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/x-amz-json-1.1\r\n{error_type}content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    fn client_without_a_sleep_impl(url: &str) -> aws_sdk_glue::Client {
+        let config = aws_sdk_glue::Config::builder()
+            .behavior_version(aws_sdk_glue::config::BehaviorVersion::latest())
+            .region(aws_sdk_glue::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_glue::config::Credentials::new(
+                "test-access-key",
+                "test-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(url)
+            .build();
+        assert!(config.sleep_impl().is_none());
+        aws_sdk_glue::Client::from_conf(config)
+    }
+
+    fn update_table_call() -> GlueUpdateTableCall {
+        GlueUpdateTableCall {
+            database_name: "ns1".to_string(),
+            table_input: TableInput::builder()
+                .name("test1")
+                .build()
+                .expect("a table input"),
+            version_id: Some("1".to_string()),
+            catalog_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once() {
+        let (url, requests) = throttling_endpoint(2).await;
+        let transport = LiveGlueCommitTransport::new(client_without_a_sleep_impl(&url), None);
+        let send = transport.send_update_table(update_table_call()).await;
+        let requests = requests.lock().expect("the request log").clone();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|body| *body == requests[0]));
+        assert!(matches!(send, GlueCommitSend::Success));
+    }
+
+    #[tokio::test]
+    async fn test_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled()
+     {
+        let (url, requests) = throttling_endpoint(usize::MAX).await;
+        let transport = LiveGlueCommitTransport::new(client_without_a_sleep_impl(&url), None);
+        let send = transport.send_update_table(update_table_call()).await;
+        let sends = requests.lock().expect("the request log").len();
+        let error = map_glue_commit_send(send, &test_table_ident())
+            .expect_err("an exhausted throttle fails");
+        assert!(
+            error
+                .message()
+                .contains(&format!("on each of {sends} sends")),
+            "{sends} sends: {}",
+            error.message()
+        );
+        assert_eq!(sends, 3);
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+    }
+
     fn test_table_ident() -> TableIdent {
         TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
     }

@@ -275,6 +275,7 @@ async fn glue_throttled_on_every_send_fails_terminally_after_three_sends() {
     assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
     let message = measured.message.as_deref().unwrap_or_default();
     assert!(message.contains("nothing was applied"), "{message}");
+    assert!(message.contains("on each of 3 sends"), "{message}");
     assert_eq!(measured.marked_snapshots, 0);
     assert_eq!(measured.rows, 0);
 }

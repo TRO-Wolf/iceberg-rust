@@ -275,6 +275,7 @@ async fn s3tables_throttled_on_every_send_fails_terminally_after_three_sends() {
     assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
     let message = measured.message.as_deref().unwrap_or_default();
     assert!(message.contains("nothing was applied"), "{message}");
+    assert!(message.contains("on each of 3 sends"), "{message}");
     assert_eq!(measured.marked_snapshots, 0);
     assert_eq!(measured.rows, 0);
 }
@@ -325,6 +326,48 @@ async fn s3tables_unreadable_success_reply_before_the_commit_is_unknown_and_keep
     )]);
     assert_eq!(measured.reads(), 3);
     assert_eq!(measured.outcome, Err(ErrorKind::CommitStateUnknown));
+    assert_eq!(measured.marked_snapshots, 0);
+    assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn s3tables_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once() {
+    let measured = drill_without_a_sleep_impl(&[
+        CommitScript::DropThenError(429, "TooManyRequestsException"),
+        CommitScript::DropThenError(429, "TooManyRequestsException"),
+    ])
+    .await;
+    assert_eq!(measured.commits(), vec![
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::Answered),
+    ]);
+    let sent = measured.metadata_sent();
+    assert!(sent.iter().all(|location| *location == sent[0]));
+    assert_eq!(measured.reads_between_commits(), 0);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn s3tables_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled()
+ {
+    let measured = drill_without_a_sleep_impl(&[
+        CommitScript::DropThenError(429, "TooManyRequestsException"),
+        CommitScript::DropThenError(429, "TooManyRequestsException"),
+        CommitScript::DropThenError(429, "TooManyRequestsException"),
+        CommitScript::DropThenError(429, "TooManyRequestsException"),
+    ])
+    .await;
+    let sends = measured.commits().len();
+    let message = measured.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains(&format!("on each of {sends} sends")),
+        "{sends} sends: {message}"
+    );
+    assert_eq!(sends, 3);
+    assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
     assert_eq!(measured.marked_snapshots, 0);
     assert_eq!(measured.rows, 0);
 }

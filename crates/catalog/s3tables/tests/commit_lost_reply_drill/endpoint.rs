@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aws_sdk_s3tables::config::{BehaviorVersion, Credentials, Region};
 use iceberg::io::MemoryStorageFactory;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
@@ -567,6 +568,38 @@ pub(crate) async fn s3tables_catalog(url: &str) -> S3TablesCatalog {
         .expect("build the S3 Tables catalog against the drill endpoint")
 }
 
+pub(crate) fn client_without_a_sleep_impl(url: &str) -> aws_sdk_s3tables::Client {
+    let config = aws_sdk_s3tables::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(Credentials::new(
+            "drill-access-key",
+            "drill-secret-key",
+            None,
+            None,
+            "drill",
+        ))
+        .endpoint_url(url)
+        .build();
+    assert!(config.sleep_impl().is_none());
+    aws_sdk_s3tables::Client::from_conf(config)
+}
+
+pub(crate) async fn s3tables_catalog_with_client(
+    client: aws_sdk_s3tables::Client,
+) -> S3TablesCatalog {
+    let props = HashMap::from([(
+        S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN.to_string(),
+        BUCKET_ARN.to_string(),
+    )]);
+    S3TablesCatalogBuilder::default()
+        .with_storage_factory(Arc::new(MemoryStorageFactory))
+        .with_client(client)
+        .load("drill", props)
+        .await
+        .expect("build the S3 Tables catalog on an injected client")
+}
+
 pub(crate) async fn seeded_table(catalog: &S3TablesCatalog) -> Table {
     let schema = Schema::builder()
         .with_fields(vec![
@@ -690,6 +723,15 @@ pub(crate) async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Me
     endpoint.arm(scripts);
     let label = format!("{scripts:?} check_duplicate={check_duplicate}");
     measure(&endpoint, &catalog, &table, check_duplicate, &label).await
+}
+
+pub(crate) async fn drill_without_a_sleep_impl(scripts: &[CommitScript]) -> Measured {
+    let endpoint = FakeS3Tables::start(Connections::KeepAlive).await;
+    let catalog = s3tables_catalog_with_client(client_without_a_sleep_impl(&endpoint.url)).await;
+    let table = seeded_table(&catalog).await;
+    endpoint.arm(scripts);
+    let label = format!("{scripts:?} on a client without a sleep_impl");
+    measure(&endpoint, &catalog, &table, true, &label).await
 }
 
 pub(crate) async fn drill_refused_commit_connection() -> Measured {
