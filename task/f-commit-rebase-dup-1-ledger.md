@@ -957,3 +957,26 @@ observes how long the transport sleeps.
 | `make check-rust-file-size check-comment-blocks check-agent-artifacts check-matrix-anchors` | 0 |
 | comment gate, base `2001c6d6` | 0 |
 | `git diff 46af9dc8 HEAD -- '*/src/*' '*Cargo.toml' Cargo.lock` | empty |
+
+## Scoped re-verifier of ruling 140, 2026-10-17: PASS
+
+The re-verifier judged head `ca358550` against `46af9dc8` and passed it.
+- **Scope:** no production file changed.
+- **The two cells:** each holds every point its stage lists and is red under its own mutant (V1s,
+  V2s-b).
+- **Suite:** the S3 Tables suite, 93 tests, is green, and nothing green on `46af9dc8` is red.
+- **Ruling and premise:** the ruling block is verbatim, and the corrected premise matches
+  aws-smithy-runtime 1.12.1 `default_sleep_impl_plugin`.
+
+It found no behaviour finding. It recorded four test gaps from its own mutants on the same seam,
+none of them verdict-bearing. Under each mutant the commit still lands once in three sends; only
+the sleep that takes the wait, or its length, changes.
+
+| Id | Severity | Gap | Note |
+|---|---|---|---|
+| R140-1 | low | Cell 1 pins that the client's sleep is asked for the two backoff waits, not that the transport awaits them. A transport that asks the client's sleep and then waits on another sleep, or drops the request unawaited, passes. | A plain missing `.await` cannot pass: `Sleep` is `#[must_use]`, and clippy with `-D warnings` refuses it. Only an explicit `drop` escapes. On head, the client's sleep receives and completes both waits. |
+| R140-2 | low | Cell 1's client has no retry config, so a fallback that replaces a client's own sleep whenever `retry_config()` is Some passes both cells. | A client built from an `SdkConfig` with a custom sleep carries both. On head, that shape uses its own sleep. A cell-1 variant with `.retry_config(RetryConfig::standard())` beside the recording sleep would close it. |
+| R140-3 | info | Cell 1's bounds (below 1 s, then below 2 s) do not pin the doubling. | The R3 class, timing, left unpinned by ruling 140. `throttle_backoff` is pinned as a pure function. |
+| R140-4 | info | Cell 1's filter claims more than the SDK guarantees. A retried read asks the client's sleep for a jittered wait that can fall below 2 s. | The drill never fails a read in these cells, so it does not arise. Such a wait would turn the cell red, not green. The 6.2 s and 21.6 s requests are the identity cache's `pessimistic_load_timeout`: 2 × 3.1 s per attempt, and 3 attempts plus 1 s and 2 s of backoff. |
+
+Ruling 140 allows no third test round. These gaps stay recorded here.
