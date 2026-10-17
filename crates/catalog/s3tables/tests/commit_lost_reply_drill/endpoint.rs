@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aws_sdk_s3tables::config::{BehaviorVersion, Credentials, Region};
+use aws_sdk_s3tables::config::retry::RetryConfig;
+use aws_sdk_s3tables::config::{AsyncSleep, BehaviorVersion, Credentials, Region, Sleep};
 use iceberg::io::MemoryStorageFactory;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
@@ -90,6 +91,7 @@ pub(crate) struct Logged {
     pub(crate) operation: &'static str,
     pub(crate) version_sent: Option<String>,
     pub(crate) metadata_sent: Option<String>,
+    pub(crate) body_sent: Option<String>,
     pub(crate) answer: Answer,
 }
 
@@ -174,10 +176,12 @@ impl S3TablesState {
         let metadata_sent = (operation == "UpdateTableMetadataLocation")
             .then(|| json_string(body, "metadataLocation"))
             .flatten();
+        let body_sent = (operation == "UpdateTableMetadataLocation").then(|| body.to_string());
         self.log.push(Logged {
             operation,
             version_sent,
             metadata_sent,
+            body_sent,
             answer,
         });
         reply
@@ -568,8 +572,49 @@ pub(crate) async fn s3tables_catalog(url: &str) -> S3TablesCatalog {
         .expect("build the S3 Tables catalog against the drill endpoint")
 }
 
-pub(crate) fn client_without_a_sleep_impl(url: &str) -> aws_sdk_s3tables::Client {
-    let config = aws_sdk_s3tables::Config::builder()
+pub(crate) const SDK_THROUGHPUT_CHECK: Duration = Duration::from_millis(100);
+pub(crate) const TRANSPORT_BACKOFF_CEILING: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RecordingSleep {
+    requested: Arc<Mutex<Vec<Duration>>>,
+}
+
+impl RecordingSleep {
+    pub(crate) fn transport_waits(&self) -> Vec<Duration> {
+        self.requested
+            .lock()
+            .expect("the sleep log")
+            .iter()
+            .copied()
+            .filter(|duration| {
+                *duration != SDK_THROUGHPUT_CHECK && *duration < TRANSPORT_BACKOFF_CEILING
+            })
+            .collect()
+    }
+
+    pub(crate) fn requests(&self) -> BTreeMap<Duration, usize> {
+        let mut counts = BTreeMap::new();
+        for duration in self.requested.lock().expect("the sleep log").iter() {
+            *counts.entry(*duration).or_default() += 1;
+        }
+        counts
+    }
+}
+
+impl AsyncSleep for RecordingSleep {
+    fn sleep(&self, duration: Duration) -> Sleep {
+        self.requested.lock().expect("the sleep log").push(duration);
+        if duration < TRANSPORT_BACKOFF_CEILING {
+            Sleep::new(async {})
+        } else {
+            Sleep::new(tokio::time::sleep(duration))
+        }
+    }
+}
+
+fn drill_client_config(url: &str) -> aws_sdk_s3tables::config::Builder {
+    aws_sdk_s3tables::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .credentials_provider(Credentials::new(
@@ -580,7 +625,28 @@ pub(crate) fn client_without_a_sleep_impl(url: &str) -> aws_sdk_s3tables::Client
             "drill",
         ))
         .endpoint_url(url)
+}
+
+pub(crate) fn client_without_a_sleep_impl(url: &str) -> aws_sdk_s3tables::Client {
+    let config = drill_client_config(url).build();
+    assert!(config.sleep_impl().is_none());
+    aws_sdk_s3tables::Client::from_conf(config)
+}
+
+pub(crate) fn client_with_its_own_sleep(
+    url: &str,
+    sleep: &RecordingSleep,
+) -> aws_sdk_s3tables::Client {
+    let config = drill_client_config(url).sleep_impl(sleep.clone()).build();
+    assert!(config.sleep_impl().is_some());
+    aws_sdk_s3tables::Client::from_conf(config)
+}
+
+pub(crate) fn client_with_retries_on_and_no_sleep_impl(url: &str) -> aws_sdk_s3tables::Client {
+    let config = drill_client_config(url)
+        .retry_config(RetryConfig::standard())
         .build();
+    assert!(config.retry_config().is_some_and(|retry| retry.has_retry()));
     assert!(config.sleep_impl().is_none());
     aws_sdk_s3tables::Client::from_conf(config)
 }
@@ -693,6 +759,13 @@ impl Measured {
         }
     }
 
+    pub(crate) fn bodies_sent(&self) -> Vec<&str> {
+        self.log
+            .iter()
+            .filter_map(|logged| logged.body_sent.as_deref())
+            .collect()
+    }
+
     pub(crate) fn metadata_sent(&self) -> Vec<&str> {
         self.log
             .iter()
@@ -726,11 +799,24 @@ pub(crate) async fn drill(scripts: &[CommitScript], check_duplicate: bool) -> Me
 }
 
 pub(crate) async fn drill_without_a_sleep_impl(scripts: &[CommitScript]) -> Measured {
+    drill_on_client(
+        scripts,
+        "a client without a sleep_impl",
+        client_without_a_sleep_impl,
+    )
+    .await
+}
+
+pub(crate) async fn drill_on_client(
+    scripts: &[CommitScript],
+    client_label: &str,
+    client: impl FnOnce(&str) -> aws_sdk_s3tables::Client,
+) -> Measured {
     let endpoint = FakeS3Tables::start(Connections::KeepAlive).await;
-    let catalog = s3tables_catalog_with_client(client_without_a_sleep_impl(&endpoint.url)).await;
+    let catalog = s3tables_catalog_with_client(client(&endpoint.url)).await;
     let table = seeded_table(&catalog).await;
     endpoint.arm(scripts);
-    let label = format!("{scripts:?} on a client without a sleep_impl");
+    let label = format!("{scripts:?} on {client_label}");
     measure(&endpoint, &catalog, &table, true, &label).await
 }
 

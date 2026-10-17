@@ -17,6 +17,8 @@
 
 mod endpoint;
 
+use std::time::Duration;
+
 use endpoint::*;
 use iceberg::{Catalog, ErrorKind};
 
@@ -370,4 +372,86 @@ async fn s3tables_a_client_without_a_sleep_impl_names_the_sends_it_made_when_eve
     assert_eq!(measured.outcome, Err(ErrorKind::Unexpected));
     assert_eq!(measured.marked_snapshots, 0);
     assert_eq!(measured.rows, 0);
+}
+
+#[tokio::test]
+async fn s3tables_a_client_with_its_own_sleep_impl_gets_the_two_backoff_waits_and_lands_once() {
+    let sleep = RecordingSleep::default();
+    let measured = drill_on_client(
+        &[
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+        ],
+        "a client with its own recording sleep_impl",
+        |url| client_with_its_own_sleep(url, &sleep),
+    )
+    .await;
+    let waits = sleep.transport_waits();
+    println!(
+        "transport waits {waits:?}; every requested sleep {:?}",
+        sleep.requests()
+    );
+    assert_eq!(waits.len(), 2, "{waits:?}");
+    assert!(waits[0] < Duration::from_secs(1), "{waits:?}");
+    assert!(waits[1] < Duration::from_secs(2), "{waits:?}");
+    assert_eq!(measured.commits(), vec![
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::Answered),
+    ]);
+    let bodies = measured.bodies_sent();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.iter().all(|body| *body == bodies[0]));
+    assert_eq!(measured.reads_between_commits(), 0);
+    assert_eq!(measured.outcome, Ok(()));
+    assert_eq!(measured.marked_snapshots, 1);
+    assert_eq!(measured.rows, ROWS_PER_APPEND);
+}
+
+#[tokio::test]
+async fn s3tables_a_client_with_retries_on_and_no_sleep_impl_resends_a_throttle_three_times() {
+    let landed = drill_on_client(
+        &[
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+        ],
+        "a client with standard retries and no sleep_impl",
+        client_with_retries_on_and_no_sleep_impl,
+    )
+    .await;
+    assert_eq!(landed.commits(), vec![
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::Answered),
+    ]);
+    let bodies = landed.bodies_sent();
+    assert_eq!(bodies.len(), 3);
+    assert!(bodies.iter().all(|body| *body == bodies[0]));
+    assert_eq!(landed.reads_between_commits(), 0);
+    assert_eq!(landed.outcome, Ok(()));
+    assert_eq!(landed.marked_snapshots, 1);
+    assert_eq!(landed.rows, ROWS_PER_APPEND);
+
+    let refused = drill_on_client(
+        &[
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+            CommitScript::DropThenError(429, "TooManyRequestsException"),
+        ],
+        "a client with standard retries and no sleep_impl",
+        client_with_retries_on_and_no_sleep_impl,
+    )
+    .await;
+    assert_eq!(refused.commits(), vec![
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::DroppedThenError(429)),
+        (Some("v1"), Answer::DroppedThenError(429)),
+    ]);
+    let message = refused.message.as_deref().unwrap_or_default();
+    assert!(message.contains("on each of 3 sends"), "{message}");
+    assert!(message.contains("nothing was applied"), "{message}");
+    assert_eq!(refused.outcome, Err(ErrorKind::Unexpected));
+    assert_eq!(refused.marked_snapshots, 0);
+    assert_eq!(refused.rows, 0);
 }
