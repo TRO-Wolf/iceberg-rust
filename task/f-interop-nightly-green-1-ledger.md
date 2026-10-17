@@ -92,3 +92,17 @@ This ledger retires when the three pull requests land and the weekly run reports
   `verify-interop-validate-append-only: 0 failures` (Java), `test result: ok. 1 passed` (Rust),
   and both sabotage legs fail closed (`FAIL validate-append-only[matching_partition]: outcome
   THROW but expected COMMIT` on each side).
+
+### A3 — the REST fixture keeps its catalog in a WAL-mode SQLite file
+
+- **Cause.** The `rest` service in `dev/docker-compose.yaml` ran its JDBC catalog on
+  `jdbc:sqlite:file:/tmp/iceberg_rest_mode=memory`. Under parallel commits SQLite answered
+  `SQLITE_BUSY` (seen in the ICE-CI-RUSTFS-1 verification).
+- **Fix.** `CATALOG_URI=jdbc:sqlite:file:/tmp/iceberg_rest.db?journal_mode=WAL`, the upstream
+  line from `6262dffd7`. WAL lets readers run beside one writer. `dev/map.md` names the setting
+  and the `SQLITE_BUSY` symptom.
+
+**Evidence (2026-10-17, rootless Docker).** `make docker-up`: exit 0, every service healthy
+(`dev-rest-1 Up ... (healthy)`), `GET /v1/config` answers. Inside the `rest` container `/tmp`
+holds `iceberg_rest.db`, `iceberg_rest.db-wal` and `iceberg_rest.db-shm`, so the catalog runs
+in WAL mode. `make docker-down`: exit 0.

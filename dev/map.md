@@ -31,7 +31,7 @@ Developer tools: Java interop oracles, Spark provisioner, and credentialed catal
 | `java-interop/` | Java 1.10.0 oracle harnesses. See `java-interop/map.md`. |
 | `pr5a-catalog-commit-outcomes.sh` | Credentialed PR-5A Glue + S3 Tables commit-outcome runner. Hard-fails unless `ICEBERG_PR5A_CREDENTIALED=1` and required config is present. Does not print credentials or object-store URLs. |
 | `spark/` | Spark provisioner for interop tables. |
-| `docker-compose.yaml` | Local REST / RustFS object store / HMS fixtures. The `object-store` service is RustFS; the one-shot `create-buckets` job makes the test buckets. |
+| `docker-compose.yaml` | Local REST / RustFS object store / HMS fixtures. The `object-store` service is RustFS; the one-shot `create-buckets` job makes the test buckets. The `rest` service keeps its JDBC catalog in a SQLite file in WAL mode (upstream `6262dffd7`), so parallel commits do not fail with `SQLITE_BUSY`. |
 
 ## I want to…
 
@@ -57,6 +57,7 @@ Developer tools: Java interop oracles, Spark provisioner, and credentialed catal
 | Runner exits 1 credentials absent | No AWS credential source | Access key, profile, container, or web identity — do not log values |
 | javap decode fixture count mismatch | Iceberg jar drift | Confirm 1.10.0 jars under `~/.m2` |
 | `make docker-up` fails with `no such manifest` or `pull access denied` | A registry dropped a fixture image | Re-pin the image by digest; see `task/ice-ci-rustfs-1-ledger.md` |
+| REST catalog tests fail with `SQLITE_BUSY` under parallel load | The `rest` service `CATALOG_URI` lost `journal_mode=WAL`, or points at an in-memory database | `grep CATALOG_URI docker-compose.yaml` |
 
 ### First checks
 
