@@ -33,6 +33,7 @@ use aws_sdk_s3tables::config::http::HttpResponse;
 use aws_sdk_s3tables::config::retry::RetryConfig;
 use aws_sdk_s3tables::error::ProvideErrorMetadata;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
+use aws_smithy_async::rt::sleep::default_async_sleep;
 #[cfg(test)]
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
@@ -54,6 +55,7 @@ pub(crate) enum S3TablesCommitSend {
     ModeledService(UpdateTableMetadataLocationError),
     RefusedBeforeProcessing(
         Box<aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>>,
+        u32,
     ),
 }
 
@@ -175,7 +177,11 @@ impl LiveS3TablesCommitTransport {
 impl S3TablesCommitTransport for LiveS3TablesCommitTransport {
     async fn send_update_metadata_location(&self, call: S3TablesUpdateCall) -> S3TablesCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        let sleep = self.client.config().sleep_impl();
+        let sleep = self
+            .client
+            .config()
+            .sleep_impl()
+            .or_else(default_async_sleep);
         let mut sends = 0;
         loop {
             sends += 1;
@@ -187,7 +193,9 @@ impl S3TablesCommitTransport for LiveS3TablesCommitTransport {
                             .sleep(throttle_backoff(sends, jitter_fraction()))
                             .await;
                     }
-                    _ => return S3TablesCommitSend::RefusedBeforeProcessing(Box::new(error)),
+                    _ => {
+                        return S3TablesCommitSend::RefusedBeforeProcessing(Box::new(error), sends);
+                    }
                 },
                 Err(error) => return S3TablesCommitSend::Transport(Box::new(error)),
             }
@@ -373,11 +381,11 @@ pub(crate) fn map_s3tables_commit_send(
         S3TablesCommitSend::ModeledService(error) => Err(
             map_update_table_metadata_location_service_error(error, table_ident),
         ),
-        S3TablesCommitSend::RefusedBeforeProcessing(error) => Err(Error::new(
+        S3TablesCommitSend::RefusedBeforeProcessing(error, sends) => Err(Error::new(
             ErrorKind::Unexpected,
             format!(
                 "Commit refused for table {table_ident}: S3 Tables throttled the update on each \
-                 of {THROTTLE_ATTEMPTS} sends, and nothing was applied"
+                 of {sends} sends, and nothing was applied"
             ),
         )
         .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))),
@@ -615,15 +623,19 @@ mod tests {
     #[test]
     fn test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied() {
         let error = map_s3tables_commit_send(
-            S3TablesCommitSend::RefusedBeforeProcessing(Box::new(
-                aws_sdk_s3tables::error::SdkError::timeout_error(boxed_err("throttled")),
-            )),
+            S3TablesCommitSend::RefusedBeforeProcessing(
+                Box::new(aws_sdk_s3tables::error::SdkError::timeout_error(boxed_err(
+                    "throttled",
+                ))),
+                2,
+            ),
             &test_table_ident(),
         )
         .expect_err("an exhausted throttle fails");
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert!(!error.retryable());
         assert!(error.message().contains("nothing was applied"));
+        assert!(error.message().contains("on each of 2 sends"));
     }
 
     fn test_table_ident() -> TableIdent {

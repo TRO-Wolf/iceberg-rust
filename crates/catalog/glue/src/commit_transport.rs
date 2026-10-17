@@ -34,6 +34,7 @@ use aws_sdk_glue::config::retry::RetryConfig;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
+use aws_smithy_async::rt::sleep::default_async_sleep;
 #[cfg(test)]
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
@@ -54,7 +55,7 @@ pub(crate) enum GlueCommitSend {
     Transport(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>),
     #[allow(dead_code)]
     ModeledService(UpdateTableError),
-    RefusedBeforeProcessing(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>),
+    RefusedBeforeProcessing(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>, u32),
 }
 
 pub(crate) const THROTTLE_ATTEMPTS: u32 = 3;
@@ -145,7 +146,11 @@ impl LiveGlueCommitTransport {
 impl GlueCommitTransport for LiveGlueCommitTransport {
     async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        let sleep = self.client.config().sleep_impl();
+        let sleep = self
+            .client
+            .config()
+            .sleep_impl()
+            .or_else(default_async_sleep);
         let mut sends = 0;
         loop {
             sends += 1;
@@ -157,7 +162,7 @@ impl GlueCommitTransport for LiveGlueCommitTransport {
                             .sleep(throttle_backoff(sends, jitter_fraction()))
                             .await;
                     }
-                    _ => return GlueCommitSend::RefusedBeforeProcessing(Box::new(error)),
+                    _ => return GlueCommitSend::RefusedBeforeProcessing(Box::new(error), sends),
                 },
                 Err(error) => return GlueCommitSend::Transport(Box::new(error)),
             }
@@ -358,11 +363,11 @@ pub(crate) fn map_glue_commit_send(send: GlueCommitSend, table_ident: &TableIden
         GlueCommitSend::ModeledService(error) => {
             Err(map_update_table_service_error(error, table_ident))
         }
-        GlueCommitSend::RefusedBeforeProcessing(error) => Err(Error::new(
+        GlueCommitSend::RefusedBeforeProcessing(error, sends) => Err(Error::new(
             ErrorKind::Unexpected,
             format!(
                 "Commit refused for table {table_ident}: Glue throttled the update on each of \
-                 {THROTTLE_ATTEMPTS} sends, and nothing was applied"
+                 {sends} sends, and nothing was applied"
             ),
         )
         .with_source(anyhow!("aws sdk error: {error:?}"))),
@@ -598,15 +603,19 @@ mod tests {
     #[test]
     fn test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied() {
         let error = map_glue_commit_send(
-            GlueCommitSend::RefusedBeforeProcessing(Box::new(
-                aws_sdk_glue::error::SdkError::timeout_error(boxed_err("throttled")),
-            )),
+            GlueCommitSend::RefusedBeforeProcessing(
+                Box::new(aws_sdk_glue::error::SdkError::timeout_error(boxed_err(
+                    "throttled",
+                ))),
+                2,
+            ),
             &test_table_ident(),
         )
         .expect_err("an exhausted throttle fails");
         assert_eq!(error.kind(), ErrorKind::Unexpected);
         assert!(!error.retryable());
         assert!(error.message().contains("nothing was applied"));
+        assert!(error.message().contains("on each of 2 sends"));
     }
 
     async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
