@@ -866,3 +866,94 @@ repark-sql`:
 
 No test is green without the override and red with it. RePark's `Cargo.lock` was restored, and the
 clone is clean.
+
+## Owner ruling 140, 2026-10-17
+
+The scoped re-verifier of ruling 137 failed `46af9dc8` (the branch after the fork main `2001c6d6`
+merge) on two test gaps; the behaviour held on all three items. R137-1: no test pinned that an S3
+Tables client with its own `sleep_impl` keeps using it, so mutant V1s (the fallback replaces the
+client's sleep) survived. R137-2: the no-sleep pins covered only a client whose `retry_config()` is
+None, so mutant V2s-b (the fallback skipped when the config explicitly enables retries) survived.
+R137-3 (info): the fallback's own wait is not pinned. The ruling, verbatim:
+
+```
+Q140 → (a). One tests-only round on the same session, Opus xhigh.
+No production code changes under any outcome of this round: if one
+of the two cells cannot be built the way the brief describes it, the
+round reports that, and the transport is not bent to make it
+buildable. The two S3 Tables drill cells go beside the no-sleep
+pins, each shown red under its mutant (V1s, V2s-b). The ledger
+records the corrected premise. The fallback's own wait stays
+unpinned, as the verifier recommends. Then the scoped re-verifier
+on those two pins only.
+
+  PASS → the fork-push and rev-bump question comes to me.
+  FAIL on test gaps only → (b): the ledger records them and the
+    question comes anyway; the behaviour already holds on every
+    shape measured, and there is no third test round.
+  A behaviour finding → stop and bring it to me.
+
+(c) is refused. DUP-1 gates the RePark pin bump, and the closeout
+waits on that.
+```
+
+Commit: `269014aa994b` (the two cells, tests only). No file under `src/`, no `Cargo.toml` and no
+`Cargo.lock` changed: `git diff 46af9dc8 HEAD -- '*/src/*' '*Cargo.toml' Cargo.lock` is empty.
+
+### The corrected premise
+
+Ruling 137 says the SDK refuses to build a client with retries on and no sleep. At the client-config
+level that does not hold. `aws_sdk_s3tables::Config::builder()` with
+`.retry_config(RetryConfig::standard())` and no `sleep_impl` builds through `Client::from_conf` and
+works through `with_client`. The new cell asserts `retry_config()` reports retries on and
+`sleep_impl()` is None, then commits through it. The SDK supplies its own sleep one layer down:
+aws-smithy-runtime 1.12.1 `src/client/defaults.rs:113`, `default_sleep_impl_plugin()`, maps
+`default_async_sleep()` into a runtime plugin that calls `components.with_sleep_impl(Some(default))`.
+`default_plugins` (`defaults.rs:405-416`) installs it on every client. The orchestrator's retry
+delays read `runtime_components.sleep_impl()` (`src/client/orchestrator.rs:288` and `:381`), so
+the SDK's own retry has a sleep. The client `Config` never sees it, and `config().sleep_impl()`
+stays None. That is why the commit transport, which reads `config().sleep_impl()` because its
+resend runs outside the SDK orchestrator, needs the `default_async_sleep()` fallback for every
+shape without a `sleep_impl`, with retries on or off.
+
+### The two cells (`crates/catalog/s3tables/tests/commit_lost_reply_drill/`)
+
+| Cell | What it asserts | On `269014aa994b` | Under its mutant |
+|---|---|---|---|
+| `s3tables_a_client_with_its_own_sleep_impl_gets_the_two_backoff_waits_and_lands_once`: `with_client` on a client whose config carries `RecordingSleep`, which logs every requested duration and returns at once below 2 s; 429 `TooManyRequestsException` twice, then applied | the client's sleep receives exactly two transport waits, the first below 1 s and the second below 2 s; three sends at `v1`, the bodies byte-identical; no read between them; Ok, one new snapshot, the rows once | green, in the full drill run and in 8 more runs of the cell (waits, for example, `[864.850302ms, 1.477920707s]`, `[42.688678ms, 1.946494568s]`) | V1s (`let sleep = default_async_sleep();`): red, `assertion left == right failed: [] left: 0 right: 2`. The client's sleep got no transport wait (every requested sleep `{100ms: 42073, 3.1s: 1, 6.2s: 3, 21.6s: 6}`); the commit itself still landed, on Tokio's sleep. The other 22 cells stayed green |
+| `s3tables_a_client_with_retries_on_and_no_sleep_impl_resends_a_throttle_three_times`: `with_client` on a client built with `RetryConfig::standard()` and no `sleep_impl` (both asserted) | throttled twice, then applied: three sends at `v1`, the bodies byte-identical, no read between them, Ok, one new snapshot, the rows once. Throttled on every send: three sends, `Unexpected`, a message with `on each of 3 sends` and `nothing was applied`, no snapshot | green | V2s-b (`.or_else(\|\| match self.client.config().retry_config() { Some(retry) if retry.has_retry() => None, _ => default_async_sleep() })`): red, `left: [(Some("v1"), DroppedThenError(429))]`, `right:` the two 429 sends and the answered third. The other 22 cells stayed green |
+
+Each mutant came from the re-verifier's script, was applied, run with `cargo test --no-fail-fast -p
+iceberg-catalog-s3tables --test commit_lost_reply_drill` (exit 101), and restored with `git
+checkout`. The transport diff was empty after each.
+
+How cell 1 tells the transport's waits from the SDK's. The SDK calls a client's sleep on its own
+account, and only with fixed durations. The stalled-stream monitor rearms every 100 ms
+(aws-smithy-runtime 1.12.1 `minimum_throughput/options.rs:79` `DEFAULT_CHECK_WINDOW` of 1 s, divided
+by `BIN_COUNT` 10 at `throughput.rs:271` and `:307`). Because the recording sleep returns at once,
+that monitor rearms tens of thousands of times per commit. The SDK's longer waits are timeouts: the
+3.1 s `DEFAULT_CONNECT_TIMEOUT` (`defaults.rs:38`), and the 6.2 s and 21.6 s measured beside it. All of
+them are 2 s or more. The transport's waits are `throttle_backoff(1, f)` below 1 s and
+`throttle_backoff(2, f)` below 2 s. So `RecordingSleep::transport_waits` keeps every requested
+duration that is not exactly 100 ms and is below 2 s. The recording sleep passes waits of 2 s or
+more to Tokio, so the SDK's timeouts keep their meaning. In each of the eight runs that printed it,
+the full list of requested durations was the two transport draws plus only 100 ms, 3.1 s, 6.2 s
+and 21.6 s. A draw of exactly
+100 ms, about a one-in-10^9 event per draw, would be dropped and turn the cell red, not green.
+
+### R137-3, left under R3
+
+The fallback's own wait (mutant V7s, a fallback sleep that returns at once) stays unpinned, as the
+ruling directs. It is the same gap as the re-verifier's R3 on `3e3aad98`: nothing in the repository
+observes how long the transport sleeps.
+
+### Gates (fork, on `269014aa994b`)
+
+| Command | Exit |
+|---|---|
+| `cargo test --no-fail-fast -p iceberg-catalog-s3tables` | 0: 93 passed, 0 failed |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
+| `cargo fmt --all -- --check` | 0 |
+| `make check-rust-file-size check-comment-blocks check-agent-artifacts check-matrix-anchors` | 0 |
+| comment gate, base `2001c6d6` | 0 |
+| `git diff 46af9dc8 HEAD -- '*/src/*' '*Cargo.toml' Cargo.lock` | empty |
