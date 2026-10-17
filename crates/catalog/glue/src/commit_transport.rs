@@ -18,17 +18,23 @@
 #[cfg(test)]
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
+use std::hash::BuildHasher;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
+use aws_runtime::retries::classifiers::THROTTLING_ERRORS;
+use aws_sdk_glue::config::AsyncSleep;
+use aws_sdk_glue::config::retry::RetryConfig;
 use aws_sdk_glue::error::ProvideErrorMetadata;
 use aws_sdk_glue::operation::update_table::UpdateTableError;
 use aws_sdk_glue::types::TableInput;
+use aws_smithy_async::rt::sleep::default_async_sleep;
 #[cfg(test)]
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
@@ -49,6 +55,32 @@ pub(crate) enum GlueCommitSend {
     Transport(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>),
     #[allow(dead_code)]
     ModeledService(UpdateTableError),
+    RefusedBeforeProcessing(Box<aws_sdk_glue::error::SdkError<UpdateTableError>>, u32),
+}
+
+pub(crate) const THROTTLE_ATTEMPTS: u32 = 3;
+
+const THROTTLE_FIRST_BACKOFF: Duration = Duration::from_secs(1);
+
+pub(crate) fn throttle_backoff(sends: u32, fraction: f64) -> Duration {
+    THROTTLE_FIRST_BACKOFF
+        .saturating_mul(2u32.saturating_pow(sends.saturating_sub(1)))
+        .mul_f64(fraction)
+}
+
+pub(crate) fn jitter_fraction() -> f64 {
+    let bits = std::collections::hash_map::RandomState::new().hash_one(());
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+pub(crate) fn refused_before_processing(
+    error: &aws_sdk_glue::error::SdkError<UpdateTableError>,
+) -> bool {
+    matches!(
+        error,
+        aws_sdk_glue::error::SdkError::ServiceError(context)
+            if context.err().code().is_some_and(|code| THROTTLING_ERRORS.contains(&code))
+    )
 }
 
 #[async_trait]
@@ -81,28 +113,59 @@ impl LiveGlueCommitTransport {
             attempts: AtomicU64::new(0),
         }
     }
+
+    async fn send_once(
+        &self,
+        call: &GlueUpdateTableCall,
+    ) -> std::result::Result<(), aws_sdk_glue::error::SdkError<UpdateTableError>> {
+        let mut builder = self
+            .client
+            .update_table()
+            .database_name(call.database_name.clone())
+            .set_skip_archive(Some(true))
+            .table_input(call.table_input.clone());
+        if let Some(version_id) = &call.version_id {
+            builder = builder.version_id(version_id);
+        }
+        let catalog_id = call.catalog_id.clone().or_else(|| self.catalog_id.clone());
+        if let Some(catalog_id) = catalog_id {
+            builder = builder.catalog_id(catalog_id);
+        }
+        builder
+            .customize()
+            .config_override(
+                aws_sdk_glue::config::Builder::default().retry_config(RetryConfig::disabled()),
+            )
+            .send()
+            .await
+            .map(|_| ())
+    }
 }
 
 #[async_trait]
 impl GlueCommitTransport for LiveGlueCommitTransport {
     async fn send_update_table(&self, call: GlueUpdateTableCall) -> GlueCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        let mut builder = self
+        let sleep = self
             .client
-            .update_table()
-            .database_name(call.database_name)
-            .set_skip_archive(Some(true))
-            .table_input(call.table_input);
-        if let Some(version_id) = call.version_id {
-            builder = builder.version_id(version_id);
-        }
-        let catalog_id = call.catalog_id.or_else(|| self.catalog_id.clone());
-        if let Some(catalog_id) = catalog_id {
-            builder = builder.catalog_id(catalog_id);
-        }
-        match builder.send().await {
-            Ok(_) => GlueCommitSend::Success,
-            Err(error) => GlueCommitSend::Transport(Box::new(error)),
+            .config()
+            .sleep_impl()
+            .or_else(default_async_sleep);
+        let mut sends = 0;
+        loop {
+            sends += 1;
+            match self.send_once(&call).await {
+                Ok(()) => return GlueCommitSend::Success,
+                Err(error) if refused_before_processing(&error) => match &sleep {
+                    Some(sleep) if sends < THROTTLE_ATTEMPTS => {
+                        sleep
+                            .sleep(throttle_backoff(sends, jitter_fraction()))
+                            .await;
+                    }
+                    _ => return GlueCommitSend::RefusedBeforeProcessing(Box::new(error), sends),
+                },
+                Err(error) => return GlueCommitSend::Transport(Box::new(error)),
+            }
         }
     }
 
@@ -300,6 +363,14 @@ pub(crate) fn map_glue_commit_send(send: GlueCommitSend, table_ident: &TableIden
         GlueCommitSend::ModeledService(error) => {
             Err(map_update_table_service_error(error, table_ident))
         }
+        GlueCommitSend::RefusedBeforeProcessing(error, sends) => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!(
+                "Commit refused for table {table_ident}: Glue throttled the update on each of \
+                 {sends} sends, and nothing was applied"
+            ),
+        )
+        .with_source(anyhow!("aws sdk error: {error:?}"))),
     }
 }
 
@@ -441,7 +512,245 @@ impl GlueCommitHarness {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_glue::config::http::HttpResponse;
+
     use super::*;
+
+    #[test]
+    fn test_throttled_commit_schedule_is_three_sends_with_full_jitter_from_one_second() {
+        assert_eq!(THROTTLE_ATTEMPTS, 3);
+        assert_eq!(throttle_backoff(1, 0.0), Duration::ZERO);
+        assert_eq!(throttle_backoff(1, 0.5), Duration::from_millis(500));
+        assert_eq!(throttle_backoff(2, 0.5), Duration::from_secs(1));
+        assert_eq!(throttle_backoff(2, 0.75), Duration::from_millis(1500));
+        assert!(throttle_backoff(1, 0.999_999) < Duration::from_secs(1));
+        assert!(throttle_backoff(2, 0.999_999) < Duration::from_secs(2));
+        for _ in 0..1000 {
+            assert!((0.0..1.0).contains(&jitter_fraction()));
+        }
+    }
+
+    fn reply(status: u16, code: &str) -> aws_sdk_glue::error::SdkError<UpdateTableError> {
+        aws_sdk_glue::error::SdkError::service_error(
+            UpdateTableError::generic(
+                aws_sdk_glue::error::ErrorMetadata::builder()
+                    .code(code)
+                    .build(),
+            ),
+            HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into()),
+        )
+    }
+
+    #[test]
+    fn test_only_a_throttle_reply_is_refused_before_processing() {
+        assert!(refused_before_processing(&reply(
+            400,
+            "ThrottlingException"
+        )));
+        assert!(refused_before_processing(&reply(
+            500,
+            "ThrottlingException"
+        )));
+        assert!(!refused_before_processing(&reply(
+            400,
+            "ValidationException"
+        )));
+        assert!(!refused_before_processing(&reply(
+            400,
+            "ConcurrentModificationException"
+        )));
+    }
+
+    #[test]
+    fn test_every_sdk_throttling_code_is_refused_before_processing_on_a_4xx_and_a_5xx() {
+        for code in aws_runtime::retries::classifiers::THROTTLING_ERRORS {
+            for status in [400, 503] {
+                assert!(
+                    refused_before_processing(&reply(status, code)),
+                    "{code} on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_sdk_transient_codes_are_not_refused_before_processing() {
+        for code in ["RequestTimeout", "RequestTimeoutException"] {
+            for status in [400, 503] {
+                assert!(
+                    !refused_before_processing(&reply(status, code)),
+                    "{code} on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_503_slow_down_is_resent_and_a_503_internal_failure_is_maybe_sent() {
+        assert!(refused_before_processing(&reply(503, "SlowDown")));
+        let internal_failure = reply(503, "InternalFailure");
+        assert!(!refused_before_processing(&internal_failure));
+        assert!(matches!(
+            classify_commit_send_disposition(&internal_failure),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert_eq!(
+            map_glue_commit_sdk_error(internal_failure, &test_table_ident()).kind(),
+            ErrorKind::CommitStateUnknown
+        );
+    }
+
+    #[test]
+    fn test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied() {
+        let error = map_glue_commit_send(
+            GlueCommitSend::RefusedBeforeProcessing(
+                Box::new(aws_sdk_glue::error::SdkError::timeout_error(boxed_err(
+                    "throttled",
+                ))),
+                2,
+            ),
+            &test_table_ident(),
+        )
+        .expect_err("an exhausted throttle fails");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(!error.retryable());
+        assert!(error.message().contains("nothing was applied"));
+        assert!(error.message().contains("on each of 2 sends"));
+    }
+
+    async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Option<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(at) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        while buffer.len() < head_end + length {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+        }
+        Some(buffer[head_end..head_end + length].to_vec())
+    }
+
+    async fn throttling_endpoint(throttles: usize) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local endpoint");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the local endpoint address")
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    while let Some(body) = read_request_body(&mut stream).await {
+                        let count = {
+                            let mut seen = seen.lock().expect("the request log");
+                            seen.push(body);
+                            seen.len()
+                        };
+                        let (status, error_type, body) = if count <= throttles {
+                            (
+                                "400 Bad Request",
+                                "x-amzn-errortype: ThrottlingException\r\n",
+                                r#"{"__type":"ThrottlingException","message":"Rate exceeded"}"#,
+                            )
+                        } else {
+                            ("200 OK", "", "{}")
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/x-amz-json-1.1\r\n{error_type}content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if stream.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    fn client_without_a_sleep_impl(url: &str) -> aws_sdk_glue::Client {
+        let config = aws_sdk_glue::Config::builder()
+            .behavior_version(aws_sdk_glue::config::BehaviorVersion::latest())
+            .region(aws_sdk_glue::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_glue::config::Credentials::new(
+                "test-access-key",
+                "test-secret-key",
+                None,
+                None,
+                "test",
+            ))
+            .endpoint_url(url)
+            .build();
+        assert!(config.sleep_impl().is_none());
+        aws_sdk_glue::Client::from_conf(config)
+    }
+
+    fn update_table_call() -> GlueUpdateTableCall {
+        GlueUpdateTableCall {
+            database_name: "ns1".to_string(),
+            table_input: TableInput::builder()
+                .name("test1")
+                .build()
+                .expect("a table input"),
+            version_id: Some("1".to_string()),
+            catalog_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once() {
+        let (url, requests) = throttling_endpoint(2).await;
+        let transport = LiveGlueCommitTransport::new(client_without_a_sleep_impl(&url), None);
+        let send = transport.send_update_table(update_table_call()).await;
+        let requests = requests.lock().expect("the request log").clone();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|body| *body == requests[0]));
+        assert!(matches!(send, GlueCommitSend::Success));
+    }
+
+    #[tokio::test]
+    async fn test_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled()
+     {
+        let (url, requests) = throttling_endpoint(usize::MAX).await;
+        let transport = LiveGlueCommitTransport::new(client_without_a_sleep_impl(&url), None);
+        let send = transport.send_update_table(update_table_call()).await;
+        let sends = requests.lock().expect("the request log").len();
+        let error = map_glue_commit_send(send, &test_table_ident())
+            .expect_err("an exhausted throttle fails");
+        assert!(
+            error
+                .message()
+                .contains(&format!("on each of {sends} sends")),
+            "{sends} sends: {}",
+            error.message()
+        );
+        assert_eq!(sends, 3);
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+    }
 
     fn test_table_ident() -> TableIdent {
         TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")

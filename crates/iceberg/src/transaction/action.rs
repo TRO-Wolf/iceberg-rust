@@ -40,6 +40,9 @@ mod offset_property_retry_tests;
 #[path = "publish_changes.rs"]
 mod publish_changes;
 #[cfg(test)]
+#[path = "rebase_landed_tests.rs"]
+mod rebase_landed_tests;
+#[cfg(test)]
 #[path = "rewrite_manifests_cluster_tests.rs"]
 mod rewrite_manifests_cluster_tests;
 #[cfg(test)]

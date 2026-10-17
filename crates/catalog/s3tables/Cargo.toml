@@ -33,7 +33,9 @@ repository = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true }
+aws-runtime = { workspace = true }
 aws-sdk-s3tables = { workspace = true }
+aws-smithy-async = { workspace = true }
 iceberg = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-s3"] }
 

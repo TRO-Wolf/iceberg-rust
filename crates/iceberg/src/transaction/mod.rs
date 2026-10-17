@@ -143,15 +143,8 @@ pub struct Transaction {
     starting_snapshot_id: Option<i64>,
     starting_ref_snapshot_ids: HashMap<String, i64>,
     actions: Vec<BoxedTransactionAction>,
-    /// The snapshot ids the MOST RECENT `do_commit` attempt handed to `Catalog::update_table`
-    /// (one per `AddSnapshot` update, client-generated before the request). This is the
-    /// reconciliation evidence for an `ErrorKind::CommitStateUnknown` outcome: the commit landed
-    /// iff any of these ids is present in a reloaded table's snapshot set (the Rust equivalent of
-    /// Java `checkCurrentMetadataLocation`'s current-or-`previousFiles()` search — see
-    /// [`commit_status`]). Cleared at the top of every attempt so a failure BEFORE `update_table`
-    /// can never leak a previous attempt's ids into reconciliation; empty means the attempt
-    /// carried no snapshot evidence (metadata-only commit) and is not reconciled.
     latest_attempt_snapshot_ids: Vec<i64>,
+    sent_ids: Vec<i64>,
 }
 
 impl Transaction {
@@ -168,6 +161,7 @@ impl Transaction {
                 .collect(),
             actions: vec![],
             latest_attempt_snapshot_ids: vec![],
+            sent_ids: vec![],
         }
     }
     fn starting_snapshot_for(&self, branch: &str) -> Option<i64> {
@@ -432,7 +426,7 @@ impl Transaction {
         catalog: &dyn Catalog,
         original_error: Error,
     ) -> Result<Table> {
-        if self.latest_attempt_snapshot_ids.is_empty() {
+        if self.sent_ids.is_empty() {
             // No snapshot was attempted (metadata-only commit) — there is no client-visible
             // marker to look for, so the outcome stays unknown. (Named divergence: Java's
             // location-based check covers these; the metadata location is catalog-assigned and
@@ -472,7 +466,7 @@ impl Transaction {
         match commit_status::check_commit_status_strict(
             catalog,
             self.table.identifier(),
-            &self.latest_attempt_snapshot_ids,
+            &self.sent_ids,
             &config,
         )
         .await
@@ -499,11 +493,11 @@ impl Transaction {
     }
 
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
-        // Drop any previous attempt's reconciliation evidence FIRST: if this attempt fails
-        // before its own `update_table` call, stale ids from an attempt that provably did not
-        // land (e.g. a requirement conflict) must not feed reconciliation.
         self.latest_attempt_snapshot_ids.clear();
         let refreshed = catalog.load_table(self.table.identifier()).await?;
+        if commit_status::rejected_attempt_landed(&refreshed, &self.sent_ids) {
+            return Ok(refreshed);
+        }
 
         // Location first (cheap string compare), then deep TableMetadata PartialEq only when
         // the catalog pointer is unchanged. Metadata files are immutable at a given location,
@@ -556,13 +550,11 @@ impl Transaction {
             })
             .collect();
 
-        // Capture the reconciliation evidence BEFORE the request goes out: on an
-        // `ErrorKind::CommitStateUnknown` outcome these ids are what `commit` searches the
-        // reloaded metadata for (see `reconcile_unknown_commit_outcome`).
         self.latest_attempt_snapshot_ids = added_snapshots
             .iter()
             .map(|snapshot| snapshot.snapshot_id())
             .collect();
+        self.sent_ids.extend(&self.latest_attempt_snapshot_ids);
 
         let table_commit = TableCommit::builder()
             .ident(self.table.identifier().to_owned())

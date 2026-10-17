@@ -18,14 +18,22 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::hash::BuildHasher;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use aws_runtime::retries::classifiers::THROTTLING_ERRORS;
+use aws_sdk_s3tables::config::AsyncSleep;
+use aws_sdk_s3tables::config::http::HttpResponse;
+use aws_sdk_s3tables::config::retry::RetryConfig;
+use aws_sdk_s3tables::error::ProvideErrorMetadata;
 use aws_sdk_s3tables::operation::update_table_metadata_location::UpdateTableMetadataLocationError;
+use aws_smithy_async::rt::sleep::default_async_sleep;
 #[cfg(test)]
 use iceberg::table::Table;
 use iceberg::{Error, ErrorKind, Result, TableIdent};
@@ -45,6 +53,35 @@ pub(crate) enum S3TablesCommitSend {
     Transport(Box<aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>>),
     #[allow(dead_code)]
     ModeledService(UpdateTableMetadataLocationError),
+    RefusedBeforeProcessing(
+        Box<aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>>,
+        u32,
+    ),
+}
+
+pub(crate) const THROTTLE_ATTEMPTS: u32 = 3;
+
+const THROTTLE_FIRST_BACKOFF: Duration = Duration::from_secs(1);
+
+pub(crate) fn throttle_backoff(sends: u32, fraction: f64) -> Duration {
+    THROTTLE_FIRST_BACKOFF
+        .saturating_mul(2u32.saturating_pow(sends.saturating_sub(1)))
+        .mul_f64(fraction)
+}
+
+pub(crate) fn jitter_fraction() -> f64 {
+    let bits = std::collections::hash_map::RandomState::new().hash_one(());
+    (bits >> 11) as f64 / (1u64 << 53) as f64
+}
+
+pub(crate) fn refused_before_processing(
+    error: &aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>,
+) -> bool {
+    matches!(
+        error,
+        aws_sdk_s3tables::error::SdkError::ServiceError(context)
+            if context.err().code().is_some_and(|code| THROTTLING_ERRORS.contains(&code))
+    )
 }
 
 #[async_trait]
@@ -60,18 +97,35 @@ pub(crate) enum CommitSendDisposition {
     ResponseReceived,
 }
 
-pub(crate) fn classify_commit_send_disposition<E, R>(
-    error: &aws_sdk_s3tables::error::SdkError<E, R>,
+pub(crate) fn classify_commit_send_disposition<E>(
+    error: &aws_sdk_s3tables::error::SdkError<E, HttpResponse>,
 ) -> CommitSendDisposition {
     use aws_sdk_s3tables::error::SdkError;
     match error {
         SdkError::ConstructionFailure(_) => CommitSendDisposition::NeverSent,
-        SdkError::DispatchFailure(dispatch) if dispatch.is_user() || dispatch.is_other() => {
+        SdkError::DispatchFailure(dispatch)
+            if dispatch.is_user() || connection_refused(dispatch.as_connector_error()) =>
+        {
             CommitSendDisposition::NeverSent
+        }
+        SdkError::ServiceError(context)
+            if context.raw().status().is_success() || context.raw().status().is_server_error() =>
+        {
+            CommitSendDisposition::MaybeSent
         }
         SdkError::ServiceError(_) => CommitSendDisposition::ResponseReceived,
         _ => CommitSendDisposition::MaybeSent,
     }
+}
+
+const MAX_SOURCE_DEPTH: usize = 16;
+
+fn connection_refused(error: Option<&aws_sdk_s3tables::error::ConnectorError>) -> bool {
+    let first = error.and_then(std::error::Error::source);
+    std::iter::successors(first, |error| error.source())
+        .take(MAX_SOURCE_DEPTH)
+        .filter_map(|error| error.downcast_ref::<std::io::Error>())
+        .any(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
 }
 
 pub(crate) struct LiveS3TablesCommitTransport {
@@ -94,23 +148,57 @@ impl LiveS3TablesCommitTransport {
             attempts: AtomicU64::new(0),
         }
     }
+
+    async fn send_once(
+        &self,
+        call: &S3TablesUpdateCall,
+    ) -> std::result::Result<
+        String,
+        aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError>,
+    > {
+        self.client
+            .update_table_metadata_location()
+            .table_bucket_arn(call.table_bucket_arn.clone())
+            .namespace(call.namespace.clone())
+            .name(call.name.clone())
+            .version_token(call.version_token.clone())
+            .metadata_location(call.metadata_location.clone())
+            .customize()
+            .config_override(
+                aws_sdk_s3tables::config::Builder::default().retry_config(RetryConfig::disabled()),
+            )
+            .send()
+            .await
+            .map(|output| output.version_token)
+    }
 }
 
 #[async_trait]
 impl S3TablesCommitTransport for LiveS3TablesCommitTransport {
     async fn send_update_metadata_location(&self, call: S3TablesUpdateCall) -> S3TablesCommitSend {
         self.attempts.fetch_add(1, Ordering::SeqCst);
-        let builder = self
+        let sleep = self
             .client
-            .update_table_metadata_location()
-            .table_bucket_arn(call.table_bucket_arn)
-            .namespace(call.namespace)
-            .name(call.name)
-            .version_token(call.version_token)
-            .metadata_location(call.metadata_location);
-        match builder.send().await {
-            Ok(output) => S3TablesCommitSend::Success(Some(output.version_token)),
-            Err(error) => S3TablesCommitSend::Transport(Box::new(error)),
+            .config()
+            .sleep_impl()
+            .or_else(default_async_sleep);
+        let mut sends = 0;
+        loop {
+            sends += 1;
+            match self.send_once(&call).await {
+                Ok(version_token) => return S3TablesCommitSend::Success(Some(version_token)),
+                Err(error) if refused_before_processing(&error) => match &sleep {
+                    Some(sleep) if sends < THROTTLE_ATTEMPTS => {
+                        sleep
+                            .sleep(throttle_backoff(sends, jitter_fraction()))
+                            .await;
+                    }
+                    _ => {
+                        return S3TablesCommitSend::RefusedBeforeProcessing(Box::new(error), sends);
+                    }
+                },
+                Err(error) => return S3TablesCommitSend::Transport(Box::new(error)),
+            }
         }
     }
 
@@ -293,6 +381,14 @@ pub(crate) fn map_s3tables_commit_send(
         S3TablesCommitSend::ModeledService(error) => Err(
             map_update_table_metadata_location_service_error(error, table_ident),
         ),
+        S3TablesCommitSend::RefusedBeforeProcessing(error, sends) => Err(Error::new(
+            ErrorKind::Unexpected,
+            format!(
+                "Commit refused for table {table_ident}: S3 Tables throttled the update on each \
+                 of {sends} sends, and nothing was applied"
+            ),
+        )
+        .with_source(anyhow::Error::msg(format!("aws sdk error: {error:?}")))),
     }
 }
 
@@ -424,6 +520,124 @@ impl S3TablesCommitHarness {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_throttled_commit_schedule_is_three_sends_with_full_jitter_from_one_second() {
+        assert_eq!(THROTTLE_ATTEMPTS, 3);
+        assert_eq!(throttle_backoff(1, 0.0), Duration::ZERO);
+        assert_eq!(throttle_backoff(1, 0.5), Duration::from_millis(500));
+        assert_eq!(throttle_backoff(2, 0.5), Duration::from_secs(1));
+        assert_eq!(throttle_backoff(2, 0.75), Duration::from_millis(1500));
+        assert!(throttle_backoff(1, 0.999_999) < Duration::from_secs(1));
+        assert!(throttle_backoff(2, 0.999_999) < Duration::from_secs(2));
+        for _ in 0..1000 {
+            assert!((0.0..1.0).contains(&jitter_fraction()));
+        }
+    }
+
+    fn meta(code: &str) -> aws_sdk_s3tables::error::ErrorMetadata {
+        aws_sdk_s3tables::error::ErrorMetadata::builder()
+            .code(code)
+            .build()
+    }
+
+    fn reply(
+        status: u16,
+        error: UpdateTableMetadataLocationError,
+    ) -> aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError> {
+        aws_sdk_s3tables::error::SdkError::service_error(
+            error,
+            HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into()),
+        )
+    }
+
+    fn coded(
+        status: u16,
+        code: &str,
+    ) -> aws_sdk_s3tables::error::SdkError<UpdateTableMetadataLocationError> {
+        reply(
+            status,
+            UpdateTableMetadataLocationError::generic(meta(code)),
+        )
+    }
+
+    #[test]
+    fn test_only_a_throttle_reply_is_refused_before_processing() {
+        let throttle = || {
+            UpdateTableMetadataLocationError::TooManyRequestsException(
+                aws_sdk_s3tables::types::error::TooManyRequestsException::builder()
+                    .meta(meta("TooManyRequestsException"))
+                    .build(),
+            )
+        };
+        assert!(refused_before_processing(&reply(429, throttle())));
+        assert!(refused_before_processing(&reply(503, throttle())));
+        assert!(!refused_before_processing(&reply(
+            409,
+            UpdateTableMetadataLocationError::ConflictException(
+                aws_sdk_s3tables::types::error::ConflictException::builder()
+                    .meta(meta("ConflictException"))
+                    .build(),
+            )
+        )));
+    }
+
+    #[test]
+    fn test_every_sdk_throttling_code_is_refused_before_processing_on_a_4xx_and_a_5xx() {
+        for code in aws_runtime::retries::classifiers::THROTTLING_ERRORS {
+            for status in [400, 503] {
+                assert!(
+                    refused_before_processing(&coded(status, code)),
+                    "{code} on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_sdk_transient_codes_are_not_refused_before_processing() {
+        for code in ["RequestTimeout", "RequestTimeoutException"] {
+            for status in [400, 503] {
+                assert!(
+                    !refused_before_processing(&coded(status, code)),
+                    "{code} on {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_503_slow_down_is_resent_and_a_503_internal_failure_is_maybe_sent() {
+        assert!(refused_before_processing(&coded(503, "SlowDown")));
+        let internal_failure = coded(503, "InternalFailure");
+        assert!(!refused_before_processing(&internal_failure));
+        assert!(matches!(
+            classify_commit_send_disposition(&internal_failure),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert_eq!(
+            map_s3tables_commit_sdk_error(internal_failure, &test_table_ident()).kind(),
+            ErrorKind::CommitStateUnknown
+        );
+    }
+
+    #[test]
+    fn test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied() {
+        let error = map_s3tables_commit_send(
+            S3TablesCommitSend::RefusedBeforeProcessing(
+                Box::new(aws_sdk_s3tables::error::SdkError::timeout_error(boxed_err(
+                    "throttled",
+                ))),
+                2,
+            ),
+            &test_table_ident(),
+        )
+        .expect_err("an exhausted throttle fails");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(!error.retryable());
+        assert!(error.message().contains("nothing was applied"));
+        assert!(error.message().contains("on each of 2 sends"));
+    }
+
     fn test_table_ident() -> TableIdent {
         TableIdent::from_strs(["ns1", "test1"]).expect("build test table ident")
     }
@@ -480,7 +694,10 @@ mod tests {
     #[test]
     fn test_commit_send_disposition_split() {
         use aws_sdk_s3tables::error::ConnectorError;
-        type TestSdkError = aws_sdk_s3tables::error::SdkError<(), ()>;
+        type TestSdkError = aws_sdk_s3tables::error::SdkError<(), HttpResponse>;
+        fn response(status: u16) -> HttpResponse {
+            HttpResponse::new(status.try_into().expect("a valid HTTP status"), "".into())
+        }
         fn boxed(msg: &str) -> Box<dyn std::error::Error + Send + Sync> {
             msg.to_string().into()
         }
@@ -496,9 +713,15 @@ mod tests {
             CommitSendDisposition::MaybeSent
         ));
         assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::timeout(boxed("stalled"))
+            )),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
             classify_commit_send_disposition(&TestSdkError::response_error(
                 boxed("unparsable response"),
-                ()
+                response(200)
             )),
             CommitSendDisposition::MaybeSent
         ));
@@ -515,8 +738,63 @@ mod tests {
             CommitSendDisposition::NeverSent
         ));
         assert!(matches!(
-            classify_commit_send_disposition(&TestSdkError::service_error((), ())),
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(400))),
             CommitSendDisposition::ResponseReceived
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(409))),
+            CommitSendDisposition::ResponseReceived
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(200))),
+            CommitSendDisposition::MaybeSent
+        ));
+        for status in [201, 299] {
+            assert!(
+                matches!(
+                    classify_commit_send_disposition(&TestSdkError::service_error(
+                        (),
+                        response(status)
+                    )),
+                    CommitSendDisposition::MaybeSent
+                ),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(500))),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::service_error((), response(503))),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::other(
+                    boxed("connection closed before message completed"),
+                    Some(aws_config::retry::ErrorKind::TransientError),
+                )
+            )),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(
+                ConnectorError::other(boxed("unrecognized"), None)
+            )),
+            CommitSendDisposition::MaybeSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(
+                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+            ))),
+            CommitSendDisposition::NeverSent
+        ));
+        assert!(matches!(
+            classify_commit_send_disposition(&TestSdkError::dispatch_failure(ConnectorError::io(
+                Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            ))),
+            CommitSendDisposition::MaybeSent
         ));
     }
 

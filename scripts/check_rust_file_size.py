@@ -98,7 +98,7 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/transaction/expire_cleanup.rs": 1857,
     "crates/iceberg/src/transaction/expire_snapshots.rs": 1388,
     "crates/iceberg/src/transaction/manage_snapshots.rs": 1250,
-    "crates/iceberg/src/transaction/mod.rs": 1936,
+    "crates/iceberg/src/transaction/mod.rs": 1928,
     "crates/iceberg/src/transaction/overwrite_files.rs": 3383,
     "crates/iceberg/src/transaction/replace_partitions.rs": 2782,
     "crates/iceberg/src/transaction/rewrite_files.rs": 2458,

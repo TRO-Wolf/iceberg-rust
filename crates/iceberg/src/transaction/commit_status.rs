@@ -230,10 +230,7 @@ pub(crate) async fn check_commit_status_strict(
             Ok(reloaded) => {
                 // One SUCCESSFUL refresh decides: Java's Tasks loop retries only thrown
                 // failures — a supplier returning false completes with FAILURE after one read.
-                let landed = attempted_snapshot_ids
-                    .iter()
-                    .any(|id| reloaded.metadata().snapshot_by_id(*id).is_some());
-                return if landed {
+                return if holds_any_snapshot(&reloaded, attempted_snapshot_ids) {
                     tracing::info!(
                         table = %table_ident,
                         "commit status check: the ambiguous commit is present in the reloaded \
@@ -271,6 +268,23 @@ pub(crate) async fn check_commit_status_strict(
             }
         }
     }
+}
+
+pub(crate) fn rejected_attempt_landed(refreshed: &Table, sent_snapshot_ids: &[i64]) -> bool {
+    let landed = holds_any_snapshot(refreshed, sent_snapshot_ids);
+    if landed {
+        tracing::info!(
+            table = %refreshed.identifier(),
+            "a rejected commit attempt is in the refreshed table: it landed and is not re-applied"
+        );
+    }
+    landed
+}
+
+fn holds_any_snapshot(table: &Table, snapshot_ids: &[i64]) -> bool {
+    snapshot_ids
+        .iter()
+        .any(|id| table.metadata().snapshot_by_id(*id).is_some())
 }
 
 #[cfg(test)]
