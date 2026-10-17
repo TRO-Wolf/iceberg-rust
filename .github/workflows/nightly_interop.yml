@@ -117,6 +117,10 @@ jobs:
           # suite invocations find a fully-populated ~/.m2.
           export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
           /opt/maven/bin/mvn -B -q -f dev/java-interop dependency:go-offline compile exec:help
+          ICEBERG_VERSION="$(sed -n 's:.*<iceberg.version>\(.*\)</iceberg.version>.*:\1:p' dev/java-interop/pom.xml)"
+          test -n "${ICEBERG_VERSION}"
+          /opt/maven/bin/mvn -B -q -f dev/java-interop dependency:get \
+            -Dartifact="org.apache.iceberg:iceberg-aws:${ICEBERG_VERSION}" -Dtransitive=false
 
       - name: Driver self-test (discovery / floor / hard-fail mechanics)
         run: make interop-selftest

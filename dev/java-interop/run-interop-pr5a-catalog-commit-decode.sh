@@ -33,7 +33,7 @@ CORE_JAR="${HOME}/.m2/repository/org/apache/iceberg/iceberg-core/1.10.0/iceberg-
 
 echo "==> [1/4] Prerequisites"
 test -x "${JAVAP}" || { echo "FAIL missing javap at ${JAVAP}"; exit 1; }
-test -f "${AWS_JAR}" || { echo "FAIL missing iceberg-aws 1.10.0 jar"; exit 1; }
+test -f "${AWS_JAR}" || { echo "FAIL missing iceberg-aws 1.10.0 jar; fetch it with: mvn dependency:get -Dartifact=org.apache.iceberg:iceberg-aws:1.10.0 -Dtransitive=false"; exit 1; }
 test -f "${CORE_JAR}" || { echo "FAIL missing iceberg-core 1.10.0 jar"; exit 1; }
 
 rm -rf "${TMP}"
