@@ -69,3 +69,26 @@ This ledger retires when the three pull requests land and the weekly run reports
   - `HOME=<dir whose .m2 holds only the dependency:get jar and the iceberg-core jar>`:
     `pr5a-catalog-commit-decode: 12 needles`, `OK`, exit 0. `javap` does not resolve the SDK
     classes it names, so the jar alone is enough.
+
+### A2 — the validate-append-only Rust mirror declares its partitioning
+
+- **Cause.** Since `2c50c6bfa` (2026-08-28) `DataFileWriterBuilder::build` refuses a writer that
+  has neither `.unpartitioned()`, `.with_partition_spec(...)` nor a `PartitionKey`. The mirror's
+  `write_file` helper called `.build(partition_key.cloned())` for both table shapes, so the first
+  unpartitioned case panicked at `interop_validate_append_only.rs:293`. The Java leg passed 4 of 4.
+- **Fix.** `write_file` branches on `partition_key`: `Some(key)` builds with `Some(key)` (the
+  `interop_v3_maintenance.rs` form), `None` builds `.unpartitioned().build(None)` (the
+  `engine_contract_isolation_recipes.rs` form). Nothing else in the test changed.
+
+**Evidence (2026-10-17).**
+
+- `origin/main` test source, same Java-written case directory:
+  `panicked at crates/iceberg/tests/interop_validate_append_only.rs:293:10: build data file
+  writer: DataInvalid => writer was built with neither a PartitionSpec nor a PartitionKey`.
+  `test result: FAILED. 0 passed; 1 failed`.
+- With the fix, `scripts/run_interop_suites.sh --only
+  run-interop-validate-append-only.sh,run-interop-pr5a-catalog-commit-decode.sh`: both PASS
+  (`TOTAL: 2 passed, 0 failed, 2 run, 65 discovered (floor 65)`). The append-only suite shows
+  `verify-interop-validate-append-only: 0 failures` (Java), `test result: ok. 1 passed` (Rust),
+  and both sabotage legs fail closed (`FAIL validate-append-only[matching_partition]: outcome
+  THROW but expected COMMIT` on each side).
