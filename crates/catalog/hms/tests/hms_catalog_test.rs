@@ -32,7 +32,8 @@ use iceberg_catalog_hms::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use iceberg_test_utils::{
-    cleanup_namespace, get_hms_endpoint, get_minio_endpoint, normalize_test_name_with_parts, set_up,
+    cleanup_namespace, get_hms_endpoint, get_object_store_endpoint, normalize_test_name_with_parts,
+    set_up,
 };
 use tokio::time::sleep;
 use tracing::info;
@@ -43,7 +44,7 @@ async fn get_catalog() -> HmsCatalog {
     set_up();
 
     let hms_endpoint = get_hms_endpoint();
-    let minio_endpoint = get_minio_endpoint();
+    let object_store_endpoint = get_object_store_endpoint();
 
     let props = HashMap::from([
         (HMS_CATALOG_PROP_URI.to_string(), hms_endpoint),
@@ -55,7 +56,7 @@ async fn get_catalog() -> HmsCatalog {
             HMS_CATALOG_PROP_WAREHOUSE.to_string(),
             "s3a://warehouse/hive".to_string(),
         ),
-        (S3_ENDPOINT.to_string(), minio_endpoint),
+        (S3_ENDPOINT.to_string(), object_store_endpoint),
         (S3_ACCESS_KEY_ID.to_string(), "admin".to_string()),
         (S3_SECRET_ACCESS_KEY.to_string(), "password".to_string()),
         (S3_REGION.to_string(), "us-east-1".to_string()),
