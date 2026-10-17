@@ -267,7 +267,7 @@ cargo fmt --all -- --check
   `substrait`, whose build needs the Protobuf compiler. If `protoc` is unavailable, the core surface
   still builds/tests via `cargo test --workspace --exclude iceberg-sqllogictest`. Install
   `protobuf-compiler` to run the full suite.
-- **`make test` starts Docker** (`docker-up`) for integration suites (REST fixture, MinIO, etc.).
+- **`make test` starts Docker** (`docker-up`) for integration suites (REST fixture, RustFS object store, etc.).
   AWS/Glue/S3-Tables integration tests need real credentials and are not part of the offline gate.
 - **Formatter:** [rustfmt.toml](rustfmt.toml) (`StdExternalCrate` import grouping, module granularity).
   **TOML:** `taplo`. **Unused deps:** `cargo machete`. **Prose:** `typos`.
