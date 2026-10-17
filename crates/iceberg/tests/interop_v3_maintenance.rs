@@ -49,11 +49,12 @@ use tempfile::TempDir;
 
 type Row = (i64, i64, i64);
 
-const SEED_NEXT_ROW_ID: i64 = 12;
-const M1_NEXT_ROW_ID: i64 = 24;
-const M2_NEXT_ROW_ID: i64 = 36;
-const M3_NEXT_ROW_ID: i64 = 12;
-const M4_NEXT_ROW_ID: i64 = 24;
+const SEED_DATA_FILE_ROWS: i64 = 12;
+const SEED_NEXT_ROW_ID: i64 = SEED_DATA_FILE_ROWS;
+const M1_NEXT_ROW_ID: i64 = SEED_NEXT_ROW_ID + SEED_DATA_FILE_ROWS;
+const M2_NEXT_ROW_ID: i64 = M1_NEXT_ROW_ID + SEED_DATA_FILE_ROWS;
+const M3_NEXT_ROW_ID: i64 = SEED_NEXT_ROW_ID;
+const M4_NEXT_ROW_ID: i64 = M3_NEXT_ROW_ID + SEED_DATA_FILE_ROWS;
 
 fn maintenance_dir() -> Option<PathBuf> {
     std::env::var_os("ICEBERG_INTEROP_V3_MAINTENANCE_DIR")
@@ -496,9 +497,49 @@ async fn manifest_row_id_end(table: &Table) -> i64 {
     end
 }
 
+async fn rows_numbered_by_current_snapshot(table: &Table) -> (u64, u64, u64) {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("the table has a current snapshot");
+    let (snapshot_first_row_id, snapshot_added_rows) = snapshot
+        .row_range()
+        .expect("a V3 snapshot carries first-row-id and added-rows");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), table.metadata())
+        .await
+        .expect("load the manifest list");
+    let numbered_rows = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+        .filter(|manifest| {
+            manifest
+                .first_row_id
+                .is_some_and(|first| first >= snapshot_first_row_id)
+        })
+        .map(|manifest| {
+            manifest.added_rows_count.unwrap_or(0) + manifest.existing_rows_count.unwrap_or(0)
+        })
+        .sum();
+    (snapshot_first_row_id, snapshot_added_rows, numbered_rows)
+}
+
 async fn assert_row_id_accounting(table: &Table, expected: i64, stage: &str) {
     let next_row_id = i64::try_from(table.metadata().next_row_id()).expect("next_row_id fits i64");
     assert_eq!(next_row_id, expected, "{stage}: next_row_id");
+    let (snapshot_first_row_id, snapshot_added_rows, numbered_rows) =
+        rows_numbered_by_current_snapshot(table).await;
+    assert_eq!(
+        snapshot_added_rows, numbered_rows,
+        "{stage}: the snapshot's added-rows must equal the added plus existing rows of the data \
+         manifests it numbered, and of no carried manifest"
+    );
+    assert_eq!(
+        table.metadata().next_row_id(),
+        snapshot_first_row_id + numbered_rows,
+        "{stage}: next_row_id must be the snapshot's first-row-id plus the rows it numbered"
+    );
     assert_eq!(
         manifest_row_id_end(table).await,
         next_row_id,

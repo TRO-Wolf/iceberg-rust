@@ -29759,9 +29759,14 @@ public final class InteropOracle {
         Path workDir = dir.resolve("java_confirm").resolve("m1");
         BaseTable table = loadWritable(source, workDir, "java_confirm_m1");
         long before = table.operations().current().nextRowId();
+        java.util.Set<DataFile> toDelete = new java.util.LinkedHashSet<>();
+        java.util.Set<DataFile> toAdd = new java.util.LinkedHashSet<>();
         for (long grp : new long[] {1L, 2L}) {
-          compactOnePartition(table, workDir, grp);
+          compactOnePartition(table, workDir, grp, toDelete, toAdd);
         }
+        long sequenceNumber = table.currentSnapshot().sequenceNumber();
+        table.newRewrite().rewriteFiles(toDelete, toAdd, sequenceNumber).commit();
+        table.refresh();
         long javaNextRowId = table.operations().current().nextRowId();
         if (javaNextRowId != rustNextRowId) {
           System.out.println(
@@ -29784,7 +29789,7 @@ public final class InteropOracle {
                 + before
                 + " to "
                 + javaNextRowId
-                + " after two per-partition rewrites");
+                + " after one rewrite commit over both partitions");
         return 0;
       } catch (RuntimeException | IOException error) {
         System.out.println("FAIL v3-maintenance confirm " + tag + ": unexpected error " + error);
@@ -29792,16 +29797,21 @@ public final class InteropOracle {
       }
     }
 
-    private static void compactOnePartition(BaseTable table, Path workDir, long grp)
+    private static void compactOnePartition(
+        BaseTable table,
+        Path workDir,
+        long grp,
+        java.util.Set<DataFile> toDelete,
+        java.util.Set<DataFile> toAdd)
         throws IOException {
       PartitionSpec spec = table.spec();
-      java.util.Set<DataFile> toDelete = new java.util.LinkedHashSet<>();
+      int deletedBefore = toDelete.size();
       for (DataFile file : liveDataFiles(table)) {
         if (file.partition().get(0, Long.class) == grp) {
           toDelete.add(file);
         }
       }
-      if (toDelete.isEmpty()) {
+      if (toDelete.size() == deletedBefore) {
         throw new IOException("no live data file in partition " + grp);
       }
       List<Record> records = new ArrayList<>();
@@ -29825,11 +29835,7 @@ public final class InteropOracle {
       try (Closeable toClose = writer) {
         writer.write(records);
       }
-      java.util.Set<DataFile> toAdd = new java.util.LinkedHashSet<>();
       toAdd.add(writer.toDataFile());
-      long sequenceNumber = table.currentSnapshot().sequenceNumber();
-      table.newRewrite().rewriteFiles(toDelete, toAdd, sequenceNumber).commit();
-      table.refresh();
     }
 
     private static void printManifests(BaseTable table, String tag) throws IOException {
