@@ -112,3 +112,6 @@ names this.
   `false` (the commit keeps the DV, the pre-F-DANGLING-DV-COMMIT-1 behaviour), GEN dir set:
   1 red out of 2 — `test_remove_dangling_gen` panics in `assert_pruned_at_commit` with live delete
   partitions `{"dv", "dk"}`. Restored; 2 of 2 green.
+- File-size ratchet: `interop_remove_dangling.rs` fell from 1018 to 1000 lines, inside the default
+  ceiling, so its legacy row in `scripts/check_rust_file_size.py` is removed (the checker demands
+  it).
