@@ -52,20 +52,12 @@
 //!
 //! | partition | data seq(s) | delete (seq)            | declared | reason                                        |
 //! |-----------|-------------|-------------------------|----------|-----------------------------------------------|
-//! | `dv`      | 1 → 3 (rw)  | DV on the rewritten file| REMOVE\* | referenced data file gone                     |
 //! | `dk`      | 1           | DV on the live file     | KEEP     | referenced data file live                     |
-//!
-//! \* THE V3 DV DIVERGENCE. Java `ManifestFilterManager` AUTO-PRUNES a dangling DV at the commit that
-//! removes its referenced data file. Rust's `RewriteFiles` carry-posture does not, and leaves the
-//! dangling DV for this action. So the `dv` REMOVE is reachable on the Rust-built table, while over
-//! the Java-built table this action correctly removes NOTHING and agrees with Java's clean state.
-//! See [`Origin`].
 //!
 //! `pk` and `er` are the two off-by-one boundaries, one per content type. Each commits the data file
 //! and its delete in ONE `row_delta`, so they share a sequence number and the delete sits at the
 //! exact partition min. Flipping the position branch `<` to `<=` resurrects `pk`'s masked row, and
-//! flipping the equality branch `<=` to `<` strands `er`. `pr` and `dv` dangle through a fresh-seq
-//! rewrite that lifts the partition min above the delete's seq, or replaces the referenced file.
+//! flipping the equality branch `<=` to `<` strands `er`.
 //! `ne` never held live data, and `nb` holds ballast so the V2 live row set is non-trivial.
 //!
 //! ## Read-identity
@@ -124,6 +116,7 @@ enum Verdict {
     Keep,
     /// The delete is dangling — it MUST be removed by the action.
     Remove,
+    PrunedAtCommit,
 }
 
 /// One scenario partition: its `cat` value, the delete's content kind, and the hand-declared verdict.
@@ -178,7 +171,7 @@ fn scenarios(world: &World) -> Vec<Scenario> {
             Scenario {
                 cat: "dv",
                 kind: DeleteKind::DeletionVector,
-                verdict: Verdict::Remove,
+                verdict: Verdict::PrunedAtCommit,
             },
             Scenario {
                 cat: "dk",
@@ -600,7 +593,6 @@ async fn build_v2_world(catalog: &impl Catalog, mut table: Table) -> Table {
     table
 }
 
-/// The V3 world: dv (DV REMOVE — referenced file rewritten away) and dk (DV KEEP — referenced file live).
 async fn build_v3_world(catalog: &impl Catalog, mut table: Table) -> Table {
     // --- Commit 1 (seq 1): base data for dv (rewritten away in commit 3) + dk (stays live).
     let dv = write_data_file(&table, "dv", &[(600, 10), (620, 20), (630, 30)]).await;
@@ -614,7 +606,6 @@ async fn build_v3_world(catalog: &impl Catalog, mut table: Table) -> Table {
     let dk_del = write_dv_file(&table, "dk", &dk_path, &[1]).await; // deletes id=720
     table = row_delta(catalog, &table, vec![], vec![dv_del, dk_del]).await;
 
-    // --- Commit 3 (seq 3): FRESH-seq rewrite dv → dv' (the dv-DV's referenced file is now gone ⇒ dangling).
     let dv_prime = write_data_file(&table, "dv", &[(600, 10), (620, 20), (630, 30)]).await;
     table = rewrite_fresh(catalog, &table, vec![dv.clone()], vec![dv_prime]).await;
 
@@ -770,13 +761,14 @@ async fn test_remove_dangling_gen() {
             "GEN sanity ({}): PRE-cleanup live ids must equal the hand-declared set",
             pre_name
         );
+        assert_pruned_at_commit(&pre, &world).await;
 
         // Run the action and assert the full contract.
         let result = RemoveDanglingDeleteFiles::new(pre.clone())
             .execute(&catalog)
             .await
             .expect("run RemoveDanglingDeleteFiles");
-        assert_action_contract(&result, &world, Origin::RustBuilt, &pre, &catalog).await;
+        assert_action_contract(&result, &world, &pre, &catalog).await;
 
         // Java reads the dangling PRE table and the cleaned table together, so the cleaned state needs
         // its own on-disk table. Rebuild the world and run the action on the copy.
@@ -792,9 +784,10 @@ async fn test_remove_dangling_gen() {
             .execute(&catalog)
             .await
             .expect("run RemoveDanglingDeleteFiles on the cleaned-table world");
-        assert!(
-            !cleaned_result.removed_delete_files.is_empty(),
-            "the cleaned-table world ({}) must have removed danglers",
+        assert_eq!(
+            cleaned_result.removed_delete_files.len(),
+            remove_scenarios(&world).len(),
+            "the cleaned-table world ({}) must remove exactly the hand-declared REMOVE set",
             cleaned_name
         );
         let cleaned = catalog
@@ -888,7 +881,7 @@ async fn test_rust_validates_java_remove_dangling() {
             .execute(&catalog)
             .await
             .expect("run RemoveDanglingDeleteFiles on the Java table");
-        assert_action_contract(&result, &world, Origin::JavaBuilt, &table, &catalog).await;
+        assert_action_contract(&result, &world, &table, &catalog).await;
 
         // Read-identity: the post-action live id set is IDENTICAL (no resurrection, no loss).
         let cleaned = catalog
@@ -912,45 +905,35 @@ async fn test_rust_validates_java_remove_dangling() {
 
 // The shared contract assertion — removed == REMOVE set, survivors == KEEP set, per-content counters.
 
-/// Which engine BUILT the table under test — selects the V3 DV expectation. Java AUTO-PRUNES a dangling
-/// DV at the commit that removes its referenced data file (1.10.0 `ManifestFilterManager`); Rust's
-/// `RewriteFiles` carry-posture does NOT, leaving the dangling DV for this action. So on the JAVA-built
-/// V3 table the `dv` DV is already gone (the action removes NOTHING and only the `dk` DV is live), whereas
-/// on the RUST-built V3 table the action removes the persisted `dv` DV. This is the 1:1-faithful
-/// divergence the action exists to bridge for DVs — documented, not hidden.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Origin {
-    RustBuilt,
-    JavaBuilt,
-}
-
-/// The scenarios that are actually PRESENT-AND-DANGLING on a table built by `origin` for `world`. For the
-/// JAVA-built V3 table the `dv` DV was auto-pruned at commit, so it is neither removed nor surviving.
-fn effective_remove_scenarios(world: &World, origin: Origin) -> Vec<Scenario> {
+fn remove_scenarios(world: &World) -> Vec<Scenario> {
     scenarios(world)
         .into_iter()
         .filter(|s| s.verdict == Verdict::Remove)
-        .filter(|s| {
-            !(origin == Origin::JavaBuilt
-                && world.format_version == FormatVersion::V3
-                && s.kind == DeleteKind::DeletionVector)
-        })
         .collect()
 }
 
-/// Assert the action's outcome matches the hand-declared scenario contract: the REMOVED delete files are
-/// EXACTLY the (origin-effective) REMOVE-verdict partitions; the SURVIVING delete files are EXACTLY the
-/// KEEP-verdict partitions; and the per-content-type counters match. `table` is the PRE-cleanup table the
-/// action ran on; `catalog` reloads the cleaned head for the survivor check.
+async fn assert_pruned_at_commit(table: &Table, world: &World) {
+    let live_cats: HashSet<String> = live_deletes_by_cat(table).await.into_keys().collect();
+    let pruned_cats: HashSet<String> = scenarios(world)
+        .into_iter()
+        .filter(|s| s.verdict == Verdict::PrunedAtCommit)
+        .map(|s| s.cat.to_string())
+        .collect();
+    assert!(
+        live_cats.is_disjoint(&pruned_cats),
+        "the commit that removed a data file must drop its DV: live delete partitions {live_cats:?} \
+         include a pruned-at-commit partition from {pruned_cats:?}"
+    );
+}
+
 async fn assert_action_contract(
     result: &iceberg::maintenance::RemoveDanglingDeleteFilesResult,
     world: &World,
-    origin: Origin,
     table: &Table,
     catalog: &impl Catalog,
 ) {
     let scen = scenarios(world);
-    let removed_scenarios = effective_remove_scenarios(world, origin);
+    let removed_scenarios = remove_scenarios(world);
 
     // Removed set by partition cat.
     let removed_cats: HashSet<String> = result
@@ -964,7 +947,7 @@ async fn assert_action_contract(
         .collect();
     assert_eq!(
         removed_cats, expected_removed,
-        "the REMOVED partitions must equal the hand-declared REMOVE set (origin {origin:?})"
+        "the REMOVED partitions must equal the hand-declared REMOVE set"
     );
 
     // Surviving delete files by partition cat (the KEEP set — same on both engines).
@@ -983,7 +966,6 @@ async fn assert_action_contract(
         "the SURVIVING delete-file partitions must equal the hand-declared KEEP set"
     );
 
-    // Per-content-type counters (over the origin-effective removed set).
     let expect_count =
         |kind: DeleteKind| -> usize { removed_scenarios.iter().filter(|s| s.kind == kind).count() };
     assert_eq!(

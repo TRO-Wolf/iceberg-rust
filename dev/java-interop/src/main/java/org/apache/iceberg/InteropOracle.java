@@ -21733,28 +21733,9 @@ public final class InteropOracle {
       return List.of(V2_WORLD, V3_WORLD);
     }
 
-    // THE V3 DV DIVERGENCE (1:1-faithful, the reason this action exists for DVs). Java AUTO-PRUNES a
-    // dangling DV at the commit that removes its referenced data file (1.10.0 `ManifestFilterManager`
-    // prunes DVs whose referenced file is gone — `isDanglingDV` gated on PUFFIN). Rust's `RewriteFiles`
-    // carry-posture does NOT, leaving the dangling DV for `RemoveDanglingDeleteFiles` to clean. So:
-    //   - the RUST-built rust_table_v3 PERSISTS a dangling `dv` DV  ⇒ its dangling set is {dv} (verify/D2).
-    //   - the JAVA-built table_v3 has the `dv` DV auto-pruned at commit ⇒ its dangling set is {} (generate
-    //     self-check + Rust's D1 over it, where Rust's action correctly removes NOTHING — agreeing with
-    //     Java's already-clean state). The DV-REMOVE e2e is the D2 headline; D1 documents the divergence.
-
-    /** The hand-declared REMOVE-verdict `cat` values for the RUST-built table of `world` (D2 verify). */
-    private static java.util.Set<String> removeCatsRust(WorldSpec world) {
+    private static java.util.Set<String> removeCats(WorldSpec world) {
       if (world.formatVersion.equals("3")) {
-        return new java.util.LinkedHashSet<>(List.of("dv"));
-      }
-      return new java.util.LinkedHashSet<>(List.of("pr", "er", "ne"));
-    }
-
-    /** The hand-declared REMOVE-verdict `cat` values for the JAVA-built table of `world` (generate
-     * self-check). Empty for V3 (Java auto-prunes the dangling DV at commit — the divergence). */
-    private static java.util.Set<String> removeCatsJava(WorldSpec world) {
-      if (world.formatVersion.equals("3")) {
-        return new java.util.LinkedHashSet<>(); // Java auto-pruned the dangling dv DV at commit.
+        return new java.util.LinkedHashSet<>();
       }
       return new java.util.LinkedHashSet<>(List.of("pr", "er", "ne"));
     }
@@ -21819,14 +21800,14 @@ public final class InteropOracle {
         BaseTable reloaded =
             new BaseTable(new InMemoryInspectionOperations(ops.current(), new LocalFileIO()), "rd");
         java.util.Set<String> danglingCats = danglingCats(reloaded);
-        if (!danglingCats.equals(removeCatsJava(world))) {
+        if (!danglingCats.equals(removeCats(world))) {
           throw new IOException(
               "GEN self-check failed (table"
                   + world.suffix
                   + "): findDanglingDeletes = "
                   + danglingCats
-                  + " but hand-declared REMOVE (Java-built) = "
-                  + removeCatsJava(world));
+                  + " but hand-declared REMOVE = "
+                  + removeCats(world));
         }
         java.util.Set<Long> liveIds = liveIds(reloaded);
         if (!liveIds.equals(expectedLiveIds(world))) {
@@ -21842,8 +21823,8 @@ public final class InteropOracle {
         System.out.println(
             "generated remove-dangling world table"
                 + world.suffix
-                + " (REMOVE[Java-built]="
-                + removeCatsJava(world)
+                + " (REMOVE="
+                + removeCats(world)
                 + ", KEEP="
                 + keepCats(world)
                 + ", live ids="
@@ -21994,11 +21975,8 @@ public final class InteropOracle {
           BaseTable pre = loadTable(preMeta);
           BaseTable cleaned = loadTable(cleanedMeta);
 
-          // (1) SEMANTICS-MATCH: Java's INDEPENDENT findDanglingDeletes over the RUST-built PRE table ==
-          // the hand-declared REMOVE set for the Rust-built table (V3 = {dv} — Rust's carry-posture
-          // persists the dangling DV that Java would auto-prune; that is the gap this action closes).
           java.util.Set<String> dangling = danglingCats(pre);
-          if (dangling.equals(removeCatsRust(world))) {
+          if (dangling.equals(removeCats(world))) {
             System.out.println(
                 "PASS " + tag + ": findDanglingDeletes = " + dangling + " matches hand-declared REMOVE");
           } else {
@@ -22008,7 +21986,7 @@ public final class InteropOracle {
                     + ": findDanglingDeletes = "
                     + dangling
                     + " but hand-declared REMOVE = "
-                    + removeCatsRust(world));
+                    + removeCats(world));
             failures++;
           }
 
