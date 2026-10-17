@@ -71,6 +71,9 @@ jobs:
       - name: Check agent artifacts
         run: make check-agent-artifacts
 
+      - name: Check model ban
+        run: make check-model-ban
+
       - name: Check GAP_MATRIX anchors
         run: make check-matrix-anchors
 
