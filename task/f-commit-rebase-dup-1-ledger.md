@@ -761,3 +761,108 @@ to the pinned `076d5f98` without the override and to the fork's local path with 
 
 No test is green without the override and red with it. RePark's `Cargo.lock` was restored, and the
 clone is clean.
+
+## Owner ruling 137, 2026-10-17
+
+The re-verifier failed `3e3aad98` on two findings. R1: an S3 Tables client passed to
+`S3TablesCatalogBuilder::with_client` and built with no `sleep_impl` got one send, not three, on a
+throttle, and the exhausted message still said three. R2: narrowing the S3 Tables 2xx rule to
+exactly 200 survived every test. The ruling, verbatim:
+
+```
+Q137 → Fable looked. The no-sleep branch is real in both commit
+transports but unreachable: every client the fork builds comes from
+the SDK defaults with the Tokio feature on, which installs the sleep
+function, and the SDK refuses to build a client with retries on and
+no sleep. So the old code never handled that case; it could not build
+that client. One small round, three items:
+  - fall back to the SDK's default_async_sleep() when the client has
+    none; aws-smithy-async 1.3.0 is already in the lock, add it to the
+    workspace deps the way aws-runtime was under 130;
+  - the exhausted message reports the actual number of sends;
+  - the missing test.
+  Scoped re-verifier on those three only. PASS → ask me about the fork
+  push and the rev bump.
+```
+
+Commits: `3815ab239a2f` (the pins, red on `3e3aad98`), `8b76b81ad576` (the fix).
+
+### Red first, on `3e3aad98`
+
+| Pin | On `3e3aad98` |
+|---|---|
+| S3 Tables drill `s3tables_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once`: a client built with `aws_sdk_s3tables::Config::builder()` and no `sleep_impl` (asserted), passed through `with_client`; 429 `TooManyRequestsException` twice, then applied. Expects three byte-identical sends, no read between them, Ok, one snapshot, rows once | red: `left: [(Some("v1"), DroppedThenError(429))]`, `right:` the two 429 sends and the answered third |
+| S3 Tables drill `s3tables_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled`: the same client, a throttle on every send. Expects the message to name the sends made, then three of them | red: `1 sends: Commit refused for table drill.t: S3 Tables throttled the update on each of 3 sends, and nothing was applied` |
+| Glue unit `test_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once`: `LiveGlueCommitTransport` on an `aws_sdk_glue::Config::builder()` client with no `sleep_impl` (asserted), against a local endpoint that answers 400 `ThrottlingException` twice and then 200. Expects three byte-identical requests and `Success` | red: `left: 1`, `right: 3` |
+| Glue unit `test_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled`: the same, a throttle on every send | red: `1 sends: Commit refused for table ns1.test1: Glue throttled the update on each of 3 sends, and nothing was applied` |
+| `*_throttled_on_every_send_fails_terminally_after_three_sends` (both catalogs) now also asserts `on each of 3 sends` | green: the normal path sends three times, so the constant was right there |
+| S3 Tables `test_commit_send_disposition_split`: a `ServiceError` at 201 and at 299 is MaybeSent | green on `3e3aad98`; red under the re-verifier's mutant O6s (the rule narrowed to `== 200`): the assertion message is `201` |
+
+Glue has no public path that takes a client. `GlueCatalogBuilder` (`crates/catalog/glue/src/catalog.rs`)
+holds the config, a storage factory and the caches, and no client. `GlueCatalog::new` always builds
+its client as `aws_sdk_glue::Client::new(&sdk_config)` from `create_sdk_config`
+(`crates/catalog/glue/src/utils.rs`), which is `aws_config::defaults(BehaviorVersion::latest())`
+followed by `load()`, and that config carries the Tokio sleep. So the Glue pins run at the transport
+level, which is the only place a Glue client without a sleep can reach the send loop.
+
+### The change (commit `8b76b81ad576`)
+
+- Both live transports (Glue `send_update_table`, S3 Tables `send_update_metadata_location`) take
+  `self.client.config().sleep_impl().or_else(default_async_sleep)`, where `default_async_sleep` is
+  `aws_smithy_async::rt::sleep::default_async_sleep`.
+- `RefusedBeforeProcessing` carries the sends counted as a second field. The loop returns it with
+  `sends`. `map_glue_commit_send` and `map_s3tables_commit_send` build the message from that number,
+  not from `THROTTLE_ATTEMPTS`. The two unit tests that build the variant directly now pass 2 and
+  assert `on each of 2 sends`.
+- `Cargo.toml`: `aws-smithy-async = "1.3.0"` in `[workspace.dependencies]` and
+  `aws-smithy-async = { workspace = true }` in the two catalog crates. `Cargo.lock` gains the two
+  `aws-smithy-async` edges and no version moves.
+- The `rt-tokio` feature is not added. In both catalog crates, `cargo tree -e features -i
+  aws-smithy-async` shows `aws-smithy-async feature "rt-tokio"`, enabled by `aws-config feature
+  "rt-tokio"` and by `aws-sdk-glue` / `aws-sdk-s3tables feature "rt-tokio"`. So
+  `default_async_sleep()` returns the Tokio sleep in every build of these crates. The no-sleep pins
+  making three sends after the change show it.
+
+### The throttle row for a client without a `sleep_impl`
+
+| Outcome | `3e3aad98` | `8b76b81ad576` | Pins |
+|---|---|---|---|
+| Throttle, on a client with no `sleep_impl` (S3 Tables through `with_client`; Glue only at the transport level, since its catalog always builds a client that has one) | One send, then terminal `Unexpected` whose message said "each of 3 sends" (base `076d5f98`: the SDK's own retry sleeps on its default Tokio sleep, resent, and committed) | As every other client: the same request resent, up to three sends, on `default_async_sleep()`. Landed → Ok, rows once. Exhausted → terminal `Unexpected` that names the sends made (three) and says nothing was applied | drill `s3tables_a_client_without_a_sleep_impl_*`; Glue unit `test_a_client_without_a_sleep_impl_*` |
+| Exhausted throttle, any client | The message named `THROTTLE_ATTEMPTS` | The message names the sends counted | unit `test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied` (2 sends), drills `*_throttled_on_every_send_fails_terminally_after_three_sends` (3 sends) |
+| S3 Tables 2xx `ServiceError` other than 200 | MaybeSent → `CommitStateUnknown` → read-back (unpinned) | unchanged, now pinned at 201 and 299 | `test_commit_send_disposition_split` |
+
+### Mutants (each applied, run, restored; the tree was clean after each)
+
+Each ran `cargo test --no-fail-fast -p <catalog> --lib --test commit_lost_reply_drill`.
+
+| Mutant | Killed by |
+|---|---|
+| Glue: the fallback removed (`or_else` yields `None`) | `test_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once`, `test_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled` |
+| S3 Tables: the fallback removed | `s3tables_a_client_without_a_sleep_impl_resends_a_throttle_and_lands_once`, `s3tables_a_client_without_a_sleep_impl_names_the_sends_it_made_when_every_send_is_throttled` |
+| Glue: the message back to `THROTTLE_ATTEMPTS` | `test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied` |
+| S3 Tables: the message back to `THROTTLE_ATTEMPTS` | `test_an_exhausted_throttle_is_terminal_and_says_nothing_was_applied` |
+| S3 Tables: the 2xx rule narrowed to `== 200` (O6s) | `test_commit_send_disposition_split` |
+
+5 mutants, 5 killed.
+
+### Gates (fork, on `8b76b81ad576`)
+
+| Command | Exit |
+|---|---|
+| `cargo test --no-fail-fast -p iceberg -p iceberg-catalog-glue -p iceberg-catalog-s3tables` | 101: 5171 passed, 14 failed (the Docker-only `tests/glue_catalog_test.rs`, red on base too), 21 ignored. Every test green on `7b0b0dd64634` is green here; the four new tests are the no-sleep pins |
+| `cargo clippy --all-targets --all-features --workspace -- -D warnings` | 0 |
+| `cargo fmt --all -- --check` | 0 |
+| `make check-toml cargo-machete check-rust-file-size check-comment-blocks check-agent-artifacts check-matrix-anchors` | 0 |
+| comment gate, base `076d5f98` | 0 |
+
+RePark never worse, on `8b76b81ad576`, in the clone of RePark `origin/main` `0f074aff` (unchanged
+since ruling 130's round), which pins the fork at `076d5f98`, with the same command-line override.
+`cargo tree -i iceberg` resolved to the pinned `076d5f98` without the override and to the fork's
+local path with it. `cargo test --no-fail-fast -p repark-iceberg -p repark-core -p repark-spark -p
+repark-sql`:
+
+- without the override: exit 0, 5916 passed, 0 failed, 11 ignored.
+- with it: exit 0, 5916 passed, 0 failed, 11 ignored.
+
+No test is green without the override and red with it. RePark's `Cargo.lock` was restored, and the
+clone is clean.
