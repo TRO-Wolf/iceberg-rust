@@ -160,7 +160,7 @@ Or the `Makefile` targets: `make check` (fmt + clippy + TOML + unused-deps) and 
 - **`protoc`** is required by `crates/sqllogictest` (transitively via `datafusion-substrait`). Without
   it, the core surface still builds/tests via `cargo test --workspace --exclude iceberg-sqllogictest`.
 - **Docker** is required by `make test` (`docker-up`) for the service-bound integration suites
-  (Hive Metastore, REST fixture, MinIO/S3). AWS Glue / S3 Tables suites need real credentials. These
+  (Hive Metastore, REST fixture, RustFS object store/S3). AWS Glue / S3 Tables suites need real credentials. These
   are **not** part of the offline gate — run the offline lib/unit suite for fast iteration, and the
   full suite (with Docker) before claiming an integration capability done.
 
