@@ -332,3 +332,82 @@ async fn filtered_manifest_copies_existing_and_deleted_first_row_id() {
         "DELETED entry keeps the stored file first_row_id"
     );
 }
+
+async fn commit_fast_append(
+    catalog: &impl crate::Catalog,
+    table: &Table,
+    files: Vec<DataFile>,
+) -> Table {
+    let transaction = Transaction::new(table);
+    let transaction = transaction
+        .fast_append()
+        .add_data_files(files)
+        .apply(transaction)
+        .expect("apply the fast append");
+    transaction
+        .commit(catalog)
+        .await
+        .expect("commit the fast append")
+}
+
+#[tokio::test]
+async fn rewrite_assigns_row_ids_to_new_and_filtered_manifests_and_keeps_carried_ranges() {
+    let catalog = new_memory_catalog().await;
+    let table = make_v3_minimal_table_in_catalog(&catalog).await;
+
+    let first = data_file("test/first.parquet", None);
+    let second = data_file("test/second.parquet", None);
+    let third = data_file("test/third.parquet", None);
+    let table = commit_fast_append(&catalog, &table, vec![first.clone(), second]).await;
+    let table = commit_fast_append(&catalog, &table, vec![third]).await;
+    assert_eq!(table.metadata().next_row_id(), 9);
+
+    let replacement = data_file("test/replacement.parquet", None);
+    let transaction = Transaction::new(&table);
+    let transaction = transaction
+        .rewrite_files(vec![first], vec![replacement])
+        .apply(transaction)
+        .expect("apply the rewrite");
+    let table = transaction
+        .commit(&catalog)
+        .await
+        .expect("commit the rewrite");
+
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .current_snapshot()
+        .expect("the committed table has a current snapshot");
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .expect("load the manifest list");
+    let data_manifests: Vec<_> = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+        .map(|manifest| {
+            (
+                manifest.first_row_id,
+                manifest.added_rows_count,
+                manifest.existing_rows_count,
+                manifest.deleted_rows_count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        data_manifests,
+        vec![
+            (Some(9), Some(3), Some(0), Some(0)),
+            (Some(6), Some(3), Some(0), Some(0)),
+            (Some(12), Some(0), Some(3), Some(3)),
+        ],
+        "new manifest takes the snapshot's first id, the carried manifest keeps its range, the \
+         filtered manifest follows the new one and counts its existing rows"
+    );
+    assert_eq!(
+        snapshot.row_range(),
+        Some((9, 6)),
+        "the snapshot assigns added plus existing rows of the manifests it numbered"
+    );
+    assert_eq!(metadata.next_row_id(), 15);
+}
