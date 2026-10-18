@@ -116,7 +116,6 @@ LEGACY_CEILINGS: dict[str, int] = {
     "crates/iceberg/src/writer/file_writer/parquet_writer.rs": 3301,
     "crates/iceberg/tests/interop_inspection_manifests.rs": 2289,
     "crates/iceberg/tests/interop_partition_stats.rs": 2605,
-    "crates/iceberg/tests/interop_remove_dangling.rs": 1018,
     "crates/iceberg/tests/interop_scan_exec.rs": 2585,
     "crates/iceberg/tests/interop_scan_plan.rs": 1027,
     "crates/iceberg/tests/interop_write_data.rs": 2111,
