@@ -287,10 +287,20 @@ async fn write_file(
         file_name_gen,
     );
 
-    let mut writer = DataFileWriterBuilder::new(rolling)
-        .build(partition_key.cloned())
-        .await
-        .expect("build data file writer");
+    let mut writer = match partition_key {
+        Some(key) => {
+            DataFileWriterBuilder::new(rolling)
+                .build(Some(key.clone()))
+                .await
+        }
+        None => {
+            DataFileWriterBuilder::new(rolling)
+                .unpartitioned()
+                .build(None)
+                .await
+        }
+    }
+    .expect("build data file writer");
     writer.write(batch).await.expect("write data batch");
     writer
         .close()
