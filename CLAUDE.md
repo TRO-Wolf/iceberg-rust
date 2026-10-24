@@ -52,6 +52,15 @@ one.
 Everything else stays banned. If a fact seems to need a code comment, it belongs in a `task/`
 ledger or a matrix row instead — that routing rule is unchanged and is now the only route.
 
+# OWNER RULING (2026-10-17) — OPUS 5.0 IS BANNED FOREVER; OPUS MEANS OPUS 5.5
+
+**EFFECTIVE IMMEDIATELY AND PERMANENTLY. NO ACTOR, CRITIC, EXECUTOR, VERIFIER, SKETCHER OR CLERK RUNS ON OPUS 5.0. EVERY OPUS DISPATCH IS CLAUDE OPUS 5.5 (`claude-opus-5-5`) AND NOTHING ELSE.**
+
+*Mechanics (owner, 2026-10-17, same night):* a brief, trailer, workflow, launcher or skill that names an
+Opus model names `claude-opus-5-5`; the bare alias `opus` is allowed only where the tool resolves it to
+that id, and the resolution is verified from the agent transcript, never from the brief.
+`make check-model-ban` (in `make check` and CI) fails any tracked file that names a 5.0 Opus id.
+
 
 **STOP — the authoritative contract is [AGENTS.md](AGENTS.md). Read it first.** This file adds only
 Claude-specific tool mechanics; it states **no rule the spine does not already own**. Every project fact lives in the
@@ -110,6 +119,8 @@ frontier tier. This is how that maps onto Claude tiers:
 - **`OO AC` = Opus–Opus Actor–Critic is the default pair.** Whenever you spawn an Actor and/or a
   Critic, both default to Opus (`model: "opus"`) at high reasoning effort — the Claude realization
   of AGENTS.md's frontier–frontier (FF) pair.
+  Opus means `claude-opus-5-5`; Opus 5.0 is banned by the owner ruling at the top of this file, and
+  `model: "opus"` is allowed only where it resolves to 5.5, verified from the transcript.
 - **Never turn the Critic below Opus on a correctness-bearing review.** Recorded evidence: on
   2026-06-25 two Opus Critics caught (and mutation-proved) a NULL-three-valued-logic coverage gap
   that *every* Sonnet Critic in the same effort — including a dedicated "final" bundle Critic — had
