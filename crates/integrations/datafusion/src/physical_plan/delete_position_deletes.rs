@@ -471,8 +471,27 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn chunk_batch_one_chunk_past_i32_max_returns_internal() {
+        let pairs = numbered_pairs(3000, 819_200);
+        assert!(
+            pair_path_bytes(&pairs) > 2_147_483_647,
+            "the fixture must hold more path bytes than i32::MAX"
+        );
+        let config = PositionDeleteWriterConfig::new().expect("test config builds");
+        assert!(
+            matches!(
+                position_delete_chunk_batch(&config, &pairs),
+                Err(DataFusionError::Internal(message))
+                    if message.contains("3000 rows") && message.contains("2457600000")
+            ),
+            "one chunk past i32::MAX path bytes must fail, never panic"
+        );
+    }
+
+    #[test]
+    #[ignore]
     fn stress_chunked_batches_cover_partition_past_i32_max() {
-        let pairs = numbered_pairs(300_000, 8_192);
+        let pairs = numbered_pairs(3000, 819_200);
         assert!(
             pair_path_bytes(&pairs) > 2_147_483_647,
             "the fixture must hold more path bytes than i32::MAX"
@@ -482,7 +501,10 @@ mod tests {
             TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS_DEFAULT,
             POSITION_DELETE_BATCH_BYTE_BOUND,
         );
-        assert!(chunks.len() > 1, "the fixture must split into chunks");
+        assert!(
+            chunks.len() >= 10,
+            "the byte bound implies at least 10 chunks"
+        );
         let config = PositionDeleteWriterConfig::new().expect("test config builds");
         let mut rows = 0;
         for range in &chunks {
@@ -495,6 +517,7 @@ mod tests {
             assert_eq!(batch.num_rows(), chunk.len());
             rows += chunk.len();
         }
+        assert_eq!(rows, 3000);
         assert_eq!(rows, pairs.len());
     }
 }
