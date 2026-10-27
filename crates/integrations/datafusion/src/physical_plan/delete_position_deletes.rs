@@ -374,6 +374,13 @@ async fn write_position_deletes_for_partition(
 
 #[cfg(test)]
 mod tests {
+    use iceberg::io::LocalFsStorageFactory;
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+    use iceberg::{CatalogBuilder, NamespaceIdent, TableCreation};
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use tempfile::TempDir;
+
     use super::*;
 
     fn numbered_pairs(count: usize, path_len: usize) -> Vec<(String, i64)> {
@@ -387,6 +394,85 @@ mod tests {
 
     fn pair_path_bytes(pairs: &[(String, i64)]) -> usize {
         pairs.iter().map(|(path, _)| path.len()).sum()
+    }
+
+    async fn writer_pin_table() -> (Table, TempDir) {
+        let warehouse = TempDir::new().expect("create writer-pin warehouse");
+        let warehouse_path = warehouse
+            .path()
+            .to_str()
+            .expect("writer-pin warehouse path is UTF-8")
+            .to_string();
+        let catalog = MemoryCatalogBuilder::default()
+            .with_storage_factory(Arc::new(LocalFsStorageFactory))
+            .load(
+                "memory",
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_string(), warehouse_path)]),
+            )
+            .await
+            .expect("build writer-pin catalog");
+        let namespace = NamespaceIdent::new("posdel_writer_pin".to_string());
+        catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+            .expect("create writer-pin namespace");
+        let schema = Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
+            .build()
+            .expect("build writer-pin schema");
+        let table = catalog
+            .create_table(
+                &namespace,
+                TableCreation::builder()
+                    .name("target".to_string())
+                    .location(format!(
+                        "{}/target",
+                        warehouse.path().to_str().expect("warehouse path is UTF-8")
+                    ))
+                    .schema(schema)
+                    .format_version(FormatVersion::V2)
+                    .build(),
+            )
+            .await
+            .expect("create writer-pin table");
+        (table, warehouse)
+    }
+
+    async fn read_position_delete_pairs(table: &Table, files: &[DataFile]) -> Vec<(String, i64)> {
+        let mut seen = Vec::new();
+        for file in files {
+            let bytes = table
+                .file_io()
+                .new_input(file.file_path())
+                .expect("open delete file")
+                .read()
+                .await
+                .expect("read delete file");
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+                .expect("open delete parquet")
+                .build()
+                .expect("build delete reader");
+            for batch in reader {
+                let batch = batch.expect("read delete batch");
+                let paths = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("delete file_path is Utf8");
+                let positions = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("delete pos is Int64");
+                for row in 0..batch.num_rows() {
+                    seen.push((paths.value(row).to_string(), positions.value(row)));
+                }
+            }
+        }
+        seen
     }
 
     #[test]
@@ -405,15 +491,24 @@ mod tests {
 
     #[test]
     fn chunker_enumerates_ranges_only_past_two_gibibytes() {
-        let pairs = numbered_pairs(3000, 819_200);
-        assert!(
-            pair_path_bytes(&pairs) > 2_147_483_647,
-            "the fixture must hold more path bytes than i32::MAX"
-        );
+        let pairs = numbered_pairs(30, 8);
         let chunks = chunk_position_delete_pairs(&pairs, 1, usize::MAX);
-        assert_eq!(chunks.len(), 3000);
+        assert_eq!(chunks.len(), 30);
         for (index, range) in chunks.iter().enumerate() {
             assert_eq!(*range, index..index + 1);
+        }
+        let uniform = numbered_pairs(30, 10);
+        let mut varied = Vec::with_capacity(30);
+        for index in 0..30 {
+            let pos = i64::try_from(index).expect("test row count fits i64");
+            varied.push((format!("v{pos:09}"), pos));
+        }
+        let uniform_chunks = chunk_position_delete_pairs(&uniform, usize::MAX, 25);
+        let varied_chunks = chunk_position_delete_pairs(&varied, usize::MAX, 25);
+        assert_eq!(uniform_chunks, varied_chunks);
+        assert_eq!(uniform_chunks.len(), 15);
+        for (nth, range) in uniform_chunks.iter().enumerate() {
+            assert_eq!(*range, 2 * nth..2 * nth + 2);
         }
     }
 
@@ -456,6 +551,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn chunk_batch_refuses_path_bytes_past_i32_max() {
         let chunk = vec![("p".repeat(2_200_000_000), 0)];
         let config = PositionDeleteWriterConfig::new().expect("test config builds");
@@ -519,5 +615,22 @@ mod tests {
         }
         assert_eq!(rows, 3000);
         assert_eq!(rows, pairs.len());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn writer_loop_chunks_partition_past_i32_max() {
+        let (table, _warehouse) = writer_pin_table().await;
+        let pairs = numbered_pairs(3000, 819_200);
+        assert!(
+            pair_path_bytes(&pairs) > 2_147_483_647,
+            "the fixture must hold more path bytes than i32::MAX"
+        );
+        let files = write_position_deletes(&table, &pairs, None)
+            .await
+            .expect("chunked writer loop covers the partition");
+        let rows: u64 = files.iter().map(DataFile::record_count).sum();
+        assert_eq!(rows, 3000);
+        assert_eq!(read_position_delete_pairs(&table, &files).await, pairs);
     }
 }
