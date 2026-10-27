@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::ops::Range;
 use std::str::FromStr;
 
 use iceberg::arrow::FieldMatchMode;
@@ -213,6 +214,77 @@ pub(crate) fn group_pairs_by_partition(
     Ok(groups)
 }
 
+pub(crate) const POSITION_DELETE_BATCH_BYTE_BOUND: usize = 256 * 1024 * 1024;
+
+pub(crate) fn position_delete_batch_rows(properties: &HashMap<String, String>) -> DFResult<usize> {
+    match properties.get(TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS) {
+        None => Ok(TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS_DEFAULT),
+        Some(value) => match value.parse::<usize>() {
+            Ok(rows) if rows > 0 => Ok(rows),
+            _ => Err(DataFusionError::Plan(format!(
+                "Invalid value '{value}' for table property '{}'",
+                TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS
+            ))),
+        },
+    }
+}
+
+pub(crate) fn chunk_position_delete_pairs(
+    pairs: &[(String, i64)],
+    row_bound: usize,
+    byte_bound: usize,
+) -> Vec<Range<usize>> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < pairs.len() {
+        let mut rows: usize = 0;
+        let mut bytes: usize = 0;
+        let mut end = start;
+        while end < pairs.len() {
+            if rows > 0
+                && (rows >= row_bound || bytes.saturating_add(pairs[end].0.len()) > byte_bound)
+            {
+                break;
+            }
+            bytes = bytes.saturating_add(pairs[end].0.len());
+            rows += 1;
+            end += 1;
+        }
+        chunks.push(start..end);
+        start = end;
+    }
+    chunks
+}
+
+pub(crate) fn position_delete_chunk_batch(
+    config: &PositionDeleteWriterConfig,
+    chunk: &[(String, i64)],
+) -> DFResult<RecordBatch> {
+    let mut bytes: usize = 0;
+    for (path, _) in chunk {
+        bytes = bytes.saturating_add(path.len());
+    }
+    let within_limit = i64::try_from(bytes).is_ok_and(|count| count <= i64::from(i32::MAX));
+    if !within_limit {
+        return Err(DataFusionError::Internal(format!(
+            "position-delete batch of {} rows holds {bytes} path bytes, past the Utf8 StringArray limit",
+            chunk.len()
+        )));
+    }
+    let paths: Vec<&str> = chunk.iter().map(|(path, _)| path.as_str()).collect();
+    let positions: Vec<i64> = chunk.iter().map(|(_, pos)| *pos).collect();
+    RecordBatch::try_new(config.arrow_schema().clone(), vec![
+        Arc::new(StringArray::from(paths)) as ArrayRef,
+        Arc::new(Int64Array::from(positions)) as ArrayRef,
+    ])
+    .map_err(|e| {
+        DataFusionError::ArrowError(
+            Box::new(e),
+            Some("Failed to build position-delete batch".into()),
+        )
+    })
+}
+
 /// Writes one position-delete file for a SINGLE `(spec_id, partition)` group. `pairs` must already
 /// be sorted by `(path, pos)`. With `partition_key = None`, `configured_spec` MUST be `Some`, or the
 /// writer fabricates `DEFAULT_PARTITION_SPEC_ID` (0) instead of the real spec id.
@@ -284,19 +356,12 @@ async fn write_position_deletes_for_partition(
         .await
         .map_err(to_datafusion_error)?;
 
-    let paths: Vec<&str> = pairs.iter().map(|(path, _)| path.as_str()).collect();
-    let positions: Vec<i64> = pairs.iter().map(|(_, pos)| *pos).collect();
-    let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-        Arc::new(StringArray::from(paths)) as ArrayRef,
-        Arc::new(Int64Array::from(positions)) as ArrayRef,
-    ])
-    .map_err(|e| {
-        DataFusionError::ArrowError(
-            Box::new(e),
-            Some("Failed to build position-delete batch".into()),
-        )
-    })?;
-    writer.write(batch).await.map_err(to_datafusion_error)?;
+    let batch_rows = position_delete_batch_rows(table.metadata().properties())?;
+    let chunks = chunk_position_delete_pairs(pairs, batch_rows, POSITION_DELETE_BATCH_BYTE_BOUND);
+    for range in chunks {
+        let batch = position_delete_chunk_batch(config, &pairs[range])?;
+        writer.write(batch).await.map_err(to_datafusion_error)?;
+    }
     let files = writer.close().await.map_err(to_datafusion_error)?;
     // A non-empty group MUST produce a file, or the deletes vanish and the rows come back.
     if files.is_empty() {
@@ -305,4 +370,131 @@ async fn write_position_deletes_for_partition(
         ));
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered_pairs(count: usize, path_len: usize) -> Vec<(String, i64)> {
+        let mut pairs = Vec::with_capacity(count);
+        for index in 0..count {
+            let pos = i64::try_from(index).expect("test row count fits i64");
+            pairs.push(("p".repeat(path_len), pos));
+        }
+        pairs
+    }
+
+    fn pair_path_bytes(pairs: &[(String, i64)]) -> usize {
+        pairs.iter().map(|(path, _)| path.len()).sum()
+    }
+
+    #[test]
+    fn chunker_splits_twenty_five_rows_by_ten() {
+        let pairs = numbered_pairs(25, 8);
+        let chunks = chunk_position_delete_pairs(&pairs, 10, usize::MAX);
+        assert_eq!(chunks, vec![0..10, 10..20, 20..25]);
+    }
+
+    #[test]
+    fn chunker_emits_single_pairs_when_two_paths_exceed_bytes() {
+        let pairs = numbered_pairs(5, 100);
+        let chunks = chunk_position_delete_pairs(&pairs, usize::MAX, 150);
+        assert_eq!(chunks, vec![0..1, 1..2, 2..3, 3..4, 4..5]);
+    }
+
+    #[test]
+    fn chunker_enumerates_ranges_only_past_two_gibibytes() {
+        let pairs = numbered_pairs(3000, 819_200);
+        assert!(
+            pair_path_bytes(&pairs) > 2_147_483_647,
+            "the fixture must hold more path bytes than i32::MAX"
+        );
+        let chunks = chunk_position_delete_pairs(&pairs, 1, usize::MAX);
+        assert_eq!(chunks.len(), 3000);
+        for (index, range) in chunks.iter().enumerate() {
+            assert_eq!(*range, index..index + 1);
+        }
+    }
+
+    #[test]
+    fn batch_rows_default_applies_when_unset() {
+        let rows = position_delete_batch_rows(&HashMap::new()).expect("default applies");
+        assert_eq!(rows, 1_048_576);
+        assert_eq!(
+            rows,
+            TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn batch_rows_accepts_positive_value() {
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS.to_string(),
+            "10".to_string(),
+        )]);
+        let rows = position_delete_batch_rows(&props).expect("positive value parses");
+        assert_eq!(rows, 10);
+    }
+
+    #[test]
+    fn batch_rows_rejects_zero_and_non_numeric() {
+        for value in ["0", "abc"] {
+            let props = HashMap::from([(
+                TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS.to_string(),
+                value.to_string(),
+            )]);
+            let key = TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS;
+            assert!(
+                matches!(
+                    position_delete_batch_rows(&props),
+                    Err(DataFusionError::Plan(message)) if message.contains(key)
+                ),
+                "value `{value}` must refuse with a plan error naming the property"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_batch_refuses_path_bytes_past_i32_max() {
+        let chunk = vec![("p".repeat(2_200_000_000), 0)];
+        let config = PositionDeleteWriterConfig::new().expect("test config builds");
+        assert!(
+            matches!(
+                position_delete_chunk_batch(&config, &chunk),
+                Err(DataFusionError::Internal(message))
+                    if message.contains("1 rows") && message.contains("2200000000")
+            ),
+            "a chunk past i32::MAX path bytes must fail, never panic"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn stress_chunked_batches_cover_partition_past_i32_max() {
+        let pairs = numbered_pairs(300_000, 8_192);
+        assert!(
+            pair_path_bytes(&pairs) > 2_147_483_647,
+            "the fixture must hold more path bytes than i32::MAX"
+        );
+        let chunks = chunk_position_delete_pairs(
+            &pairs,
+            TableProperties::PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS_DEFAULT,
+            POSITION_DELETE_BATCH_BYTE_BOUND,
+        );
+        assert!(chunks.len() > 1, "the fixture must split into chunks");
+        let config = PositionDeleteWriterConfig::new().expect("test config builds");
+        let mut rows = 0;
+        for range in &chunks {
+            let chunk = &pairs[range.clone()];
+            assert!(
+                pair_path_bytes(chunk) <= POSITION_DELETE_BATCH_BYTE_BOUND,
+                "chunk {range:?} exceeds the byte bound"
+            );
+            let batch = position_delete_chunk_batch(&config, chunk).expect("chunk batch builds");
+            assert_eq!(batch.num_rows(), chunk.len());
+            rows += chunk.len();
+        }
+        assert_eq!(rows, pairs.len());
+    }
 }
