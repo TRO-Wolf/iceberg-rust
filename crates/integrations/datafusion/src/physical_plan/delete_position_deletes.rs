@@ -500,7 +500,7 @@ mod tests {
         let uniform = numbered_pairs(30, 10);
         let mut varied = Vec::with_capacity(30);
         for index in 0..30 {
-            let pos = i64::try_from(index).expect("test row count fits i64");
+            let pos = i64::from(index);
             varied.push((format!("v{pos:09}"), pos));
         }
         let uniform_chunks = chunk_position_delete_pairs(&uniform, usize::MAX, 25);
