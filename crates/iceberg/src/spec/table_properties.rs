@@ -239,6 +239,11 @@ impl TableProperties {
     /// `usize` sibling is `usize` only because `RollingFileWriter`'s `target_file_size` field is
     /// `usize`; that is a writer-side accident, not the parity type.
     pub const PROPERTY_WRITE_DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT: u64 = 67108864;
+    /// Row bound for one position-delete write batch.
+    pub const PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS: &str =
+        "write.delete.position-delete-batch-rows";
+    /// Default rows per position-delete write batch.
+    pub const PROPERTY_WRITE_DELETE_POSITION_DELETE_BATCH_ROWS_DEFAULT: usize = 1_048_576;
     #[allow(missing_docs)]
     pub const PROPERTY_DELETE_GRANULARITY: &str = "write.delete.granularity";
     /// Whether to use `FanoutWriter` for partitioned tables (handles unsorted data).
