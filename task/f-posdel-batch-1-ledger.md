@@ -66,13 +66,14 @@ the clause says otherwise.
 - `chunker_emits_single_pairs_when_two_paths_exceed_bytes`: five 100-byte paths with a 150-byte
   bound cut into five single-pair ranges.
 - `chunker_enumerates_ranges_only_past_two_gibibytes`: 3000 paths of 819,200 bytes, past `i32::MAX`
-  in total, with row bound 1, cut into 3000 single-pair ranges.
+  in total, with row bound 1, cut into 3000 single-pair ranges. Round 1 changed this pin; see
+  Verification round 1.
 - `batch_rows_default_applies_when_unset`: an unset property gives 1,048,576.
 - `batch_rows_accepts_positive_value`: the value `10` parses to 10.
 - `batch_rows_rejects_zero_and_non_numeric`: the values `0` and `abc` each fail with a Plan error
   that names the property.
 - `chunk_batch_refuses_path_bytes_past_i32_max`: one path of 2,200,000,000 bytes returns `Internal`
-  naming "1 rows" and "2200000000". This is the guard branch. It runs in the default suite.
+  naming "1 rows" and "2200000000". This is the guard branch. Round 1 made it `#[ignore]`; see Verification round 1.
 - `chunk_batch_one_chunk_past_i32_max_returns_internal` (`#[ignore]`): the whole 3000 x 800 KiB
   slice as one range returns `Internal` naming "3000 rows" and "2457600000". It does not panic.
 - `stress_chunked_batches_cover_partition_past_i32_max` (`#[ignore]`): the same 3000 paths cut at
@@ -134,3 +135,74 @@ The registry path prefix is trimmed in both runs.
    array. It does not bound the Rust heap held per deleted row.
 2. `write.delete.target-file-size-bytes` is inert on this path. The writer is built with
    `new_with_default_file_size`, and only the rewrite planner reads that key.
+
+## Verification round 1 (2026-10-27)
+
+**Verified head:** `653fbfb3`. **Fix round:** commits `bd11bf3f` and `2bc85bb8`. The fix round
+changes no production line. It adds one pin, changes two pins, and reworks one map row.
+
+### Verifier verdict
+
+The Opus 5.5 verifier (`claude-opus-5-5`) ran at `653fbfb3`. It returned FAIL on one S2 finding,
+V-POSDEL-1. No committed pin covered the production loop. A wiring mutant that cut all pairs into
+one range kept every pin green.
+
+Every product claim passed:
+
+- The pre-fix single-batch shape panics with `offset overflow` through the real writer.
+- The head returns the 3000 rows in input order.
+- Sort order across chunks holds under partition and file granularity.
+- The property refuses `0`, `-1`, `abc`, empty, padded, fractional and overflowing values. It
+  accepts `1`, `+5` and the default.
+- The guard is cast-free. It returns `Internal` at `i32::MAX` plus one byte.
+- Only the shared per-partition loop changed.
+- `make check` is green.
+
+The property and guard probes are verifier evidence. None of them is a committed pin.
+
+Two S3 notes:
+
+- Two plain tests allocated over 2 GiB each (V-POSDEL-2). The fix round removes both allocations
+  from the plain run.
+- The equality-delete conversion site in `crates/iceberg/src/maintenance/convert_equality_delete_files.rs`
+  builds one `StringArray` over all pairs (line 538 at `2bc85bb8`). It has the same fault class. It
+  is outside this unit. It should be carded on the RePark side.
+
+### Fix round: pins new or changed
+
+Each name is in `crates/integrations/datafusion/src/physical_plan/delete_position_deletes.rs`.
+
+- `writer_loop_chunks_partition_past_i32_max` (new, `#[ignore]`, `#[tokio::test]`). It calls
+  `write_position_deletes` on an unpartitioned v2 in-memory table with 3000 identical 800 KiB paths
+  (2,457,600,000 path bytes). It asserts `Ok`, record counts that sum to 3000, and read-back pairs
+  equal to the input in order. Green once: 20.93 s test time, peak RSS 5,666,052 KiB (5.40 GiB).
+  The builder replayed the one-chunk wiring mutant as `let chunks = vec![0..pairs.len()];`, for one
+  run, then restored the tree. The pin failed in 3.42 s with:
+
+    chunked writer loop covers the partition: Internal("position-delete batch of 3000 rows holds 2457600000 path bytes, past the Utf8 StringArray limit")
+
+  The pin re-ran green after the restore.
+- `chunker_enumerates_ranges_only_past_two_gibibytes` (changed, plain). The fixture shrinks to 30
+  pairs with row bound 1, and it asserts 30 single-pair ranges. A byte-bound check now asserts that
+  uniform and varied same-length paths chunk identically: fifteen 2-wide ranges at byte bound 25.
+  That proves the chunker reads path bytes only through `len()`. The name stays. The fixture no
+  longer passes 2 GiB.
+- `chunk_batch_refuses_path_bytes_past_i32_max` (changed, now `#[ignore]`). It was a plain test over
+  one path of 2,200,000,000 bytes. The ignored one-chunk pin still covers the guard.
+
+The plain module run, `cargo test -p iceberg-datafusion --lib delete_position_deletes`, gives 6
+passed, 4 ignored, and peak RSS 123,496 KiB (about 121 MiB).
+
+The four ignored pins, each run green once at head:
+
+    cargo test -p iceberg-datafusion --lib writer_loop_chunks -- --ignored --exact physical_plan::delete::delete_position_deletes::tests::writer_loop_chunks_partition_past_i32_max
+    cargo test -p iceberg-datafusion --lib chunk_batch_refuses -- --ignored --exact physical_plan::delete::delete_position_deletes::tests::chunk_batch_refuses_path_bytes_past_i32_max
+    cargo test -p iceberg-datafusion --lib chunk_batch_one_chunk -- --ignored --exact physical_plan::delete::delete_position_deletes::tests::chunk_batch_one_chunk_past_i32_max_returns_internal
+    cargo test -p iceberg-datafusion --lib stress_chunked_batches -- --ignored --exact physical_plan::delete::delete_position_deletes::tests::stress_chunked_batches_cover_partition_past_i32_max
+
+The other unit pins and the three integration pins in `posdel_batch.rs` are unchanged.
+
+### Gates at `2bc85bb8`
+
+Builder record, not re-run by the clerk: `cargo test -p iceberg-datafusion` exit 0.
+`cargo test -p iceberg --lib` 4639 passed, 0 failed, 9 ignored. `make check` green.
