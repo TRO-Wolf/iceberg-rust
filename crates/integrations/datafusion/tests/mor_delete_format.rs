@@ -371,8 +371,13 @@ async fn test_mor_delete_on_orc_writes_orc_delete_file() {
         false,
     )
     .await;
-    insert_values(&context, &table_ident, "(1, 'a'), (2, 'b'), (3, 'c')").await;
-    delete_where(&context, &table_ident, "id = 2").await;
+    insert_values(
+        &context,
+        &table_ident,
+        "(0, 'z'), (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    )
+    .await;
+    delete_where(&context, &table_ident, "id BETWEEN 1 AND 3").await;
 
     let rows = files_content_format(&context, &table_ident).await;
     let content_format: Vec<(i32, String)> = rows
@@ -398,6 +403,17 @@ async fn test_mor_delete_on_orc_writes_orc_delete_file() {
         bytes.len() > 4 && &bytes[bytes.len() - 4..bytes.len() - 1] == b"ORC",
         "delete file {delete_path} carries the ORC tail magic"
     );
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![0, 4],
+        "the ORC delete applies and no row resurrects"
+    );
+    delete_where(&context, &table_ident, "id = 4").await;
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![0],
+        "the second ORC delete applies and no row resurrects"
+    );
 }
 
 #[tokio::test]
@@ -411,8 +427,13 @@ async fn test_mor_delete_on_avro_writes_avro_delete_file() {
         false,
     )
     .await;
-    insert_values(&context, &table_ident, "(1, 'a'), (2, 'b'), (3, 'c')").await;
-    delete_where(&context, &table_ident, "id = 2").await;
+    insert_values(
+        &context,
+        &table_ident,
+        "(0, 'z'), (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    )
+    .await;
+    delete_where(&context, &table_ident, "id BETWEEN 1 AND 3").await;
 
     let rows = files_content_format(&context, &table_ident).await;
     let content_format: Vec<(i32, String)> = rows
@@ -437,6 +458,69 @@ async fn test_mor_delete_on_avro_writes_avro_delete_file() {
     assert!(
         bytes.starts_with(b"Obj\x01"),
         "delete file {delete_path} carries the Avro OCF header"
+    );
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![0, 4],
+        "the Avro delete applies and no row resurrects"
+    );
+    delete_where(&context, &table_ident, "id = 4").await;
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![0],
+        "the second Avro delete applies and no row resurrects"
+    );
+}
+
+#[tokio::test]
+async fn test_mor_delete_parquet_reads_back_two_deletes() {
+    let (context, _catalog, table_ident, _warehouse) = create_fixture(
+        "mor_delete_format_parquet_readback",
+        "target",
+        mor_properties(&[]),
+        FormatVersion::V2,
+        false,
+        false,
+    )
+    .await;
+    insert_values(
+        &context,
+        &table_ident,
+        "(0, 'z'), (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+    )
+    .await;
+    delete_where(&context, &table_ident, "id BETWEEN 1 AND 3").await;
+
+    let rows = files_content_format(&context, &table_ident).await;
+    let content_format: Vec<(i32, String)> = rows
+        .iter()
+        .map(|(content, format, _)| (*content, format.clone()))
+        .collect();
+    assert_eq!(
+        content_format,
+        vec![(0, "PARQUET".to_string()), (1, "PARQUET".to_string())],
+        "a parquet table takes parquet data and parquet position deletes, got {rows:?}"
+    );
+    let delete_path = &rows[1].2;
+    assert!(
+        delete_path.ends_with(".parquet"),
+        "delete file {delete_path} keeps the parquet suffix"
+    );
+    let bytes = std::fs::read(local_fs_path(delete_path)).expect("read delete file bytes");
+    assert!(
+        bytes.starts_with(b"PAR1"),
+        "delete file {delete_path} carries the parquet magic"
+    );
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![0, 4],
+        "the parquet delete applies and no row resurrects"
+    );
+    delete_where(&context, &table_ident, "id = 4").await;
+    assert_eq!(
+        surviving_ids(&context, &table_ident).await,
+        vec![0],
+        "the second parquet delete applies and no row resurrects"
     );
 }
 
