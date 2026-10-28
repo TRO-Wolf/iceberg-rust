@@ -77,15 +77,19 @@ conditional read-fully-and-select-by-name arm was not needed.
 | C-002 | Same, ORC | PROVEN | `test_mor_delete_on_orc_writes_orc_delete_file`, `test_orc_position_deletes_read_back_two_columns_in_order` |
 | C-003 | Parquet MoR table: same two-delete shape answers `[0, 4]` then `[0]`; no parquet behavior changed | PROVEN | `test_mor_delete_parquet_reads_back_two_deletes`; full suites green (§Gates) |
 | C-004 | Equality deletes dispatch by format and keep parquet semantics | PROVEN | Live-key happy path, closed in fold-2: the verifier measured Avro-on-Parquet, ORC-on-Parquet, Avro-on-Avro, ORC-on-ORC and the Parquet control each answering `y = [0, 10, 40]` after an equality delete on `y in {20, 30}`, key-less projections included; pinned in-suite by `test_avro_equality_delete_with_live_key_applies_without_key_projection` and the ORC twin in `crates/iceberg/tests/mor_eqdel_format.rs`. Dropped-key refusal is C-007. |
-| C-005 | A format the loader cannot read refuses `FeatureUnsupported` naming the file and the format | OPEN | Same ceiling reason as C-004: no pin fit for the two Puffin-row refusal arms. Both are unreachable in-suite (Puffin position deletes route to the deletion-vector path first; Puffin equality deletes are never written). Each is a 6-line error constructor with the file path and the format in the message. |
+| C-005 | A format the loader cannot read refuses `FeatureUnsupported` naming the file and the format | PROVEN | Verifier-measured at `53fc7177`: `position_delete_batch_stream` and the trait door refuse "Cannot read position deletes from Puffin file '<path>' as delete rows: ..."; `equality_delete_batch_stream` refuses "Cannot read equality deletes from Puffin file '<path>': ...". No committed pin: both arms are unreachable in-suite (Puffin position deletes route to the deletion-vector path first; Puffin equality deletes are never written). |
 | C-006 | No neighboring answer changed | PROVEN | Gates: `iceberg --lib arrow::` 537/0, `iceberg-datafusion` 802/0 across 43 suites, clippy `-D warnings`, fmt. Base `mor_delete_format` run (11/11) matches the 10 pre-existing tests at head plus the new control. |
 | C-007 | An equality key absent from the current schema refuses instead of applying no delete | PROVEN | Fold-2 V-1: `equality_delete_expected_schema` returns `DataInvalid` naming the file and the field id; the empty-expected-schema arm now only covers an empty id list. Red-first: pre-fix the Avro and ORC dropped-key scans answered all five rows; pinned by `test_avro_equality_delete_with_dropped_key_refuses` and the ORC twin in `crates/iceberg/tests/mor_eqdel_format.rs`. |
 | C-008 | The legacy position-delete load dispatches on file format | PROVEN | Fold-2 V-2: `load_legacy_positions_by_path` builds a `FileScanTaskDeleteFile` and reads through `position_delete_batch_stream` instead of the Parquet loader. Pinned by `avro_position_delete_loads_positions_by_path` (red against the Parquet-only call, restored green). Parquet behavior unchanged: the partition-scoped call is identical, and the file-scoped projection difference is invisible to the pos-only parser. |
+| C-009 | Parquet-only delete opens outside the dispatched doors stay open as follow-ups, not defects of this PR | OPEN | `maintenance/rewrite_position_delete_files.rs:617` skips non-Parquet position deletes with `continue` (Avro/ORC deletes uncompacted; data correct); `maintenance/rewrite_table_path.rs:446` refuses non-Parquet with a typed error; `maintenance/convert_equality_delete_files.rs:601` has no format gate (Avro/ORC fail loud with the Parquet footer error, by code reading). |
 
 ## Pins
 
-Each unit pin is in `crates/iceberg/src/arrow/delete_file_loader.rs`; each
-integration pin in `crates/integrations/datafusion/tests/mor_delete_format.rs`.
+Unit pins live in `crates/iceberg/src/arrow/delete_file_loader.rs`; the
+position-delete integration pins in
+`crates/integrations/datafusion/tests/mor_delete_format.rs`; the
+equality-delete format pins in `crates/iceberg/tests/mor_eqdel_format.rs`;
+the legacy-door pin in `delete_vector_container/legacy.rs`.
 
 - `test_avro_position_deletes_read_back_two_columns_in_order`: a 3-row
   unsorted `(file_path, pos)` fixture written by `AvroWriterBuilder` over the
@@ -132,13 +136,15 @@ Restored tree: 2 green.
   exit 0.
 - `cargo fmt --all -- --check`: exit 0.
 - `scripts/check_rust_file_size.py`: 698 files clean (after the 3270 to 3263
-  ceiling move).
+  ceiling move; 699 at the fold-2 head with the new `mor_eqdel_format.rs`
+  test file).
 
 ## Fold-2 — verifier round 1 (one S1, two S3)
 
 **Date:** 2026-10-28. **Branch:** `fix/posdel-format-read-1`, commits
-`e887c9ec` (item 1), `cb22348c` (item 2), `4e18f3c9` (item 3), and this
-commit (item 4, records only).
+`e887c9ec` (item 1), `cb22348c` (item 2), `4e18f3c9` (item 3), `06835def`
+(item 4, records), `53fc7177` (fmt fixup), and this commit (fold-3,
+records only).
 
 **Model:** builder Muse Spark (`muse-spark-1.3-contributor`).
 
@@ -171,6 +177,26 @@ temporarily restored Parquet-only call and green after the restore.
 
 Gate results for the fold-2 head live in the round hand-back, not here: the
 brief runs the gate after the last commit.
+
+## Verifier rounds
+
+Round 1 (Opus 5.5): FAIL with one S1 and two S3 findings. V-1 S1: the
+unknown-id skip resurrected deleted rows (fixed in `e887c9ec`, C-007). V-2
+S3: the legacy door opened every live non-DV position delete with the
+Parquet loader (fixed in `4e18f3c9`, C-008). V-3 S3: this ledger described
+the unknown-id skip as a design choice; it was the defect (C-004 rewritten,
+C-007/C-008 added).
+
+Round 2 (fresh Opus 5.5 at `53fc7177`): PASS. V-1 closed: Avro and ORC
+equality deletes refuse `DataInvalid` on a dropped key and apply live keys
+under key-less projections, with renamed keys applying by field id; the
+dropped-key pins went red on the fold-1 sources and the legacy pin went red
+under a dispatch-call mutation. V-2 closed: the legacy door builds the task
+from the `DataFile`, and an ORC position-delete probe read back the expected
+partition-scoped and file-scoped positions. The Puffin arms measured as
+stated in C-005. Three S3 wording items, all fixed in this fold-3 commit:
+C-005 carries its own reason, the `## Pins` intro names every pin home, and
+the fold-2 commit list plus the file-size count are corrected.
 
 ## Follow-ups (out of scope)
 
