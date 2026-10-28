@@ -27,9 +27,10 @@ use parquet::basic::{ConvertedType, LogicalType};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
-use crate::error::Result;
 use crate::expr::BoundPredicate;
+use crate::metadata_columns::is_metadata_field;
 use crate::spec::{NestedField, Schema, Type};
+use crate::{Error, ErrorKind, Result};
 
 pub(crate) struct PushedRowFilter {
     pub(crate) filter: RowFilter,
@@ -63,12 +64,40 @@ pub(crate) fn plan_row_filter(
     iceberg_field_ids: &HashSet<i32>,
     force_residual: bool,
 ) -> Result<RowFilterPlan> {
+    let absent: Vec<i32> = {
+        let mut ids: Vec<i32> = iceberg_field_ids
+            .iter()
+            .copied()
+            .filter(|id| !is_metadata_field(*id) && table_schema.field_by_id(*id).is_none())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
     if force_residual {
+        if !absent.is_empty() {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!(
+                    "cannot apply equality deletes on dropped column ids {absent:?} through \
+                     the residual read path, which resolves columns through the current table \
+                     schema"
+                ),
+            ));
+        }
         return Ok(RowFilterPlan::Residual);
     }
     let leaf_lists = match build_field_id_leaf_lists(parquet_schema)? {
         Some(lists) => lists,
         None => {
+            if !absent.is_empty() {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "cannot apply equality deletes on dropped column ids {absent:?}: the \
+                         data file carries no embedded Parquet field ids to map them by"
+                    ),
+                ));
+            }
             let stamped = stamped_top_level_leaf_lists(parquet_schema, stamped_arrow_schema);
             let present_but_unmapped = iceberg_field_ids.iter().any(|field_id| {
                 !stamped.contains_key(field_id)

@@ -25,15 +25,15 @@ use tokio::sync::Notify;
 use tokio::sync::futures::OwnedNotified;
 use tokio::sync::oneshot::Receiver;
 
+use super::pos_del_claim::{pos_del_claim_key, pos_del_load_failed_error};
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::delete_vector::DeleteVector;
-use crate::expr::Predicate::AlwaysTrue;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::FileIO;
 use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
-use crate::spec::DataContentType;
+use crate::spec::{DataContentType, SchemaRef};
 use crate::{Error, ErrorKind, Result};
 
 #[derive(Debug)]
@@ -41,7 +41,7 @@ enum EqDelState {
     Loading(Arc<Notify>),
     /// The resolved file: its survival [`Predicate`], which is always present, and the hashed
     /// [`EqDeleteKeySet`] accelerator when every key column is type-eligible.
-    Loaded(Predicate, Option<EqDeleteKeySet>),
+    Loaded(Predicate, SchemaRef, Option<EqDeleteKeySet>),
     /// The load failed terminally: the loader dropped the oneshot sender without sending. Any
     /// error or cancellation in the load, parse, or send window does that. Waiters MUST treat this
     /// as terminal and surface absence, so the caller raises a typed error. A re-wait on the
@@ -227,10 +227,15 @@ impl EqDelLoadGuard {
     /// sends the parsed predicate once it reads the file. A sender dropped without sending, which
     /// any error or cancellation in the load window does, makes the await err and the entry move to
     /// [`EqDelState::Failed`].
-    pub(crate) fn spawn_publisher(mut self, eq_del: Receiver<(Predicate, Option<EqDeleteKeySet>)>) {
+    pub(crate) fn spawn_publisher(
+        mut self,
+        eq_del: Receiver<(Predicate, SchemaRef, Option<EqDeleteKeySet>)>,
+    ) {
         crate::runtime::spawn(async move {
             let terminal = match eq_del.await {
-                Ok((predicate, key_set)) => EqDelState::Loaded(predicate, key_set),
+                Ok((predicate, bind_schema, key_set)) => {
+                    EqDelState::Loaded(predicate, bind_schema, key_set)
+                }
                 Err(_) => EqDelState::Failed,
             };
             self.publish(terminal);
@@ -263,31 +268,6 @@ enum EqDelLookup<T> {
 /// alive. This is the crate's policy for the delete-path locks. See `arrow/reader.rs`.
 fn recover_poison<G>(result: std::sync::LockResult<G>) -> G {
     result.unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// The claim key under which one positional-delete SOURCE loads and installs its contribution.
-///
-/// | Source | Key |
-/// |---|---|
-/// | a parquet position-delete file | its own path |
-/// | a deletion vector in a Puffin file | `{puffin path}@{offset}`, since one file holds many |
-/// | anything else | `None` |
-///
-/// The loader and [`DeleteFilter::resolve_delete_vector`] share this one key, so the claim, the
-/// install, and the application cannot drift apart and silently drop deletes.
-///
-/// A Puffin entry with a missing or negative `content_offset` also gives `None`. The loader fails
-/// loud on that metadata, so such an entry can never have a contribution to resolve.
-pub(crate) fn pos_del_claim_key(delete: &FileScanTaskDeleteFile) -> Option<String> {
-    if delete.file_type != DataContentType::PositionDeletes {
-        return None;
-    }
-    if delete.file_format == crate::spec::DataFileFormat::Puffin {
-        let offset = delete.content_offset.filter(|offset| *offset >= 0)?;
-        Some(format!("{}@{offset}", delete.file_path))
-    } else {
-        Some(delete.file_path.clone())
-    }
 }
 
 impl DeleteFilter {
@@ -485,33 +465,37 @@ impl DeleteFilter {
     fn lookup_or_arm_eq_del<T>(
         &self,
         file_path: &str,
-        project: impl FnOnce(&Predicate, &Option<EqDeleteKeySet>) -> T,
+        project: impl FnOnce(&Predicate, &SchemaRef, &Option<EqDeleteKeySet>) -> T,
     ) -> EqDelLookup<T> {
         match recover_poison(self.state.read())
             .equality_deletes
             .get(file_path)
         {
             None | Some(EqDelState::Failed) => EqDelLookup::Ready(None),
-            Some(EqDelState::Loaded(predicate, key_set)) => {
-                EqDelLookup::Ready(Some(project(predicate, key_set)))
+            Some(EqDelState::Loaded(predicate, bind_schema, key_set)) => {
+                EqDelLookup::Ready(Some(project(predicate, bind_schema, key_set)))
             }
             Some(EqDelState::Loading(notify)) => EqDelLookup::Wait(notify.clone().notified_owned()),
         }
     }
 
     /// The equality-delete predicate for one delete file path.
-    pub(crate) async fn get_equality_delete_predicate_for_delete_file_path(
+    pub(crate) async fn get_equality_delete_predicate_and_schema_for_delete_file_path(
         &self,
         file_path: &str,
-    ) -> Option<Predicate> {
-        match self.lookup_or_arm_eq_del(file_path, |predicate, _| predicate.clone()) {
+    ) -> Option<(Predicate, SchemaRef)> {
+        match self.lookup_or_arm_eq_del(file_path, |predicate, bind_schema, _| {
+            (predicate.clone(), bind_schema.clone())
+        }) {
             EqDelLookup::Ready(predicate) => return predicate,
             EqDelLookup::Wait(notified) => notified.await,
         }
 
         // Once the notifier fires the entry is terminal, and neither state is ever replaced.
         // Read anything other than `Loaded` as absence, so the caller raises a typed error.
-        match self.lookup_or_arm_eq_del(file_path, |predicate, _| predicate.clone()) {
+        match self.lookup_or_arm_eq_del(file_path, |predicate, bind_schema, _| {
+            (predicate.clone(), bind_schema.clone())
+        }) {
             EqDelLookup::Ready(predicate) => predicate,
             EqDelLookup::Wait(_) => None,
         }
@@ -527,14 +511,14 @@ impl DeleteFilter {
         // A failed or unknown load gives no key set, which routes the task onto the predicate
         // path. That path raises the typed error. The outer `Option` is the entry's presence, and
         // the inner one is the file's fast-path eligibility.
-        match self.lookup_or_arm_eq_del(file_path, |_, key_set| key_set.clone()) {
+        match self.lookup_or_arm_eq_del(file_path, |_, _, key_set| key_set.clone()) {
             EqDelLookup::Ready(key_set) => return key_set.flatten(),
             EqDelLookup::Wait(notified) => notified.await,
         }
 
         // After the notifier fires the entry is terminal. Anything other than `Loaded` gives
         // `None`, so the caller uses the predicate path.
-        match self.lookup_or_arm_eq_del(file_path, |_, key_set| key_set.clone()) {
+        match self.lookup_or_arm_eq_del(file_path, |_, _, key_set| key_set.clone()) {
             EqDelLookup::Ready(key_set) => key_set.flatten(),
             EqDelLookup::Wait(_) => None,
         }
@@ -573,14 +557,14 @@ impl DeleteFilter {
         &self,
         file_scan_task: &FileScanTask,
     ) -> Result<Option<BoundPredicate>> {
-        let mut combined_predicate = AlwaysTrue;
+        let mut combined: Option<BoundPredicate> = None;
         for delete in file_scan_task.deletes.iter() {
             if !is_equality_delete(delete) {
                 continue;
             }
 
-            let Some(predicate) = self
-                .get_equality_delete_predicate_for_delete_file_path(&delete.file_path)
+            let Some((predicate, bind_schema)) = self
+                .get_equality_delete_predicate_and_schema_for_delete_file_path(&delete.file_path)
                 .await
             else {
                 return Err(Error::new(
@@ -592,16 +576,14 @@ impl DeleteFilter {
                 ));
             };
 
-            combined_predicate = combined_predicate.and(predicate);
+            let bound = predicate.bind(bind_schema, file_scan_task.case_sensitive)?;
+            combined = Some(match combined {
+                Some(current) => current.and(bound),
+                None => bound,
+            });
         }
 
-        if combined_predicate == AlwaysTrue {
-            return Ok(None);
-        }
-
-        let bound_predicate = combined_predicate
-            .bind(file_scan_task.schema.clone(), file_scan_task.case_sensitive)?;
-        Ok(Some(bound_predicate))
+        Ok(combined)
     }
 
     /// Installs the parsed `data file path` to `positions` map of ONE freshly loaded positional
@@ -618,22 +600,6 @@ impl DeleteFilter {
             .pos_del_contributions
             .insert(claim.file_path.clone(), Arc::new(contribution));
     }
-}
-
-/// The typed error every consumer of a terminally-failed positional-delete load receives. The
-/// claim-time and post-wake paths must render one failure, so it lives in one place.
-///
-/// `reason` is the cause [`PosDelState::Failed`] carries. It renders inline rather than through
-/// `with_source`, because it is a message the failing task left behind, not an [`Error`] this one
-/// wraps. No source chain is dropped here.
-fn pos_del_load_failed_error(file_path: &str, reason: &str) -> Error {
-    Error::new(
-        ErrorKind::Unexpected,
-        format!(
-            "the loader for positional delete file '{file_path}' terminated without publishing \
-             its deletes: {reason}"
-        ),
-    )
 }
 
 /// The stable engine-facing surface. It mirrors Java `org.apache.iceberg.data.DeleteFilter`.
@@ -825,6 +791,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+    use crate::expr::Predicate::AlwaysTrue;
     use crate::expr::{Bind, Reference};
     use crate::io::FileIO;
     use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, SchemaRef, Type};
@@ -1124,7 +1091,7 @@ pub(crate) mod tests {
             .spawn_publisher(rx);
 
         // No key set (predicate-only path) for this case-sensitivity test.
-        tx.send((pred, None)).unwrap();
+        tx.send((pred, schema.clone(), None)).unwrap();
 
         // ---------- should FAIL ----------
         // BOUNDED: this call reaches the eq-delete wait path, so a lost-wakeup regression never
@@ -1239,7 +1206,8 @@ pub(crate) mod tests {
         };
 
         let filter = DeleteFilter::default();
-        let (tx, rx) = tokio::sync::oneshot::channel::<(Predicate, Option<EqDeleteKeySet>)>();
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<(Predicate, SchemaRef, Option<EqDeleteKeySet>)>();
         filter
             .try_start_eq_del_load("eq-del.parquet")
             .expect("a fresh eq-delete file must be claimable")
@@ -1517,8 +1485,12 @@ pub(crate) mod tests {
                 .try_start_eq_del_load(path)
                 .expect("a fresh eq-delete file must be claimable")
                 .spawn_publisher(rx);
-            tx.send((Reference::new("id").equal_to(Datum::long(value)), None))
-                .expect("the publisher task must be listening");
+            tx.send((
+                Reference::new("id").equal_to(Datum::long(value)),
+                schema.clone(),
+                None,
+            ))
+            .expect("the publisher task must be listening");
         }
 
         // The task lists ONLY eq-del-1, so its predicate must be exactly eq-del-1's.
@@ -2809,15 +2781,17 @@ pub(crate) mod tests {
 
         // Arm through the production seam, as both accessors do.
         let EqDelLookup::Wait(notified) =
-            filter.lookup_or_arm_eq_del("eq-del.parquet", |predicate, _| predicate.clone())
+            filter.lookup_or_arm_eq_del("eq-del.parquet", |predicate, _, _| predicate.clone())
         else {
             panic!("a claimed but unloaded eq-delete file must make the caller wait");
         };
 
         let predicate = Reference::new("id").equal_to(Datum::long(10));
+        let bind_schema: SchemaRef =
+            Arc::new(Schema::builder().build().expect("empty bind schema builds"));
         let (tx, rx) = tokio::sync::oneshot::channel();
         guard.spawn_publisher(rx);
-        tx.send((predicate.clone(), None))
+        tx.send((predicate.clone(), bind_schema.clone(), None))
             .expect("the publisher task must still be listening");
 
         // Drive the publisher to completion BEFORE awaiting. The ordering under test is: notify
@@ -2838,7 +2812,7 @@ pub(crate) mod tests {
                 recover_poison(filter.state.read())
                     .equality_deletes
                     .get("eq-del.parquet"),
-                Some(EqDelState::Loaded(_, _))
+                Some(EqDelState::Loaded(_, _, _))
             ),
             "the publisher must have published before the waiter awaits, or this test proves nothing"
         );
@@ -2849,9 +2823,9 @@ pub(crate) mod tests {
 
         assert_eq!(
             filter
-                .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
+                .get_equality_delete_predicate_and_schema_for_delete_file_path("eq-del.parquet")
                 .await,
-            Some(predicate),
+            Some((predicate, bind_schema)),
             "the woken waiter must read the published predicate"
         );
     }
@@ -2869,7 +2843,7 @@ pub(crate) mod tests {
             .expect("a fresh eq-delete file must be claimable");
 
         let EqDelLookup::Wait(notified) =
-            filter.lookup_or_arm_eq_del("eq-del.parquet", |predicate, _| predicate.clone())
+            filter.lookup_or_arm_eq_del("eq-del.parquet", |predicate, _, _| predicate.clone())
         else {
             panic!("a claimed but unloaded eq-delete file must make the caller wait");
         };
@@ -2884,7 +2858,7 @@ pub(crate) mod tests {
 
         assert!(
             filter
-                .get_equality_delete_predicate_for_delete_file_path("eq-del.parquet")
+                .get_equality_delete_predicate_and_schema_for_delete_file_path("eq-del.parquet")
                 .await
                 .is_none(),
             "a terminally failed eq-delete load must read as absence, so the caller errors"
@@ -2909,8 +2883,11 @@ pub(crate) mod tests {
                 .build()
                 .expect("build the throwaway runtime that hosts the publisher task");
             let tx = runtime.block_on(async {
-                let (tx, rx) =
-                    tokio::sync::oneshot::channel::<(Predicate, Option<EqDeleteKeySet>)>();
+                let (tx, rx) = tokio::sync::oneshot::channel::<(
+                    Predicate,
+                    SchemaRef,
+                    Option<EqDeleteKeySet>,
+                )>();
                 filter_for_teardown
                     .try_start_eq_del_load("eq-del.parquet")
                     .expect("a fresh eq-delete file must be claimable")
@@ -2925,7 +2902,7 @@ pub(crate) mod tests {
 
         let predicate = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            filter.get_equality_delete_predicate_for_delete_file_path("eq-del.parquet"),
+            filter.get_equality_delete_predicate_and_schema_for_delete_file_path("eq-del.parquet"),
         )
         .await
         .expect("a never-polled publisher must not hang the waiter");
