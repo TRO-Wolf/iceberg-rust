@@ -47,7 +47,7 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | `partition_value_calculator.rs` | partition values from data batches |
 | `nan_val_cnt_visitor.rs` | NaN / null-count metric collection |
 | `delete_filter.rs` | merge-on-read delete filtering over batches |
-| `delete_file_loader.rs` / `caching_delete_file_loader.rs` | delete-file loading (+ cached) |
+| `delete_file_loader.rs` / `caching_delete_file_loader.rs` | delete-file loading (+ cached). F-POSDEL-FORMAT-READ-1: position and equality deletes open with the reader for the task's `file_format` (parquet as before; Avro/ORC through the whole-file readers over the reserved `file_path`+`pos` schema / the key-column subset schema; Puffin rows refuse `FeatureUnsupported`) |
 | `equality_delete_set.rs` | equality-delete keyset matching |
 | `avro_reader.rs` (+ `avro_reader_tests.rs`) | Avro whole-file reader |
 | `orc_reader.rs` (+ `orc_reader_tests.rs`, `orc_reader/`) | ORC whole-file reader |
