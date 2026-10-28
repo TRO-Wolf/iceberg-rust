@@ -31,7 +31,7 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | File | What it does |
 |---|---|
 | `reader.rs` | `ArrowReader`: Parquet/Avro/ORC task execution — projection masks, `RowFilter` planning via `row_filter_plan`, row-group + page-index pruning, the post-decode residual (`RowFilterPlan::Residual` → `evaluate_predicate_to_mask` → prune extra columns), fallback field-id stamping for id-less files (`add_fallback_field_ids_to_arrow_schema`: table-name match, Java-counter fallback) |
-| `row_filter_plan.rs` | `plan_row_filter`: `Push` (leaf-index map incl. group ids) vs `Residual` (present-but-unmapped ids on id-less files); `top_level_ancestor_id`, `unmapped_group_leaf_indices`, `leaf_count`; `PushedRowFilter { filter, disable_predicate_cache }` + `apply_to_stream` (`pushed_mask_disables_predicate_cache`, `group_is_list`) turns the predicate cache off when the pushed mask selects the leaf of a single-leaf non-LIST group root, which would otherwise panic in parquet's cached array reader |
+| `row_filter_plan.rs` | `plan_row_filter`: `Push` (leaf-index map incl. group ids) vs `Residual` (present-but-unmapped ids on id-less files); `top_level_ancestor_id`, `unmapped_group_leaf_indices`, `leaf_count`; `PushedRowFilter { filter, disable_predicate_cache }` + `apply_to_stream` (`pushed_mask_disables_predicate_cache`, `group_is_list`) turns the predicate cache off when the pushed mask selects the leaf of a single-leaf non-LIST group root, which would otherwise panic in parquet's cached array reader. Predicate ids absent from the task schema (equality deletes on dropped keys) fail loud with `FeatureUnsupported` outside the embedded-id `Push` path, which reads them from the data file by id |
 | `evolution_nested_null_tests.rs` | **test-only** schema-evolution pins: a STRUCT / MAP / LIST / struct-keyed MAP column added after a Parquet file was written reads as typed nulls for that file, and as values for files written after the ALTER |
 | `row_filter_nested_tests.rs` | **test-only** red-first pin: `IS NULL` on an optional single-leaf struct with the struct projected returns only the null-struct row (parquet predicate-cache panic guard) |
 | `record_batch_predicate.rs` | `evaluate_predicate_to_mask`: `BoundPredicate` → `BooleanArray` over one batch, resolving references by field-id path with parent-validity propagation (`column_at_path` + `null_propagation`) |
@@ -46,8 +46,10 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | `value.rs` (+ `value_tests.rs`, `value_tail_tests.rs`) | Arrow value conversion |
 | `partition_value_calculator.rs` | partition values from data batches |
 | `nan_val_cnt_visitor.rs` | NaN / null-count metric collection |
-| `delete_filter.rs` | merge-on-read delete filtering over batches |
-| `delete_file_loader.rs` / `caching_delete_file_loader.rs` | delete-file loading (+ cached) |
+| `delete_filter.rs` | merge-on-read delete filtering over batches; each equality-delete predicate binds against its own file's schema (dropped keys resolve by field id, never by name) |
+| `delete_file_loader.rs` / `caching_delete_file_loader.rs` | delete-file loading (+ cached); equality deletes evolve against a per-file schema (current definitions for present ids, the delete file's own columns for dropped ids) |
+| `pos_delete_parse.rs` | positional-delete stream parsing, moved out of the caching loader: per-data-file delete vectors from path+pos batches; short arity, null cells and negative positions fail closed |
+| `pos_del_claim.rs` | positional-delete load-claim key derivation (a parquet file claims under its path, a Puffin deletion vector under `{path}@{offset}`) + the terminal-failure error renderer |
 | `equality_delete_set.rs` | equality-delete keyset matching |
 | `avro_reader.rs` (+ `avro_reader_tests.rs`) | Avro whole-file reader |
 | `orc_reader.rs` (+ `orc_reader_tests.rs`, `orc_reader/`) | ORC whole-file reader |
@@ -85,6 +87,8 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | Matching rows dropped under page-index row selection | unmapped GROUP ids must fail open (`field_id_names_a_group`), never `CantMatch` (pin: M9) |
 | NULL struct parent reads as non-null child | Arrow validity does not propagate down; every struct descent must go through `array_with_parent_validity` |
 | Rows duplicated on AVRO/ORC splits | whole-file readers ignore byte ranges — see [../scan/map.md#debug](../scan/map.md#debug) |
+| `FeatureUnsupported` naming dropped column ids on a `_deleted` projection or an id-less file | equality deletes on dropped keys apply only through the embedded-id `Push` path; residual and id-less reads fail loud by design (F-EQDEL-DROPPED-KEY-1) instead of silently keeping deleted rows |
+| Avro/ORC/`_pos` scan errors after `DROP` of an equality-delete key | `build_expected_schema` / the keyset apply seam reject the schema-absent id (loud, as at base); only the Parquet pushdown path applies dropped-key deletes — known residue, ledger F-EQDEL-DROPPED-KEY-1 § Follow-ups |
 
 ### First checks
 

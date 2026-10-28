@@ -1108,12 +1108,9 @@ mod tests {
         let stream_batches: Vec<crate::Result<RecordBatch>> =
             batches.iter().cloned().map(Ok).collect();
         let stream = Box::pin(stream::iter(stream_batches)) as ArrowRecordBatchStream;
-        let actual_map = parse_positional_deletes_record_batch_stream(
-            "pos-dels.parquet",
-            stream,
-        )
-        .await
-        .expect("parse positional deletes");
+        let actual_map = parse_positional_deletes_record_batch_stream("pos-dels.parquet", stream)
+            .await
+            .expect("parse positional deletes");
 
         let actual: HashMap<String, Vec<u64>> = actual_map
             .into_iter()
@@ -1402,12 +1399,10 @@ mod tests {
 
         for (batch, arity) in [(one_col, 1usize), (no_col, 0usize)] {
             let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
-            let error = parse_positional_deletes_record_batch_stream(
-                "truncated-pos-dels.parquet",
-                stream,
-            )
-            .await
-            .expect_err("a short column arity must fail closed with a typed error");
+            let error =
+                parse_positional_deletes_record_batch_stream("truncated-pos-dels.parquet", stream)
+                    .await
+                    .expect_err("a short column arity must fail closed with a typed error");
 
             assert_eq!(error.kind(), ErrorKind::DataInvalid);
             assert!(
@@ -1447,12 +1442,10 @@ mod tests {
         .expect("build three-column position delete batch");
         let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
 
-        let result = parse_positional_deletes_record_batch_stream(
-            "pos-dels-with-row.parquet",
-            stream,
-        )
-        .await
-        .expect("a delete file carrying the optional `row` column must still parse");
+        let result =
+            parse_positional_deletes_record_batch_stream("pos-dels-with-row.parquet", stream)
+                .await
+                .expect("a delete file carrying the optional `row` column must still parse");
 
         let deletes = result
             .get("data-1.parquet")
@@ -1480,12 +1473,10 @@ mod tests {
         .expect("build batch with null file_path");
         let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
 
-        let error = parse_positional_deletes_record_batch_stream(
-            "corrupt-pos-dels.parquet",
-            stream,
-        )
-        .await
-        .expect_err("a null file_path must fail closed with a typed error");
+        let error =
+            parse_positional_deletes_record_batch_stream("corrupt-pos-dels.parquet", stream)
+                .await
+                .expect_err("a null file_path must fail closed with a typed error");
 
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
         assert!(
