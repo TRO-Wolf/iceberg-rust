@@ -60,12 +60,12 @@ conditional read-fully-and-select-by-name arm was not needed.
 - `BasicDeleteFileLoader::equality_delete_batch_stream(&task, &schema, ids)`:
   Parquet keeps the exact old call; Avro/ORC read over
   `equality_delete_expected_schema` (the top-level fields containing the key
-  ids, in table order; unknown ids are skipped, and an empty subset yields an
-  empty stream, which the equality parse folds to `AlwaysTrue` exactly as its
-  empty-columns arm does) and then run the unchanged `evolve_schema`; Puffin
-  refuses `FeatureUnsupported` naming the file. A nested key column resolves
-  on Avro (the reader descends by id) and refuses loud on ORC (the reader's v1
-  scope is top-level primitives).
+  ids, in table order; an id absent from the current schema refuses
+  `DataInvalid` naming the file and the field id, so a dropped key fails loud
+  instead of applying no delete — fold-2 V-1) and then run the unchanged
+  `evolve_schema`; Puffin refuses `FeatureUnsupported` naming the file. A
+  nested key column resolves on Avro (the reader descends by id) and refuses
+  loud on ORC (the reader's v1 scope is top-level primitives).
 - The `DeleteFileLoader::read_delete_file` trait impl routes through the same
   two methods, so the trait door and the caching door cannot drift.
 
@@ -76,9 +76,11 @@ conditional read-fully-and-select-by-name arm was not needed.
 | C-001 | Avro MoR table: `DELETE WHERE id BETWEEN 1 AND 3` scans `[0, 4]`; second `DELETE` of id 4 scans `[0]` | PROVEN | `test_mor_delete_on_avro_writes_avro_delete_file`, `test_avro_position_deletes_read_back_two_columns_in_order` |
 | C-002 | Same, ORC | PROVEN | `test_mor_delete_on_orc_writes_orc_delete_file`, `test_orc_position_deletes_read_back_two_columns_in_order` |
 | C-003 | Parquet MoR table: same two-delete shape answers `[0, 4]` then `[0]`; no parquet behavior changed | PROVEN | `test_mor_delete_parquet_reads_back_two_deletes`; full suites green (§Gates) |
-| C-004 | Equality deletes dispatch by format and keep parquet semantics | OPEN | No Avro/ORC equality-delete fixture exists in the suite (Spark writes parquet equality deletes; the fork never writes equality deletes, it converts them), and `delete_file_loader.rs` sits 36 lines under its ceiling, so no direct pin fit. The parquet arm is the unchanged call, covered by the existing equality pins, all green. The Avro/ORC arms share the proven pos-delete reader plumbing and the unchanged `evolve_schema`. |
+| C-004 | Equality deletes dispatch by format and keep parquet semantics | PROVEN | Live-key happy path, closed in fold-2: the verifier measured Avro-on-Parquet, ORC-on-Parquet, Avro-on-Avro, ORC-on-ORC and the Parquet control each answering `y = [0, 10, 40]` after an equality delete on `y in {20, 30}`, key-less projections included; pinned in-suite by `test_avro_equality_delete_with_live_key_applies_without_key_projection` and the ORC twin in `crates/iceberg/tests/mor_eqdel_format.rs`. Dropped-key refusal is C-007. |
 | C-005 | A format the loader cannot read refuses `FeatureUnsupported` naming the file and the format | OPEN | Same ceiling reason as C-004: no pin fit for the two Puffin-row refusal arms. Both are unreachable in-suite (Puffin position deletes route to the deletion-vector path first; Puffin equality deletes are never written). Each is a 6-line error constructor with the file path and the format in the message. |
 | C-006 | No neighboring answer changed | PROVEN | Gates: `iceberg --lib arrow::` 537/0, `iceberg-datafusion` 802/0 across 43 suites, clippy `-D warnings`, fmt. Base `mor_delete_format` run (11/11) matches the 10 pre-existing tests at head plus the new control. |
+| C-007 | An equality key absent from the current schema refuses instead of applying no delete | PROVEN | Fold-2 V-1: `equality_delete_expected_schema` returns `DataInvalid` naming the file and the field id; the empty-expected-schema arm now only covers an empty id list. Red-first: pre-fix the Avro and ORC dropped-key scans answered all five rows; pinned by `test_avro_equality_delete_with_dropped_key_refuses` and the ORC twin in `crates/iceberg/tests/mor_eqdel_format.rs`. |
+| C-008 | The legacy position-delete load dispatches on file format | PROVEN | Fold-2 V-2: `load_legacy_positions_by_path` builds a `FileScanTaskDeleteFile` and reads through `position_delete_batch_stream` instead of the Parquet loader. Pinned by `avro_position_delete_loads_positions_by_path` (red against the Parquet-only call, restored green). Parquet behavior unchanged: the partition-scoped call is identical, and the file-scoped projection difference is invisible to the pos-only parser. |
 
 ## Pins
 
@@ -132,10 +134,50 @@ Restored tree: 2 green.
 - `scripts/check_rust_file_size.py`: 698 files clean (after the 3270 to 3263
   ceiling move).
 
+## Fold-2 — verifier round 1 (one S1, two S3)
+
+**Date:** 2026-10-28. **Branch:** `fix/posdel-format-read-1`, commits
+`e887c9ec` (item 1), `cb22348c` (item 2), `4e18f3c9` (item 3), and this
+commit (item 4, records only).
+
+**Model:** builder Muse Spark (`muse-spark-1.3-contributor`).
+
+- **V-1, S1.** An equality id absent from the current schema was skipped in
+  `equality_delete_expected_schema`; with every key dropped the empty expected
+  schema produced an empty stream that folded to `AlwaysTrue`, so Avro/ORC
+  scans silently resurrected deleted rows. Fixed in `e887c9ec`: any
+  unresolvable id refuses `DataInvalid` naming the file and the field id, and
+  the empty-stream arm now only covers an empty id list (the Parquet-arm
+  outcome for that edge). The field-id resolution that closes the sequence
+  for every format lands in F-EQDEL-DROPPED-KEY-1, out of scope here.
+- **V-2, S3.** `load_legacy_positions_by_path` opened every live non-DV
+  position delete with the Parquet loader. Fixed in `4e18f3c9`: it builds a
+  `FileScanTaskDeleteFile` and reads through `position_delete_batch_stream`.
+  The two required doc lines on the touched items were reworded in place
+  (parquet-only text was false after the dispatch); no net-new comments.
+- **V-3, S3.** This ledger described the unknown-id skip as a design choice;
+  it was the defect. C-004 is rewritten and closed PROVEN for the live-key
+  happy path on the verifier's measurement plus the new pins; C-007
+  (dropped-key refusal) and C-008 (legacy door) are new PROVEN rows. Map rows:
+  `crates/iceberg/tests/map.md` gains the new test file;
+  `crates/iceberg/src/arrow/map.md` gains the refusal clause.
+  `delete_vector_container/` has no `map.md` (nor does `src/`), so per the
+  navigation rule none was created for the V-2 door.
+
+Red runs, fold-2: the four new `mor_eqdel_format` tests run 2 red / 2 green
+pre-fix (both dropped-key scans answered all five rows; both live-key pins
+already green), 4 green post-fix. The V-2 unit pin runs red against the
+temporarily restored Parquet-only call and green after the restore.
+
+Gate results for the fold-2 head live in the round hand-back, not here: the
+brief runs the gate after the last commit.
+
 ## Follow-ups (out of scope)
 
-1. C-004 and C-005 want pins once a ceiling split frees room in
-   `delete_file_loader.rs`, or an Avro/ORC equality-delete fixture exists.
+1. C-004 is pinned by `crates/iceberg/tests/mor_eqdel_format.rs` in
+   fold-2 (the pins live outside `delete_file_loader.rs`, so no ceiling split
+   was needed). C-005 still wants pins once a ceiling split frees room in
+   `delete_file_loader.rs`, or a Puffin-row fixture exists.
 2. `crates/iceberg/src/inspect/position_deletes.rs` (`read_delete_file_rows`)
    keeps its own door: the `position_deletes` metadata table reads Parquet
    delete files and Puffin deletion vectors and refuses Avro/ORC with a typed
