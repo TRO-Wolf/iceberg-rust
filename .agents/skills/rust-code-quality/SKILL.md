@@ -41,6 +41,8 @@ Machine-held, so a reviewer's finding on these is a duplicate, not a catch:
 - **TOML**: `make check-toml` (`taplo check`). **Unused deps**: `make cargo-machete`.
 - **Agent-session artifacts**: `scripts/check_agent_artifacts.sh` — tool-call wrapper tags cannot be
   committed.
+- **Model ban**: `scripts/check_model_ban.sh` — no tracked file names an Opus 5.0 model id in any
+  spelling; Opus means `claude-opus-5-5` (owner ruling 2026-10-17). Self-tests its pattern first.
 - **GAP_MATRIX structure**: `scripts/check_matrix_anchors.sh` — the 5-pipe row audit, the permanent
   `R<id>` anchors, and that every `row R<id>` citation *resolves*.
 - **Spelling**: `typos .`.

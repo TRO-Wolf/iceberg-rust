@@ -51,6 +51,15 @@ one.
 Everything else stays banned. If a fact seems to need a code comment, it belongs in a `task/`
 ledger or a matrix row instead — that routing rule is unchanged and is now the only route.
 
+# OWNER RULING (2026-10-17) — OPUS 5.0 IS BANNED FOREVER; OPUS MEANS OPUS 5.5
+
+**EFFECTIVE IMMEDIATELY AND PERMANENTLY. NO ACTOR, CRITIC, EXECUTOR, VERIFIER, SKETCHER OR CLERK RUNS ON OPUS 5.0. EVERY OPUS DISPATCH IS CLAUDE OPUS 5.5 (`claude-opus-5-5`) AND NOTHING ELSE.**
+
+*Mechanics (owner, 2026-10-17, same night):* a brief, trailer, workflow, launcher or skill that names an
+Opus model names `claude-opus-5-5`; the bare alias `opus` is allowed only where the tool resolves it to
+that id, and the resolution is verified from the agent transcript, never from the brief.
+`make check-model-ban` (in `make check` and CI) fails any tracked file that names a 5.0 Opus id.
+
 
 This is the **single authoritative contract** for this repository, written for **any contributor —
 human or automated agent**, naming no tool or model. It holds the read order, the precedence chain,
@@ -244,7 +253,7 @@ The canonical entry points are in the [Makefile](Makefile) (run from the repo ro
 ```bash
 make build         # cargo build --all-targets --all-features --workspace
 make check         # fmt --check + clippy -D warnings + taplo TOML check + cargo-machete (unused deps)
-                   #   + check-agent-artifacts + check-matrix-anchors + check-comment-blocks
+                   #   + check-agent-artifacts + check-matrix-anchors + check-comment-blocks + check-model-ban
                    #   + Rust source-file size
 make unit-test     # doc tests + lib tests only (faster)
 make test          # docker-up + cargo nextest run --all-targets --all-features --workspace
