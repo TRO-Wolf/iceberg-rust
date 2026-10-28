@@ -196,10 +196,11 @@ impl BasicDeleteFileLoader {
                 .await
             }
             DataFileFormat::Avro | DataFileFormat::Orc => {
-                let expected = equality_delete_expected_schema(schema, equality_ids)?;
-                if expected.as_struct().fields().is_empty() {
+                if equality_ids.is_empty() {
                     return Ok(Box::pin(futures::stream::empty()));
                 }
+                let expected =
+                    equality_delete_expected_schema(schema, equality_ids, &task.file_path)?;
                 let input = self.file_io.new_input(&task.file_path)?;
                 let batches = if task.file_format == DataFileFormat::Avro {
                     read_avro_data_file(&input, expected, DELETE_FILE_READ_BATCH_SIZE).await?
@@ -267,12 +268,22 @@ impl BasicDeleteFileLoader {
     }
 }
 
-fn equality_delete_expected_schema(schema: &Schema, equality_ids: &[i32]) -> Result<Arc<Schema>> {
+fn equality_delete_expected_schema(
+    schema: &Schema,
+    equality_ids: &[i32],
+    delete_file_path: &str,
+) -> Result<Arc<Schema>> {
     let mut wanted = HashSet::new();
     for id in equality_ids {
-        if let Some(top) = top_level_ancestor_id(schema, *id) {
-            wanted.insert(top);
-        }
+        let Some(top) = top_level_ancestor_id(schema, *id) else {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Equality delete '{delete_file_path}' references equality field id {id} that is absent from the current schema"
+                ),
+            ));
+        };
+        wanted.insert(top);
     }
     let fields: Vec<NestedFieldRef> = schema
         .as_struct()
