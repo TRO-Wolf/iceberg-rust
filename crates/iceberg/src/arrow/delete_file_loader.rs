@@ -18,24 +18,25 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_schema::Schema as ArrowSchema;
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::schema::types::SchemaDescriptor;
 
+use crate::arrow::ArrowReader;
 use crate::arrow::avro_reader::read_avro_data_file;
+use crate::arrow::eq_delete_schema::{
+    equality_delete_schema, parquet_key_schema, whole_file_equality_delete_batches,
+};
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
-use crate::arrow::row_filter_plan::top_level_ancestor_id;
-use crate::arrow::{ArrowReader, arrow_schema_to_schema};
 use crate::io::FileIO;
 use crate::metadata_columns::{
     RESERVED_COL_NAME_DELETE_FILE_PATH, RESERVED_COL_NAME_DELETE_FILE_POS,
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{DataFileFormat, NestedField, NestedFieldRef, Schema, SchemaRef};
+use crate::spec::{DataFileFormat, Schema, SchemaRef};
 use crate::writer::base_writer::position_delete_writer::pos_delete_schema;
 use crate::{Error, ErrorKind, Result};
 
@@ -140,63 +141,6 @@ impl BasicDeleteFileLoader {
         ))
     }
 
-    pub(crate) fn equality_delete_schema(
-        current_schema: &Schema,
-        delete_file_arrow_schema: &ArrowSchema,
-        equality_ids: &[i32],
-    ) -> Result<Schema> {
-        let mut fields: Vec<NestedFieldRef> = Vec::with_capacity(equality_ids.len());
-        let mut seen: HashSet<i32> = HashSet::new();
-        let mut used_names: HashSet<String> = HashSet::new();
-        let needs_recovery = equality_ids
-            .iter()
-            .any(|id| current_schema.field_by_id(*id).is_none());
-        let delete_schema = if needs_recovery {
-            Some(arrow_schema_to_schema(delete_file_arrow_schema)?)
-        } else {
-            None
-        };
-        for &id in equality_ids {
-            if !seen.insert(id) {
-                continue;
-            }
-            let source: NestedFieldRef = match current_schema.field_by_id(id) {
-                Some(field) => field.clone(),
-                None => delete_schema
-                    .as_ref()
-                    .and_then(|schema| schema.field_by_id(id))
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "equality delete file is missing its key column with field id {id}"
-                            ),
-                        )
-                    })?,
-            };
-            let mut name = source.name.clone();
-            while used_names.contains(&name.to_lowercase()) {
-                name.push('_');
-            }
-            used_names.insert(name.to_lowercase());
-            if name == source.name {
-                fields.push(source);
-            } else {
-                fields.push(Arc::new(NestedField {
-                    id: source.id,
-                    name,
-                    required: source.required,
-                    field_type: source.field_type.clone(),
-                    doc: source.doc.clone(),
-                    initial_default: source.initial_default.clone(),
-                    write_default: source.write_default.clone(),
-                }));
-            }
-        }
-        Schema::builder().with_fields(fields).build()
-    }
-
     /// Project only the reserved positional-delete columns (`file_path` + `pos`).
     ///
     /// Used by the MoR pos-delete load path so the optional third `row` column (and any other
@@ -255,7 +199,7 @@ impl BasicDeleteFileLoader {
         schema: &Schema,
         equality_ids: &[i32],
     ) -> Result<(ArrowRecordBatchStream, SchemaRef)> {
-        match task.file_format {
+        let (raw_stream, delete_schema) = match task.file_format {
             DataFileFormat::Parquet => {
                 let (stream, delete_arrow_schema) = self
                     .parquet_stream_and_arrow_schema(
@@ -264,40 +208,31 @@ impl BasicDeleteFileLoader {
                         Some(equality_ids),
                     )
                     .await?;
-                let delete_schema = Arc::new(Self::equality_delete_schema(
-                    schema,
-                    &delete_arrow_schema,
-                    equality_ids,
-                )?);
-                Ok((stream, delete_schema))
+                let file_schema = parquet_key_schema(&delete_arrow_schema, equality_ids)?;
+                let delete_schema =
+                    equality_delete_schema(schema, &file_schema, equality_ids, &task.file_path)?;
+                (stream, Arc::new(delete_schema))
             }
             DataFileFormat::Avro | DataFileFormat::Orc => {
-                let expected =
-                    equality_delete_expected_schema(schema, equality_ids, &task.file_path)?;
-                if equality_ids.is_empty() {
-                    return Ok((Box::pin(futures::stream::empty()), expected));
-                }
-                let input = self.file_io.new_input(&task.file_path)?;
-                let batches = if task.file_format == DataFileFormat::Avro {
-                    read_avro_data_file(&input, expected.clone(), DELETE_FILE_READ_BATCH_SIZE)
-                        .await?
-                } else {
-                    read_orc_data_file(&input, expected.clone(), DELETE_FILE_READ_BATCH_SIZE)
-                        .await?
-                };
-                Ok((
-                    Box::pin(futures::stream::iter(batches.into_iter().map(Ok))),
-                    expected,
-                ))
+                let (batches, delete_schema) =
+                    whole_file_equality_delete_batches(&self.file_io, task, schema, equality_ids)
+                        .await?;
+                let stream: ArrowRecordBatchStream =
+                    Box::pin(futures::stream::iter(batches.into_iter().map(Ok)));
+                (stream, delete_schema)
             }
-            DataFileFormat::Puffin => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!(
-                    "Cannot read equality deletes from Puffin file '{}': Puffin holds deletion vectors, not equality-delete rows",
-                    task.file_path
-                ),
-            )),
-        }
+            DataFileFormat::Puffin => {
+                return Err(Error::new(
+                    ErrorKind::FeatureUnsupported,
+                    format!(
+                        "Cannot read equality deletes from Puffin file '{}': Puffin holds deletion vectors, not equality-delete rows",
+                        task.file_path
+                    ),
+                ));
+            }
+        };
+        let evolved = Self::evolve_schema(raw_stream, delete_schema.clone(), equality_ids).await?;
+        Ok((evolved, delete_schema))
     }
 
     /// Reads `length` bytes at `offset` from `file_path`.
@@ -347,38 +282,6 @@ impl BasicDeleteFileLoader {
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
-}
-
-fn equality_delete_expected_schema(
-    schema: &Schema,
-    equality_ids: &[i32],
-    delete_file_path: &str,
-) -> Result<Arc<Schema>> {
-    let mut wanted = HashSet::new();
-    for id in equality_ids {
-        let Some(top) = top_level_ancestor_id(schema, *id) else {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Equality delete '{delete_file_path}' references equality field id {id} that is absent from the current schema"
-                ),
-            ));
-        };
-        wanted.insert(top);
-    }
-    let fields: Vec<NestedFieldRef> = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .filter(|field| wanted.contains(&field.id))
-        .cloned()
-        .collect();
-    Ok(Arc::new(
-        Schema::builder()
-            .with_schema_id(schema.schema_id())
-            .with_fields(fields)
-            .build()?,
-    ))
 }
 
 /// Best-effort projection mask for delete-file columns.
@@ -466,12 +369,10 @@ impl DeleteFileLoader for BasicDeleteFileLoader {
         schema: SchemaRef,
     ) -> Result<ArrowRecordBatchStream> {
         match &task.equality_ids {
-            Some(ids) => {
-                let (raw_batch_stream, delete_schema) = self
-                    .equality_delete_batch_stream(task, &schema, ids.as_slice())
-                    .await?;
-                Self::evolve_schema(raw_batch_stream, delete_schema, ids).await
-            }
+            Some(ids) => Ok(self
+                .equality_delete_batch_stream(task, &schema, ids.as_slice())
+                .await?
+                .0),
             None => {
                 let raw_batch_stream = self.position_delete_batch_stream(task).await?;
                 let field_ids: Vec<i32> = schema.field_id_to_name_map().keys().cloned().collect();

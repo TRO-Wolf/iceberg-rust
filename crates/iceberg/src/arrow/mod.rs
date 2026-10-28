@@ -33,6 +33,7 @@ pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
 pub mod delete_file_loader;
 pub(crate) mod delete_filter;
+pub(crate) mod eq_delete_schema;
 pub use delete_filter::DeleteFilter;
 pub(crate) mod equality_delete_set;
 

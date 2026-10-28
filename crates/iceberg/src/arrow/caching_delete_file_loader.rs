@@ -300,15 +300,9 @@ impl CachingDeleteFileLoader {
                         ),
                     ));
                 };
-                let (raw_stream, delete_schema) = basic_delete_file_loader
+                let (evolved_stream, delete_schema) = basic_delete_file_loader
                     .equality_delete_batch_stream(task, &schema, &equality_ids_vec)
                     .await?;
-                let evolved_stream = BasicDeleteFileLoader::evolve_schema(
-                    raw_stream,
-                    delete_schema.clone(),
-                    &equality_ids_vec,
-                )
-                .await?;
 
                 Ok(DeleteFileContext::FreshEqDel {
                     batch_stream: evolved_stream,

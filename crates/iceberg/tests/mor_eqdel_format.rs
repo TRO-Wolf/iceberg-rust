@@ -41,7 +41,7 @@ use iceberg::writer::file_writer::{
     AvroWriterBuilder, FileWriterBuilder, OrcWriterBuilder, ParquetWriterBuilder,
 };
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation};
+use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 use tempfile::TempDir;
 
 fn two_col_schema(key_name: &str, value_name: &str) -> Schema {
@@ -258,7 +258,7 @@ async fn scan_strings(table: &Table, column: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn test_avro_equality_delete_with_dropped_key_refuses() {
+async fn test_avro_equality_delete_with_dropped_key_answers_survivors() {
     let (catalog, table, _warehouse) = setup(two_col_schema("id", "data")).await;
     let data = write_data_file(&table, vec![10, 20, 30, 40, 50], vec![
         "a", "b", "c", "d", "e",
@@ -281,27 +281,15 @@ async fn test_avro_equality_delete_with_dropped_key_refuses() {
     );
     let table = commit_eq_delete(&catalog, &table, delete).await;
     let table = drop_column(&catalog, &table, "id").await;
-    match scan_batches_result(&table, "data").await {
-        Ok(batches) => {
-            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-            panic!("a dropped equality key must refuse, got {rows} rows");
-        }
-        Err(err) => {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid, "refusal kind: {err:?}");
-            assert!(
-                err.message().contains(&delete_path),
-                "refusal names the delete file: {err:?}"
-            );
-            assert!(
-                err.message().contains("field id 1"),
-                "refusal names the missing field id: {err:?}"
-            );
-        }
-    }
+    assert_eq!(
+        scan_strings(&table, "data").await,
+        vec!["a".to_string(), "c".to_string(), "e".to_string()],
+        "the delete keeps applying by field id after its key column is dropped"
+    );
 }
 
 #[tokio::test]
-async fn test_orc_equality_delete_with_dropped_key_refuses() {
+async fn test_orc_equality_delete_with_dropped_key_answers_survivors() {
     let (catalog, table, _warehouse) = setup(two_col_schema("id", "data")).await;
     let data = write_data_file(&table, vec![10, 20, 30, 40, 50], vec![
         "a", "b", "c", "d", "e",
@@ -324,23 +312,11 @@ async fn test_orc_equality_delete_with_dropped_key_refuses() {
     );
     let table = commit_eq_delete(&catalog, &table, delete).await;
     let table = drop_column(&catalog, &table, "id").await;
-    match scan_batches_result(&table, "data").await {
-        Ok(batches) => {
-            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-            panic!("a dropped equality key must refuse, got {rows} rows");
-        }
-        Err(err) => {
-            assert_eq!(err.kind(), ErrorKind::DataInvalid, "refusal kind: {err:?}");
-            assert!(
-                err.message().contains(&delete_path),
-                "refusal names the delete file: {err:?}"
-            );
-            assert!(
-                err.message().contains("field id 1"),
-                "refusal names the missing field id: {err:?}"
-            );
-        }
-    }
+    assert_eq!(
+        scan_strings(&table, "data").await,
+        vec!["a".to_string(), "c".to_string(), "e".to_string()],
+        "the delete keeps applying by field id after its key column is dropped"
+    );
 }
 
 #[tokio::test]
