@@ -27,10 +27,11 @@ use crate::io::FileIO;
 use crate::metadata_columns::{
     RESERVED_FIELD_ID_DELETE_FILE_PATH, RESERVED_FIELD_ID_DELETE_FILE_POS,
 };
+use crate::scan::FileScanTaskDeleteFile;
 use crate::spec::{DataContentType, DataFile, PrimitiveLiteral, Struct};
 use crate::{Error, ErrorKind, Result};
 
-/// Live parquet position-delete that names a touched data file.
+/// Live position-delete that names a touched data file.
 #[derive(Debug, Clone)]
 pub struct LegacyPositionDelete {
     /// The delete file.
@@ -43,7 +44,7 @@ pub struct LegacyPositionDelete {
     pub data_sequence_number: Option<i64>,
 }
 
-/// Positions grouped by data-file path, one projected parquet read of `delete`.
+/// Positions grouped by data-file path, one format-dispatched read of `delete`.
 pub async fn load_legacy_positions_by_path(
     file_io: &FileIO,
     delete: &LegacyPositionDelete,
@@ -59,21 +60,19 @@ pub async fn load_legacy_positions_by_path(
         ));
     }
     let loader = BasicDeleteFileLoader::new(file_io.clone());
-    let field_ids: &[i32] = if delete.file_scoped {
-        &[RESERVED_FIELD_ID_DELETE_FILE_POS]
-    } else {
-        &[
-            RESERVED_FIELD_ID_DELETE_FILE_PATH,
-            RESERVED_FIELD_ID_DELETE_FILE_POS,
-        ]
+    let task = FileScanTaskDeleteFile {
+        file_path: delete.file.file_path().to_string(),
+        file_size_in_bytes: delete.file.file_size_in_bytes,
+        file_type: DataContentType::PositionDeletes,
+        partition_spec_id: delete.file.partition_spec_id(),
+        equality_ids: None,
+        file_format: delete.file.file_format(),
+        referenced_data_file: delete.file.referenced_data_file_ref().map(str::to_string),
+        content_offset: None,
+        content_size_in_bytes: None,
+        record_count: None,
     };
-    let mut stream = loader
-        .parquet_to_batch_stream_with_projection(
-            delete.file.file_path(),
-            delete.file.file_size_in_bytes,
-            Some(field_ids),
-        )
-        .await?;
+    let mut stream = loader.position_delete_batch_stream(&task).await?;
     let mut out: HashMap<String, Vec<u64>> = HashMap::new();
     let file_scoped_key = if delete.file_scoped {
         referenced_location_ref(&delete.file)
@@ -367,12 +366,22 @@ pub(super) fn finalize_legacy(
 #[cfg(test)]
 mod scope_tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
 
-    use super::{PendingLegacy, file_path_bounds_admit, finalize_legacy, partition_matches};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+    use tempfile::TempDir;
+
+    use super::{
+        LegacyPositionDelete, PendingLegacy, file_path_bounds_admit, finalize_legacy,
+        load_legacy_positions_by_path, partition_matches,
+    };
+    use crate::io::FileIO;
     use crate::metadata_columns::RESERVED_FIELD_ID_DELETE_FILE_PATH;
     use crate::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, Struct,
     };
+    use crate::writer::base_writer::position_delete_writer::PositionDeleteWriterConfig;
+    use crate::writer::file_writer::{AvroWriterBuilder, FileWriter, FileWriterBuilder};
 
     fn parquet_delete(spec_id: i32, part: i64) -> DataFile {
         parquet_delete_at("s3://b/d.parquet", spec_id, part)
@@ -539,5 +548,57 @@ mod scope_tests {
         ];
         assert_eq!(out[0].touched, expected);
         assert_eq!(out[1].touched, expected);
+    }
+
+    #[tokio::test]
+    async fn avro_position_delete_loads_positions_by_path() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp
+            .path()
+            .join("pos-del.avro")
+            .to_string_lossy()
+            .to_string();
+        let file_io = FileIO::new_with_fs();
+        let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
+        let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+            Arc::new(StringArray::from(vec!["a.parquet", "b.parquet", "a.parquet"])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![1i64, 5i64, 3i64])) as ArrayRef,
+        ])
+        .expect("pos-delete batch");
+        let output = file_io.new_output(&path).expect("new output");
+        let mut writer = AvroWriterBuilder::new(config.schema().clone())
+            .build(output)
+            .await
+            .expect("build writer");
+        writer.write(&batch).await.expect("write batch");
+        writer.close().await.expect("close writer");
+        let size = std::fs::metadata(&path).expect("stat").len();
+        let file = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path(path)
+            .file_format(DataFileFormat::Avro)
+            .file_size_in_bytes(size)
+            .record_count(3)
+            .partition_spec_id(0)
+            .partition(Struct::from_iter([Some(Literal::long(0))]))
+            .build()
+            .expect("delete file");
+        let delete = LegacyPositionDelete {
+            file,
+            touched: vec!["a.parquet".to_string(), "b.parquet".to_string()],
+            file_scoped: false,
+            data_sequence_number: None,
+        };
+        let index = load_legacy_positions_by_path(&file_io, &delete)
+            .await
+            .expect("load positions");
+        assert_eq!(
+            index.get("a.parquet").map(Vec::as_slice),
+            Some([1u64, 3].as_slice())
+        );
+        assert_eq!(
+            index.get("b.parquet").map(Vec::as_slice),
+            Some([5u64].as_slice())
+        );
     }
 }
