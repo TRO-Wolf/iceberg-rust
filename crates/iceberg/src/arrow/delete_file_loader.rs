@@ -409,6 +409,23 @@ mod tests {
 
     use super::*;
     use crate::arrow::delete_filter::tests::setup;
+    use crate::spec::DataContentType;
+    use crate::writer::base_writer::position_delete_writer::PositionDeleteWriterConfig;
+    use crate::writer::file_writer::{
+        AvroWriterBuilder, FileWriter, FileWriterBuilder, OrcWriterBuilder,
+    };
+
+    async fn write_pos_delete_file(
+        builder: impl FileWriterBuilder,
+        file_io: &FileIO,
+        path: &str,
+        batch: &RecordBatch,
+    ) {
+        let output = file_io.new_output(path).expect("new output");
+        let mut writer = builder.build(output).await.expect("build writer");
+        writer.write(batch).await.expect("write batch");
+        writer.close().await.expect("close writer");
+    }
 
     #[tokio::test]
     async fn test_basic_delete_file_loader_read_delete_file() {
@@ -848,5 +865,100 @@ mod tests {
             refused.is_none(),
             "pos-only request must refuse when only file_path is present"
         );
+    }
+
+    async fn write_then_read_pos_deletes(
+        builder: impl FileWriterBuilder,
+        file_name: &str,
+        file_format: DataFileFormat,
+    ) -> Vec<(String, i64)> {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join(file_name).to_string_lossy().to_string();
+        let file_io = FileIO::new_with_fs();
+        let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
+        let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
+            Arc::new(StringArray::from(vec![
+                "b.parquet",
+                "a.parquet",
+                "b.parquet",
+            ])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![3i64, 1i64, 2i64])) as ArrayRef,
+        ])
+        .expect("pos-delete batch");
+        write_pos_delete_file(builder, &file_io, &path, &batch).await;
+        let file_size_in_bytes = std::fs::metadata(&path).expect("stat").len();
+        let task = FileScanTaskDeleteFile {
+            file_path: path,
+            file_size_in_bytes,
+            file_type: DataContentType::PositionDeletes,
+            partition_spec_id: 0,
+            equality_ids: None,
+            file_format,
+            referenced_data_file: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            record_count: None,
+        };
+        let loader = BasicDeleteFileLoader::new(file_io);
+        let batches = loader
+            .position_delete_batch_stream(&task)
+            .await
+            .expect("stream")
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("collect");
+        assert!(!batches.is_empty(), "the file yields batches");
+        let mut seen = Vec::new();
+        for batch in &batches {
+            assert_eq!(batch.num_columns(), 2);
+            assert_eq!(batch.schema().field(0).name(), "file_path");
+            assert_eq!(batch.schema().field(1).name(), "pos");
+            let paths = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8");
+            let positions = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64");
+            for row in 0..batch.num_rows() {
+                seen.push((paths.value(row).to_string(), positions.value(row)));
+            }
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn test_avro_position_deletes_read_back_two_columns_in_order() {
+        let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
+        let seen = write_then_read_pos_deletes(
+            AvroWriterBuilder::new(config.schema().clone()),
+            "pos-del.avro",
+            DataFileFormat::Avro,
+        )
+        .await;
+        assert_eq!(seen, vec![
+            ("b.parquet".to_string(), 3),
+            ("a.parquet".to_string(), 1),
+            ("b.parquet".to_string(), 2),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn test_orc_position_deletes_read_back_two_columns_in_order() {
+        let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
+        let seen = write_then_read_pos_deletes(
+            OrcWriterBuilder::new(config.schema().clone()),
+            "pos-del.orc",
+            DataFileFormat::Orc,
+        )
+        .await;
+        assert_eq!(seen, vec![
+            ("b.parquet".to_string(), 3),
+            ("a.parquet".to_string(), 1),
+            ("b.parquet".to_string(), 2),
+        ]);
     }
 }
