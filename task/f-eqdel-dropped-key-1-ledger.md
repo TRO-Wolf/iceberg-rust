@@ -19,10 +19,15 @@
 
 # F-EQDEL-DROPPED-KEY-1 — equality deletes survive a dropped, renamed or re-added key column
 
-**Date:** 2026-10-28. **Base:** fork `main` `ea0b7741`. **Branch:**
-`fix/eqdel-dropped-key-1`, commits `ee5e0c97` (fix) and `68ebe908` (pins).
+**Date:** 2026-10-28. **Base:** fork `main` `ea0b7741`, rebased in fold-2 onto
+`56aa8913` (F-POSDEL-FORMAT-READ-1, fork PR #375). **Branch:**
+`fix/eqdel-dropped-key-1`. Fold-1 commits (rebased): `988bebdf` (fix),
+`0e209dea` (pins), `02474b31` (records). Fold-2 commits: `d6f0180b` (item 0,
+rebase follow-through), `414f617f` (item 1), `01e4eb7f` (item 2), `bfec8a9a`
+(item 3), `1afda5ec` (item 4, pins) and the records commit (item 5).
 
-**Model:** builder Muse Spark (`muse-spark-1.3-contributor`).
+**Model:** fold-1 builder Muse Spark (`muse-spark-1.3-contributor`); fold-2
+builder Claude Opus 5.5 (`claude-opus-5-5`).
 
 **Outcome in one line.** A scan no longer fails with `Unexpected => field not
 found` after the key column of a committed equality delete is dropped. The
@@ -150,16 +155,155 @@ passed, 0 failed, 9 ignored.
 
 ## Follow-ups (out of scope)
 
-1. Avro and ORC scans, the `_pos` whole-file path, and compaction
+1. Avro and ORC DATA-file scans and compaction
    (`convert_equality_delete_files.rs`) still fail LOUD on dropped equality
-   keys, exactly as at base. Making them apply the deletes needs the dropped
-   column in their projections, which is scan-projection surgery the brief
-   excludes. No silent flips: every one of these paths errors rather than
-   under-deletes.
-2. `_deleted` projections and id-less Parquet files fail loud with
-   `FeatureUnsupported` naming the dropped ids when such deletes are present.
-   Same status as item 1: loud by design, applied later if the projection
-   work is ever scoped.
+   keys, as at base (`build_expected_schema` refuses the absent id). The
+   fold-1 claim that the `_pos` whole-file path also failed loud, and that
+   there were "no silent flips", was refuted by the verifier (V-EQKEY-1,
+   V-EQKEY-4): that path answered every row. Fold-2 item 1 makes it apply the
+   delete by field id.
+2. `_deleted` projections over the Push/Residual path and id-less Parquet
+   files fail loud with `FeatureUnsupported` naming the dropped ids when such
+   deletes are present: loud by design.
 3. The per-file bind schema is transient (never persisted). A future
    name-based consumer of stored eq-delete predicates must resolve through
    the delete file's own schema, not the current table schema.
+
+## Fold-2 — rebase onto `56aa8913`
+
+`git rebase origin/main` replayed the three fold-1 commits. Conflicts and their
+resolution:
+
+- `caching_delete_file_loader.rs`, equality arm: #375 replaced the Parquet
+  opener with `equality_delete_batch_stream(task, ..)`; this branch opened the
+  Parquet file directly for its per-file schema. Resolved by making
+  `equality_delete_batch_stream` return the stream and the per-file schema
+  for every format, so #375's dispatch and Puffin refusal survive.
+- `delete_file_loader.rs`, imports and `read_delete_file`: both sides kept;
+  the trait door routes equality deletes through the same dispatched
+  function, position deletes through `position_delete_batch_stream`.
+- `scripts/check_rust_file_size.py`: the lower of each ceiling pair
+  (caching loader 3157, delete filter 2915).
+- `arrow/map.md`, `tests/map.md`: rows from both sides kept.
+
+At the replayed head the Avro and ORC equality arms still used #375's
+current-schema expected schema (the interim refusal of a dropped key).
+Fold-2 item 0 (`d6f0180b`) routes them through the per-file resolution:
+the delete file's own schema comes from the Avro writer schema or the ORC
+footer (`orc_top_level_schema`, which now reads the root struct's names and
+the `iceberg.*` type attributes), a dropped key is recovered from it, and
+neither arm returns an empty stream for an unresolvable key. The resolver moves
+to `arrow/eq_delete_schema.rs` (the loader would otherwise pass its 1000-line
+ceiling); the caching-loader ceiling lowers to 3130. Before any new work
+`eqdel_dropped_key` was 3/3 and `mor_eqdel_format` 4/4 on the replayed head.
+
+## Verifier round 1 (Opus 5.5 at `40fa72f7`): FAIL
+
+- **V-EQKEY-1, S1.** With a key the equality fast path does not take (a
+  `decimal` key, or a composite key with a NULL in an earlier column), a scan
+  projecting `_pos` or `_row_id` after the key is dropped answered all five
+  rows: the whole-file projection path returns before `plan_row_filter`, so
+  the guards never ran, and `evaluate_predicate_to_mask` read the absent
+  column as all-NULL under `col != v`. The base failed loud. The DELETE,
+  UPDATE and MERGE position-delete writers scan with `_pos` and `_file`.
+- **V-EQKEY-2, S1.** A spec-shaped equality-delete file keyed on a nested
+  field (`s.k`, equality id of the child) was lifted to the top level by the
+  per-file schema; the transformer filled it with NULL and the delete became
+  `k IS NULL`: the targets were kept and the NULL-key row deleted. The base
+  failed loud.
+- **V-EQKEY-3, S2, pre-existing.** An equality id present in the table but
+  absent from the delete file's own schema read as NULL and over-deleted.
+- **V-EQKEY-4, S3.** The ledger's "no silent flips" and "the `_pos` path
+  errors as at base" sentences were refuted by V-EQKEY-1 (corrected above in
+  Follow-ups).
+- Side observation: dropping the only child of a struct and then scanning
+  panics in the transformer (`StructArray::try_new` unwrap), same on the base.
+
+## Fold-2 clauses
+
+| Id | Claim | Verdict | Pins |
+|---|---|---|---|
+| F2-0 | Avro and ORC equality-delete files resolve a dropped key from their own schema and answer the survivors | PROVEN | `test_avro_equality_delete_with_dropped_key_answers_survivors`, `test_orc_equality_delete_with_dropped_key_answers_survivors` (`mor_eqdel_format.rs`; were the interim refusal pins, red against the replayed head with `DataInvalid ... absent from the current schema`) |
+| F2-1 | V-EQKEY-1: the `_pos` / `_row_id` whole-file path applies a dropped equality key by field id | PROVEN | `decimal_key_dropped_pos_projection_answers_survivors`, `decimal_key_dropped_row_id_projection_answers_survivors`, `composite_key_with_null_first_column_dropped_pos_projection_answers_survivors`, `long_key_dropped_pos_projection_keeps_post_drop_rows` |
+| F2-2 | V-EQKEY-2: a nested key keeps its struct path; nothing is flattened | PROVEN | `nested_key_spec_shaped_delete_answers_survivors`, `nested_key_rust_writer_delete_answers_survivors` (no-regression), `nested_key_with_struct_dropped_is_loud_or_correct` |
+| F2-3 | V-EQKEY-3: an equality id absent from the delete file refuses `DataInvalid` naming the file and the id, in every format | PROVEN | `parquet_delete_file_missing_key_column_refuses`, `avro_delete_file_missing_key_column_refuses`, `orc_delete_file_missing_key_column_refuses` |
+| F2-4 | V-EQKEY-4: the ledger's refuted sentences are corrected | PROVEN | Follow-ups above |
+| F2-5 | No neighbouring answer changed | PROVEN | Gates below: `iceberg` lib 4642/0 (base fold-1 4639 plus #375's 3), every integration binary 0 failed, `iceberg-datafusion` 802/0 |
+| F2-6 | Dropping the only child of a struct then scanning panics in the transformer (`StructArray::try_new` unwrap), same on the base | OPEN | Carded on the RePark side; not touched here |
+| F2-7 | A Rust `EqualityDeleteWriterConfig` keyed on a nested id writes the key flattened to the top level, not under its struct (the Java shape) | OPEN | Read path accepts both shapes (F2-2); writer shape unchanged |
+
+### Design choice for ruling 1
+
+The first option was taken: the dropped key is read from the data file as a
+filter-only column by field id. `row_filter_plan::dropped_equality_key_mask`
+maps every equality id absent from the task schema to the data file's
+Parquet leaves through the embedded field ids (the map the Push row filter
+uses), and the `_pos` / `_row_id` branch of `reader.rs` unions those leaves
+into its own file-level projection mask. That is the reader's own file-level
+read, not the scan projection: `FileScanTask`, `scan/` and the output
+transformer are untouched, and the extra column never reaches the output
+batch. A data file without embedded ids refuses with `FeatureUnsupported`.
+The keyset fast path now returns `None` (predicate oracle) instead of an
+error when a key column is absent from the batch, so a post-drop data file
+keeps its rows (the absent column is all-NULL under `col != v`) and a nested
+key, which the keyset resolves only at the top level, goes to the
+path-resolving predicate. `eq_delete_key_fields_projected` moved from
+`reader.rs` to `equality_delete_set.rs` (comments shed) to keep `reader.rs`
+under its ceiling, which lowers to 9547.
+
+### Design of the per-file schema (rulings 2 and 3)
+
+`eq_delete_schema::equality_delete_schema` compares each equality id's struct
+path in the current schema with its path in the delete file's own schema:
+
+| Current schema | Delete file | Per-file entry |
+|---|---|---|
+| present, same path | present | the current schema pruned to the id, struct path kept |
+| present, nested | top level (Rust writer) | a top-level entry with the current definition |
+| absent | top level | a top-level entry recovered from the file |
+| absent | nested | `FeatureUnsupported` |
+| any | absent | `DataInvalid` naming the file and the id |
+| present, other path, or inside a list or map | | `FeatureUnsupported` |
+
+The delete stream is evolved on the per-file schema's top-level ids, and each
+file's predicate binds against it.
+
+## Fold-2 pins
+
+`crates/iceberg/tests/eqdel_key_paths.rs` (10 tests, new) and the two
+updated `mor_eqdel_format.rs` pins, listed in the clause table.
+
+## Fold-2 red runs
+
+Run R1, the new and updated pins on the replayed head before any fold-2
+code: `eqdel_key_paths` 1 passed, 8 failed (the decimal `_pos` and `_row_id`
+pins and the composite pin answered all five rows; the spec-shaped nested
+pin answered `a, b, c, d, e` (targets kept, NULL-key row `f` deleted); the
+struct-dropped pin answered wrong rows; the three missing-key pins answered
+`a, c` (the NULL-id row over-deleted)); the Rust-writer nested pin passed
+(no-regression); `mor_eqdel_format` 2 passed, 2 failed (`DataInvalid ...
+absent from the current schema`).
+
+Run R2, the same with the long-key post-drop pin and the nested rename added,
+fold-2 sources stashed back to the replayed head: `eqdel_key_paths` 1 passed,
+9 failed; the long-key pin failed loud with `Unexpected => equality-delete
+set fast path: key column 'id' (field id 1) is absent from the data batch`.
+
+Per-commit greens: after item 0, `mor_eqdel_format` 4/4 and
+`eqdel_key_paths` 1/10; after item 1, 5/10 (the four `_pos` / `_row_id`
+pins green); after item 2, 7/10 (nested pins green); after item 3, 10/10.
+
+## Fold-2 gates (measured at `1afda5ec`)
+
+- `cargo test -p iceberg --test eqdel_dropped_key`: exit 0, 3 passed.
+- `cargo test -p iceberg --test eqdel_key_paths`: exit 0, 10 passed.
+- `cargo test -p iceberg --test mor_eqdel_format`: exit 0, 4 passed.
+- `cargo test -p iceberg`: exit 0; lib 4642 passed, 0 failed, 9 ignored;
+  70 result lines in all, 5001 passed, 0 failed, 21 ignored.
+- `cargo test -p iceberg-datafusion`: exit 0; lib 463 passed, 0 failed,
+  5 ignored; 43 result lines in all, 802 passed, 0 failed, 15 ignored.
+- `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings`: exit 0.
+- `cargo fmt --all -- --check`: exit 0.
+- `python3 scripts/check_rust_file_size.py`: exit 0, 704 files clean.
+- Comment gate: 0 added comment lines in every fold-2 commit beyond the
+  Apache licence headers of the two new files.
