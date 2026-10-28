@@ -263,10 +263,7 @@ impl CachingDeleteFileLoader {
                         // `note_failure` hands the error to the guard first, so the waiters' typed
                         // error names the cause and not just the file.
                         let stream = basic_delete_file_loader
-                            .parquet_positional_delete_batch_stream(
-                                &task.file_path,
-                                task.file_size_in_bytes,
-                            )
+                            .position_delete_batch_stream(task)
                             .await
                             .map_err(|error| guard.note_failure(error))?;
                         Ok(DeleteFileContext::PosDels {
@@ -304,11 +301,7 @@ impl CachingDeleteFileLoader {
                 // the ProjectionMask cannot be built safely.
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
                     basic_delete_file_loader
-                        .parquet_to_batch_stream_with_projection(
-                            &task.file_path,
-                            task.file_size_in_bytes,
-                            Some(equality_ids_vec.as_slice()),
-                        )
+                        .equality_delete_batch_stream(task, &schema, &equality_ids_vec)
                         .await?,
                     schema,
                     &equality_ids_vec,
