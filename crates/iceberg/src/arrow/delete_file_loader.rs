@@ -25,7 +25,8 @@ use parquet::schema::types::SchemaDescriptor;
 use crate::arrow::ArrowReader;
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::eq_delete_schema::{
-    equality_delete_schema, parquet_key_schema, whole_file_equality_delete_batches,
+    equality_delete_schema, parquet_key_schema, top_level_field_ids,
+    whole_file_equality_delete_batches,
 };
 use crate::arrow::orc_reader::read_orc_data_file;
 use crate::arrow::reader::ParquetReadOptions;
@@ -231,7 +232,9 @@ impl BasicDeleteFileLoader {
                 ));
             }
         };
-        let evolved = Self::evolve_schema(raw_stream, delete_schema.clone(), equality_ids).await?;
+        let top_level_ids = top_level_field_ids(&delete_schema);
+        let evolved =
+            Self::evolve_schema(raw_stream, delete_schema.clone(), &top_level_ids).await?;
         Ok((evolved, delete_schema))
     }
 

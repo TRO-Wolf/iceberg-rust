@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -29,7 +29,9 @@ use crate::arrow::avro_reader::read_avro_data_bytes;
 use crate::arrow::orc_reader::{orc_top_level_schema, read_orc_data_bytes};
 use crate::io::FileIO;
 use crate::scan::FileScanTaskDeleteFile;
-use crate::spec::{DataFileFormat, NestedFieldRef, Schema, SchemaRef};
+use crate::spec::{
+    DataFileFormat, NestedField, NestedFieldRef, Schema, SchemaRef, StructType, Type,
+};
 use crate::{Error, ErrorKind, Result};
 
 const DELETE_FILE_READ_BATCH_SIZE: usize = 1024;
@@ -40,25 +42,51 @@ pub(crate) fn equality_delete_schema(
     equality_ids: &[i32],
     delete_file_path: &str,
 ) -> Result<Schema> {
-    let mut fields: Vec<NestedFieldRef> = Vec::with_capacity(equality_ids.len());
-    let mut used_names: HashSet<String> = HashSet::new();
+    let current_paths = struct_paths(current_schema);
+    let file_paths = struct_paths(file_schema);
+    let mut kept: HashSet<i32> = HashSet::new();
+    let mut top_level: Vec<NestedFieldRef> = Vec::new();
     let mut seen: HashSet<i32> = HashSet::new();
     for &id in equality_ids {
         if !seen.insert(id) {
             continue;
         }
-        let field = match current_schema.field_by_id(id) {
-            Some(field) => field.clone(),
-            None => file_schema.field_by_id(id).cloned().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Equality delete file '{delete_file_path}' is missing its key column: \
-                         equality field id {id} is absent from the delete file's own schema"
-                    ),
-                )
-            })?,
+        let Some(file_path) = file_paths.get(&id) else {
+            if current_paths.contains_key(&id) {
+                kept.insert(id);
+                continue;
+            }
+            if file_schema.field_by_id(id).is_some() {
+                return Err(unsupported_key_path(delete_file_path, id));
+            }
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "Equality delete file '{delete_file_path}' is missing its key column: \
+                     equality field id {id} is absent from the delete file's own schema"
+                ),
+            ));
         };
+        let current_field = current_schema.field_by_id(id);
+        match (current_paths.get(&id), current_field) {
+            (Some(current_path), _) if current_path == file_path => {
+                kept.insert(id);
+            }
+            (Some(_), Some(field)) if file_path.len() == 1 => {
+                top_level.push(field.clone());
+            }
+            (None, None) if file_path.len() == 1 => {
+                let recovered = file_schema
+                    .field_by_id(id)
+                    .ok_or_else(|| unsupported_key_path(delete_file_path, id))?;
+                top_level.push(recovered.clone());
+            }
+            _ => return Err(unsupported_key_path(delete_file_path, id)),
+        }
+    }
+    let mut fields = prune_struct(current_schema.as_struct(), &kept);
+    let mut used_names: HashSet<String> = fields.iter().map(|f| f.name.to_lowercase()).collect();
+    for field in top_level {
         let mut name = field.name.clone();
         while used_names.contains(&name.to_lowercase()) {
             name.push('_');
@@ -73,6 +101,10 @@ pub(crate) fn equality_delete_schema(
         }
     }
     Schema::builder().with_fields(fields).build()
+}
+
+pub(crate) fn top_level_field_ids(schema: &Schema) -> Vec<i32> {
+    schema.as_struct().fields().iter().map(|f| f.id).collect()
 }
 
 pub(crate) fn parquet_key_schema(
@@ -99,7 +131,16 @@ pub(crate) async fn whole_file_equality_delete_batches(
     let bytes = input.read().await?;
     let file_schema = match task.file_format {
         DataFileFormat::Avro => avro_file_schema(&bytes)?,
-        _ => orc_top_level_schema(&bytes)?.0,
+        _ => {
+            let (schema, all_ids) = orc_top_level_schema(&bytes)?;
+            if let Some(id) = equality_ids
+                .iter()
+                .find(|id| schema.field_by_id(**id).is_none() && all_ids.contains(id))
+            {
+                return Err(unsupported_key_path(&task.file_path, *id));
+            }
+            schema
+        }
     };
     let delete_schema = Arc::new(equality_delete_schema(
         current_schema,
@@ -132,6 +173,61 @@ fn avro_file_schema(bytes: &[u8]) -> Result<Schema> {
         .with_source(e)
     })?;
     crate::avro::avro_schema_to_schema(reader.writer_schema())
+}
+
+fn unsupported_key_path(delete_file_path: &str, id: i32) -> Error {
+    Error::new(
+        ErrorKind::FeatureUnsupported,
+        format!(
+            "Equality delete file '{delete_file_path}' keys on field id {id} at a struct path \
+             the current schema cannot resolve (a nested key dropped from the table, a nested key \
+             under a different struct path, or a key inside a list or map); applying it is not \
+             supported"
+        ),
+    )
+}
+
+fn struct_paths(schema: &Schema) -> HashMap<i32, Vec<i32>> {
+    let mut paths = HashMap::new();
+    let mut prefix = Vec::new();
+    collect_struct_paths(schema.as_struct(), &mut prefix, &mut paths);
+    paths
+}
+
+fn collect_struct_paths(
+    struct_type: &StructType,
+    prefix: &mut Vec<i32>,
+    paths: &mut HashMap<i32, Vec<i32>>,
+) {
+    for field in struct_type.fields() {
+        prefix.push(field.id);
+        paths.insert(field.id, prefix.clone());
+        if let Type::Struct(child) = field.field_type.as_ref() {
+            collect_struct_paths(child, prefix, paths);
+        }
+        prefix.pop();
+    }
+}
+
+fn prune_struct(struct_type: &StructType, kept: &HashSet<i32>) -> Vec<NestedFieldRef> {
+    let mut fields = Vec::new();
+    for field in struct_type.fields() {
+        if kept.contains(&field.id) {
+            fields.push(field.clone());
+            continue;
+        }
+        let Type::Struct(child) = field.field_type.as_ref() else {
+            continue;
+        };
+        let children = prune_struct(child, kept);
+        if children.is_empty() {
+            continue;
+        }
+        let mut pruned: NestedField = field.as_ref().clone();
+        pruned.field_type = Box::new(Type::Struct(StructType::new(children)));
+        fields.push(Arc::new(pruned));
+    }
+    fields
 }
 
 fn arrow_field_holds_any(field: &Field, wanted: &HashSet<i32>) -> bool {
