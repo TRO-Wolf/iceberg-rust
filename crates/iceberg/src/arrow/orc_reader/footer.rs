@@ -140,6 +140,19 @@ struct RawType {
     iceberg_id: Option<i32>,
     /// `iceberg.required` attribute value, if present.
     iceberg_required: Option<bool>,
+    subtypes: Vec<u64>,
+    field_names: Vec<String>,
+    iceberg_attributes: HashMap<String, String>,
+}
+
+pub(crate) struct OrcTopLevelColumn {
+    pub(crate) name: String,
+    pub(crate) id: Option<i32>,
+    pub(crate) required: Option<bool>,
+    pub(crate) category: OrcCategory,
+    pub(crate) precision: u32,
+    pub(crate) scale: u32,
+    pub(crate) attributes: HashMap<String, String>,
 }
 
 /// The ORC compression codec from the PostScript.
@@ -192,6 +205,42 @@ impl Compression {
 /// Errors loudly if the file carries no `iceberg.id` attributes (name-mapping fallback is not
 /// supported), if the footer codec is unsupported (only NONE + ZLIB), or if the bytes are truncated.
 pub(crate) fn parse_footer(bytes: &[u8]) -> Result<HashMap<i32, OrcFileType>> {
+    build_id_map(&footer_types(bytes)?)
+}
+
+pub(crate) fn parse_top_level_columns(
+    bytes: &[u8],
+) -> Result<(Vec<OrcTopLevelColumn>, HashMap<i32, OrcFileType>)> {
+    let types = footer_types(bytes)?;
+    let id_map = build_id_map(&types)?;
+    let root = types
+        .first()
+        .ok_or_else(|| truncated("ORC footer has no root type"))?;
+    if root.subtypes.len() != root.field_names.len() {
+        return Err(corrupt("ORC root struct subtypes and field names disagree"));
+    }
+    let mut columns = Vec::with_capacity(root.subtypes.len());
+    for (subtype, name) in root.subtypes.iter().zip(&root.field_names) {
+        let index =
+            usize::try_from(*subtype).map_err(|_| corrupt("ORC subtype index exceeds usize"))?;
+        let ty = types
+            .get(index)
+            .ok_or_else(|| corrupt("ORC root subtype index is out of range"))?;
+        columns.push(OrcTopLevelColumn {
+            name: name.clone(),
+            id: ty.iceberg_id,
+            required: ty.iceberg_required,
+            category: OrcCategory::from_kind(ty.kind),
+            precision: u32::try_from(ty.precision)
+                .map_err(|_| corrupt("ORC decimal precision exceeds u32"))?,
+            scale: u32::try_from(ty.scale).map_err(|_| corrupt("ORC decimal scale exceeds u32"))?,
+            attributes: ty.iceberg_attributes.clone(),
+        });
+    }
+    Ok((columns, id_map))
+}
+
+fn footer_types(bytes: &[u8]) -> Result<Vec<RawType>> {
     // (1) PostScript: the last byte is its length; the PS protobuf precedes it.
     let ps_len = *bytes.last().ok_or_else(|| truncated("empty ORC file"))? as usize;
     if ps_len == 0 || ps_len + 1 > bytes.len() {
@@ -216,8 +265,7 @@ pub(crate) fn parse_footer(bytes: &[u8]) -> Result<HashMap<i32, OrcFileType>> {
     // (4) Parse `types` (field 4) into the pre-order list of RawType.
     let types = parse_footer_types(&footer)?;
 
-    // (5) Build the field-id → OrcFileType map from the `iceberg.id` attributes.
-    build_id_map(&types)
+    Ok(types)
 }
 
 // =================================================================================================
@@ -339,9 +387,6 @@ fn parse_footer_types(footer: &[u8]) -> Result<Vec<RawType>> {
     Ok(types)
 }
 
-/// Parse one ORC `Type` message, capturing `kind`, decimal `precision`/`scale`, and the
-/// `iceberg.id` / `iceberg.required` attributes. `subtypes`/`fieldNames` are skipped: the pre-order
-/// position in `types[]` is itself the ORC column index, which is what `orc-rust` projects by.
 fn parse_type(msg: &[u8]) -> Result<RawType> {
     let mut reader = ProtoReader::new(msg);
     let mut ty = RawType::default();
@@ -357,6 +402,9 @@ fn parse_type(msg: &[u8]) -> Result<RawType> {
             (7, WireType::Len) => {
                 let pair = reader.read_len_delimited()?;
                 if let Some((key, value)) = parse_string_pair(pair)? {
+                    if key.starts_with("iceberg.") {
+                        ty.iceberg_attributes.insert(key.clone(), value.clone());
+                    }
                     match key.as_str() {
                         "iceberg.id" => {
                             ty.iceberg_id = value.parse::<i32>().ok();
@@ -368,7 +416,16 @@ fn parse_type(msg: &[u8]) -> Result<RawType> {
                     }
                 }
             }
-            // field 2: subtypes (packed uint32) and field 3: fieldNames (repeated string) — skipped.
+            (2, WireType::Len) => {
+                let mut packed = ProtoReader::new(reader.read_len_delimited()?);
+                while packed.pos < packed.buf.len() {
+                    ty.subtypes.push(packed.read_varint()?);
+                }
+            }
+            (2, WireType::Varint) => ty.subtypes.push(reader.read_varint()?),
+            (3, WireType::Len) => ty
+                .field_names
+                .push(read_utf8(reader.read_len_delimited()?)?),
             _ => reader.skip_field(wire)?,
         }
     }

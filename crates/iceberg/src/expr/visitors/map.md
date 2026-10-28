@@ -39,7 +39,7 @@ modules are `pub(crate)`.
 | `inclusive_projection.rs` / `strict_projection.rs` | `Projections` | row filter → partition-space predicate via `Transform::project`/`strict_project` |
 | `residual_evaluator.rs` | `ResidualEvaluator` | partial-evaluate a row filter against partition values → residual (strict-true ⇒ `AlwaysTrue`, inclusive-false ⇒ `AlwaysFalse`, else keep); `residual_bound_for` binds to the snapshot schema and memoizes by partition only (`RwLock` map, poison-recovered, soft-cap 8192 inserts; bind case must match evaluator `case_sensitive`) for scan planning |
 | `rewrite_not.rs` | `RewriteNot` | **`#[cfg(test)]` only.** The production NOT-elimination pre-pass now lives in `../predicate.rs` as the explicit-stack `Predicate::rewrite_not` / `BoundPredicate::rewrite_not`; this visitor is kept solely as their differential oracle |
-| `page_index_evaluator.rs` / `row_group_metrics_evaluator.rs` | (parquet) | Parquet-level pruning in the arrow reader |
+| `page_index_evaluator.rs` / `row_group_metrics_evaluator.rs` | (parquet) | Parquet-level pruning in the arrow reader. The page-index evaluator treats a predicate id absent from the snapshot schema (an equality delete on a dropped key) as unevaluable and selects all rows; the row-group evaluator never consults the schema for the survival-predicate shapes (`!=` / null arms) and is unchanged |
 
 ## I want to...
 

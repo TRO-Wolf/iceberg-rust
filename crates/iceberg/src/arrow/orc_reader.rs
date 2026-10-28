@@ -85,7 +85,7 @@
 // called both by `read_orc_data_file` and by the offline tests. Both stay `pub(crate)`; this file
 // carries no module-level `dead_code` allow — the compiler is left to flag any genuinely-dead item.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::builder::{FixedSizeBinaryBuilder, LargeBinaryBuilder};
@@ -108,7 +108,7 @@ use crate::{Error, ErrorKind, Result};
 
 mod footer;
 
-use footer::{OrcCategory, OrcFileType, parse_footer};
+use footer::{OrcCategory, OrcFileType, OrcTopLevelColumn, parse_footer, parse_top_level_columns};
 
 // =================================================================================================
 // Public(crate) entry points
@@ -212,6 +212,62 @@ pub(crate) fn read_orc_data_bytes(
     }
 
     Ok(out_batches)
+}
+
+pub(crate) fn orc_top_level_schema(bytes: &[u8]) -> Result<(Schema, HashSet<i32>)> {
+    let (columns, id_map) = parse_top_level_columns(bytes)?;
+    let mut fields = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let (Some(id), Some(primitive)) = (column.id, orc_column_primitive_type(column)) else {
+            continue;
+        };
+        let field = if column.required == Some(true) {
+            NestedField::required(id, column.name.clone(), Type::Primitive(primitive))
+        } else {
+            NestedField::optional(id, column.name.clone(), Type::Primitive(primitive))
+        };
+        fields.push(Arc::new(field));
+    }
+    let schema = Schema::builder().with_fields(fields).build()?;
+    Ok((schema, id_map.keys().copied().collect()))
+}
+
+fn orc_column_primitive_type(column: &OrcTopLevelColumn) -> Option<PrimitiveType> {
+    let attribute = |key: &str| column.attributes.get(key).map(|value| value.to_uppercase());
+    let nanos = attribute("iceberg.timestamp-unit").as_deref() == Some("NANOS");
+    Some(match column.category {
+        OrcCategory::Boolean => PrimitiveType::Boolean,
+        OrcCategory::Int => PrimitiveType::Int,
+        OrcCategory::Long => match attribute("iceberg.long-type").as_deref() {
+            Some("TIME") => PrimitiveType::Time,
+            None | Some("LONG") => PrimitiveType::Long,
+            Some(_) => return None,
+        },
+        OrcCategory::Float => PrimitiveType::Float,
+        OrcCategory::Double => PrimitiveType::Double,
+        OrcCategory::String | OrcCategory::Varchar | OrcCategory::Char => PrimitiveType::String,
+        OrcCategory::Date => PrimitiveType::Date,
+        OrcCategory::Decimal => PrimitiveType::Decimal {
+            precision: column.precision,
+            scale: column.scale,
+        },
+        OrcCategory::Timestamp if nanos => PrimitiveType::TimestampNs,
+        OrcCategory::Timestamp => PrimitiveType::Timestamp,
+        OrcCategory::TimestampInstant if nanos => PrimitiveType::TimestamptzNs,
+        OrcCategory::TimestampInstant => PrimitiveType::Timestamptz,
+        OrcCategory::Binary => match attribute("iceberg.binary-type").as_deref() {
+            Some("UUID") => PrimitiveType::Uuid,
+            Some("FIXED") => PrimitiveType::Fixed(
+                column
+                    .attributes
+                    .get("iceberg.length")
+                    .and_then(|length| length.parse::<u64>().ok())?,
+            ),
+            None | Some("BINARY") => PrimitiveType::Binary,
+            Some(_) => return None,
+        },
+        _ => return None,
+    })
 }
 
 // =================================================================================================

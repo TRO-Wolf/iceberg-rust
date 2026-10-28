@@ -45,7 +45,7 @@ use typed_builder::TypedBuilder;
 use crate::arrow::arrow_schema_to_schema;
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
-use crate::arrow::equality_delete_set::EqDeleteKeySet;
+use crate::arrow::equality_delete_set::{EqDeleteKeySet, eq_delete_key_fields_projected};
 use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
@@ -56,7 +56,8 @@ use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
 use crate::arrow::row_filter_plan::{
-    RowFilterPlan, leaf_count, plan_row_filter, top_level_ancestor_id, unmapped_group_leaf_indices,
+    RowFilterPlan, dropped_equality_key_mask, leaf_count, plan_row_filter, top_level_ancestor_id,
+    unmapped_group_leaf_indices,
 };
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -577,13 +578,19 @@ impl ArrowReader {
             project_field_ids_without_metadata.dedup();
         }
 
-        let projection_mask = Self::get_arrow_projection_mask(
+        let mut projection_mask = Self::get_arrow_projection_mask(
             &project_field_ids_without_metadata,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
             missing_field_ids,
         )?;
+        if needs_physical_ordinals
+            && let Some(dropped) =
+                dropped_equality_key_mask(&task, record_batch_stream_builder.parquet_schema())?
+        {
+            projection_mask.union(&dropped);
+        }
 
         record_batch_stream_builder =
             record_batch_stream_builder.with_projection(projection_mask.clone());
@@ -1843,23 +1850,6 @@ impl BoundPredicateVisitor for CollectFieldIdVisitor {
         self.field_ids.insert(reference.field().id);
         Ok(())
     }
-}
-
-/// `true` when every key field id of `sets` is projected. The keyset path needs it to resolve
-/// keys on a transformed batch. Otherwise the reader uses the eq-delete RowFilter path.
-pub(crate) fn eq_delete_key_fields_projected(
-    sets: &[EqDeleteKeySet],
-    projected_non_metadata_field_ids: &[i32],
-) -> bool {
-    if sets.is_empty() {
-        return false;
-    }
-    // Every set shares one key schema, so the first set's key ids stand for the task.
-    let projected: HashSet<i32> = projected_non_metadata_field_ids.iter().copied().collect();
-    sets[0]
-        .key_field_ids()
-        .iter()
-        .all(|id| projected.contains(id))
 }
 
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.

@@ -255,9 +255,6 @@ impl EqDeleteKeySet {
     /// `not_null`, the Java `StructLikeSet` verdict). The bail keeps this path conservative: the
     /// predicate path is the oracle for every null-carrying batch. Null-aware columnar membership
     /// is a deliberate follow-up (FK1 residual seed).
-    ///
-    /// A key column ABSENT from the batch returns an error rather than silently disagreeing with the
-    /// predicate path (the apply seam guarantees the eq-delete columns are projected).
     pub(crate) fn delete_mask(&self, batch: &RecordBatch) -> Result<Option<Vec<bool>>> {
         let num_rows = batch.num_rows();
 
@@ -267,16 +264,10 @@ impl EqDeleteKeySet {
         // the predicate fallback, under-deleting null data rows that the survival predicate's
         // `col IS NULL` leaf must remove. Null-carrying batches always route to the oracle.
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(self.key_columns.len());
-        for (field_id, field_name, _) in &self.key_columns {
-            let column = resolve_column_by_field_id(batch, *field_id).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!(
-                        "equality-delete set fast path: key column '{field_name}' (field id \
-                         {field_id}) is absent from the data batch"
-                    ),
-                )
-            })?;
+        for (field_id, _, _) in &self.key_columns {
+            let Some(column) = resolve_column_by_field_id(batch, *field_id) else {
+                return Ok(None);
+            };
             if column.null_count() > 0 {
                 return Ok(None);
             }
@@ -621,6 +612,20 @@ fn type_mismatch(expected: &str, column: &ArrayRef) -> Error {
 /// Resolve a batch column by its Iceberg field id (`PARQUET_FIELD_ID_META_KEY` field metadata),
 /// mirroring `record_batch_predicate::RecordBatchPredicateEvaluator`'s resolution so the set path and
 /// the predicate path read the SAME column for a given key.
+pub(crate) fn eq_delete_key_fields_projected(
+    sets: &[EqDeleteKeySet],
+    projected_non_metadata_field_ids: &[i32],
+) -> bool {
+    if sets.is_empty() {
+        return false;
+    }
+    let projected: HashSet<i32> = projected_non_metadata_field_ids.iter().copied().collect();
+    sets[0]
+        .key_field_ids()
+        .iter()
+        .all(|id| projected.contains(id))
+}
+
 fn resolve_column_by_field_id(batch: &RecordBatch, field_id: i32) -> Option<ArrayRef> {
     for (idx, field) in batch.schema().fields().iter().enumerate() {
         if let Some(id_str) = field.metadata().get(PARQUET_FIELD_ID_META_KEY)

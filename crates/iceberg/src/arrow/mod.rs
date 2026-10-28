@@ -33,6 +33,7 @@ pub(crate) mod caching_delete_file_loader;
 /// Delete File loader
 pub mod delete_file_loader;
 pub(crate) mod delete_filter;
+pub(crate) mod eq_delete_schema;
 pub use delete_filter::DeleteFilter;
 pub(crate) mod equality_delete_set;
 
@@ -44,6 +45,8 @@ mod open_parquet;
 pub(crate) mod orc_reader;
 pub(crate) mod partition_constant;
 mod pos_apply;
+pub(crate) mod pos_del_claim;
+pub(crate) mod pos_delete_parse;
 mod ranges;
 mod reader;
 pub(crate) mod record_batch_predicate;
