@@ -213,12 +213,7 @@ async fn drop_column(catalog: &MemoryCatalog, table: &Table, name: &str) -> Tabl
 }
 
 async fn scan_batches_result(table: &Table, column: &str) -> iceberg::Result<Vec<RecordBatch>> {
-    let stream = table
-        .scan()
-        .select([column])
-        .build()?
-        .to_arrow()
-        .await?;
+    let stream = table.scan().select([column]).build()?.to_arrow().await?;
     stream.try_collect().await
 }
 
@@ -265,11 +260,19 @@ async fn scan_strings(table: &Table, column: &str) -> Vec<String> {
 #[tokio::test]
 async fn test_avro_equality_delete_with_dropped_key_refuses() {
     let (catalog, table, _warehouse) = setup(two_col_schema("id", "data")).await;
-    let data = write_data_file(&table, vec![10, 20, 30, 40, 50], vec!["a", "b", "c", "d", "e"]).await;
+    let data = write_data_file(&table, vec![10, 20, 30, 40, 50], vec![
+        "a", "b", "c", "d", "e",
+    ])
+    .await;
     let table = append_data(&catalog, &table, data).await;
-    let delete =
-        write_eq_delete_file(&table, DataFileFormat::Avro, "eqdel", vec![20, 40], AvroWriterBuilder::new)
-            .await;
+    let delete = write_eq_delete_file(
+        &table,
+        DataFileFormat::Avro,
+        "eqdel",
+        vec![20, 40],
+        AvroWriterBuilder::new,
+    )
+    .await;
     assert_eq!(delete.file_format(), DataFileFormat::Avro);
     let delete_path = delete.file_path().to_string();
     assert!(
@@ -300,11 +303,19 @@ async fn test_avro_equality_delete_with_dropped_key_refuses() {
 #[tokio::test]
 async fn test_orc_equality_delete_with_dropped_key_refuses() {
     let (catalog, table, _warehouse) = setup(two_col_schema("id", "data")).await;
-    let data = write_data_file(&table, vec![10, 20, 30, 40, 50], vec!["a", "b", "c", "d", "e"]).await;
+    let data = write_data_file(&table, vec![10, 20, 30, 40, 50], vec![
+        "a", "b", "c", "d", "e",
+    ])
+    .await;
     let table = append_data(&catalog, &table, data).await;
-    let delete =
-        write_eq_delete_file(&table, DataFileFormat::Orc, "eqdel", vec![20, 40], OrcWriterBuilder::new)
-            .await;
+    let delete = write_eq_delete_file(
+        &table,
+        DataFileFormat::Orc,
+        "eqdel",
+        vec![20, 40],
+        OrcWriterBuilder::new,
+    )
+    .await;
     assert_eq!(delete.file_format(), DataFileFormat::Orc);
     let delete_path = delete.file_path().to_string();
     assert!(
@@ -335,11 +346,19 @@ async fn test_orc_equality_delete_with_dropped_key_refuses() {
 #[tokio::test]
 async fn test_avro_equality_delete_with_live_key_applies_without_key_projection() {
     let (catalog, table, _warehouse) = setup(two_col_schema("y", "s")).await;
-    let data = write_data_file(&table, vec![0, 10, 20, 30, 40], vec!["a", "b", "c", "d", "e"]).await;
+    let data = write_data_file(&table, vec![0, 10, 20, 30, 40], vec![
+        "a", "b", "c", "d", "e",
+    ])
+    .await;
     let table = append_data(&catalog, &table, data).await;
-    let delete =
-        write_eq_delete_file(&table, DataFileFormat::Avro, "eqdel", vec![20, 30], AvroWriterBuilder::new)
-            .await;
+    let delete = write_eq_delete_file(
+        &table,
+        DataFileFormat::Avro,
+        "eqdel",
+        vec![20, 30],
+        AvroWriterBuilder::new,
+    )
+    .await;
     assert_eq!(delete.file_format(), DataFileFormat::Avro);
     let table = commit_eq_delete(&catalog, &table, delete).await;
     assert_eq!(
@@ -357,11 +376,19 @@ async fn test_avro_equality_delete_with_live_key_applies_without_key_projection(
 #[tokio::test]
 async fn test_orc_equality_delete_with_live_key_applies_without_key_projection() {
     let (catalog, table, _warehouse) = setup(two_col_schema("y", "s")).await;
-    let data = write_data_file(&table, vec![0, 10, 20, 30, 40], vec!["a", "b", "c", "d", "e"]).await;
+    let data = write_data_file(&table, vec![0, 10, 20, 30, 40], vec![
+        "a", "b", "c", "d", "e",
+    ])
+    .await;
     let table = append_data(&catalog, &table, data).await;
-    let delete =
-        write_eq_delete_file(&table, DataFileFormat::Orc, "eqdel", vec![20, 30], OrcWriterBuilder::new)
-            .await;
+    let delete = write_eq_delete_file(
+        &table,
+        DataFileFormat::Orc,
+        "eqdel",
+        vec![20, 30],
+        OrcWriterBuilder::new,
+    )
+    .await;
     assert_eq!(delete.file_format(), DataFileFormat::Orc);
     let table = commit_eq_delete(&catalog, &table, delete).await;
     assert_eq!(

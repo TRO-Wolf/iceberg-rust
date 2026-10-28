@@ -561,7 +561,11 @@ mod scope_tests {
         let file_io = FileIO::new_with_fs();
         let config = PositionDeleteWriterConfig::new().expect("pos-delete config");
         let batch = RecordBatch::try_new(config.arrow_schema().clone(), vec![
-            Arc::new(StringArray::from(vec!["a.parquet", "b.parquet", "a.parquet"])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                "a.parquet",
+                "b.parquet",
+                "a.parquet",
+            ])) as ArrayRef,
             Arc::new(Int64Array::from(vec![1i64, 5i64, 3i64])) as ArrayRef,
         ])
         .expect("pos-delete batch");
