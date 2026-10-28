@@ -231,6 +231,8 @@ ceiling); the caching-loader ceiling lowers to 3130. Before any new work
 | F2-5 | No neighbouring answer changed | PROVEN | Gates below: `iceberg` lib 4642/0 (base fold-1 4639 plus #375's 3), every integration binary 0 failed, `iceberg-datafusion` 802/0 |
 | F2-6 | Dropping the only child of a struct then scanning panics in the transformer (`StructArray::try_new` unwrap), same on the base | OPEN | Carded on the RePark side; not touched here |
 | F2-7 | A Rust `EqualityDeleteWriterConfig` keyed on a nested id writes the key flattened to the top level, not under its struct (the Java shape) | OPEN | Read path accepts both shapes (F2-2); writer shape unchanged |
+| F2-8 | A key promoted `int` to `long` after the delete fails loud under any `_pos` or `_row_id` projection, and DataFusion merge-on-read DELETE and UPDATE on such tables leave the table unchanged; pre-existing on the base and on fold-1 | OPEN | Scans without `_pos` answer correctly; promoting then dropping the key is correct; carded on the RePark side: the key-set fast path should compare after type promotion or fall back to the predicate path |
+| F2-9 | A key inside a struct inside a list is loud with the wrong message | OPEN | `DataInvalid` naming the file and the id as absent from the delete file's own schema, though the column is in the file (`parquet_key_schema` does not descend into lists); carded on the RePark side |
 
 ### Design choice for ruling 1
 
@@ -263,7 +265,8 @@ path in the current schema with its path in the delete file's own schema:
 | absent | top level | a top-level entry recovered from the file |
 | absent | nested | `FeatureUnsupported` |
 | any | absent | `DataInvalid` naming the file and the id |
-| present, other path, or inside a list or map | | `FeatureUnsupported` |
+| present, another struct path | | `FeatureUnsupported` |
+| present, inside a list or map | present in the file | loud with `DataInvalid` naming the file and the id as absent from the delete file's own schema, though the column is in the file (`parquet_key_schema` does not descend into lists); wrong message (OPEN, F2-9) |
 
 The delete stream is evolved on the per-file schema's top-level ids, and each
 file's predicate binds against it.
@@ -307,3 +310,53 @@ pins green); after item 2, 7/10 (nested pins green); after item 3, 10/10.
 - `python3 scripts/check_rust_file_size.py`: exit 0, 704 files clean.
 - Comment gate: 0 added comment lines in every fold-2 commit beyond the
   Apache licence headers of the two new files.
+
+## Verifier round 2 (Opus 5.5 at `60b0f3da`): PASS, no S1
+
+Every round-1 shape and every hunt answered the survivors: decimal,
+null-carrying composite and plain long keys under `[data]`, `_pos`, `_file`
+and `_row_id` projections before and after the drop; post-drop rows kept; a
+re-added id with new rows; a key present in some data files and absent in
+others; `_pos` with a row-selection filter; an identity-partitioned table;
+two-level nested keys under renames and sibling drops; the Rust-writer
+flattened shape; dropped single and composite keys through Parquet, Avro and
+ORC delete files; a key column under a different name with the right field
+id applies, the right name with a wrong id refuses; DataFusion merge-on-read
+DELETE and UPDATE on long and decimal keys before and after the drop, 16
+cases correct.
+
+Red on the fold-1 head: `eqdel_key_paths` 1 passed, 9 failed, with the exact
+wrong-row shapes of round 1.
+
+V2-EQKEY-1 (S2, pre-existing on the base and on fold-1): a key promoted
+`int` to `long` after the delete fails loud under any `_pos` or `_row_id`
+projection (`equality-delete set fast path: expected Int64Array, got
+Int32`), which also fails DataFusion merge-on-read DELETE and UPDATE on such
+tables with the table unchanged; scans without `_pos` answer correctly;
+promoting then dropping the key is correct. Card-worthy on the RePark side:
+the key-set fast path should compare after type promotion or fall back to
+the predicate path. Recorded as OPEN F2-8; no code touched here.
+
+V2-EQKEY-2 (S3): the fold-1 Debug row (`crates/iceberg/src/arrow/map.md`
+line 92) still says the Avro, ORC and `_pos` paths reject a schema-absent id
+loudly and only the Parquet pushdown path applies dropped-key deletes; after
+fold-2 only Avro and ORC DATA files stay loud (`DataInvalid: Projected field
+id ... is not present in the scan schema`). The map row is narrowed
+accordingly in this commit.
+
+V2-EQKEY-3 (S3): the fold-1 "The fix" text above (lines 60 and 83) still
+says the per-file schema is built by
+`BasicDeleteFileLoader::equality_delete_schema` in `delete_file_loader.rs`,
+and that there is no `reader.rs` change. Both lines are superseded, and the
+fold-1 text above is left as written: the resolver now lives in
+`eq_delete_schema::equality_delete_schema` (see "Design of the per-file
+schema"), and fold-2 item 1 changed `reader.rs` (see "Design choice for
+ruling 1").
+
+V2-EQKEY-4 (S3): a key inside a struct inside a list is loud, but with
+`DataInvalid` naming the file and the id as absent from the delete file's
+own schema, though the column is in the file (`parquet_key_schema` does not
+descend into lists); the per-file schema table above said
+`FeatureUnsupported` naming the list path. The table row is re-worded to
+what is measured, and the misleading error kind is recorded as OPEN F2-9; no
+code touched here.

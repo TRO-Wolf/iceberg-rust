@@ -89,7 +89,7 @@ application. Scan planning lives in `../scan/`; this directory runs the plan.
 | NULL struct parent reads as non-null child | Arrow validity does not propagate down; every struct descent must go through `array_with_parent_validity` |
 | Rows duplicated on AVRO/ORC splits | whole-file readers ignore byte ranges — see [../scan/map.md#debug](../scan/map.md#debug) |
 | `FeatureUnsupported` naming dropped column ids on a `_deleted` projection or an id-less file | equality deletes on dropped keys apply only through the embedded-id `Push` path; residual and id-less reads fail loud by design (F-EQDEL-DROPPED-KEY-1) instead of silently keeping deleted rows |
-| Avro/ORC/`_pos` scan errors after `DROP` of an equality-delete key | `build_expected_schema` / the keyset apply seam reject the schema-absent id (loud, as at base); only the Parquet pushdown path applies dropped-key deletes — known residue, ledger F-EQDEL-DROPPED-KEY-1 § Follow-ups |
+| Avro/ORC data-file scan errors after `DROP` of an equality-delete key | Avro and ORC data files refuse the schema-absent id loud with `DataInvalid` (`Projected field id ... is not present in the scan schema`), as does compaction; Parquet data files apply dropped-key deletes by field id — known residue, ledger F-EQDEL-DROPPED-KEY-1 § Follow-ups |
 
 ### First checks
 
