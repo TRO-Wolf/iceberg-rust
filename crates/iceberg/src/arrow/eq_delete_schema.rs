@@ -52,10 +52,6 @@ pub(crate) fn equality_delete_schema(
             continue;
         }
         let Some(file_path) = file_paths.get(&id) else {
-            if current_paths.contains_key(&id) {
-                kept.insert(id);
-                continue;
-            }
             if file_schema.field_by_id(id).is_some() {
                 return Err(unsupported_key_path(delete_file_path, id));
             }
