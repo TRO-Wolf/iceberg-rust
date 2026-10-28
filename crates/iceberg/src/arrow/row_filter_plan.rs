@@ -29,6 +29,7 @@ use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::expr::BoundPredicate;
 use crate::metadata_columns::is_metadata_field;
+use crate::scan::FileScanTask;
 use crate::spec::{NestedField, Schema, Type};
 use crate::{Error, ErrorKind, Result};
 
@@ -131,6 +132,40 @@ pub(crate) fn plan_row_filter(
         filter: RowFilter::new(vec![Box::new(arrow_predicate)]),
         disable_predicate_cache,
     }))
+}
+
+pub(crate) fn dropped_equality_key_mask(
+    task: &FileScanTask,
+    parquet_schema: &SchemaDescriptor,
+) -> Result<Option<ProjectionMask>> {
+    let mut absent: Vec<i32> = task
+        .deletes
+        .iter()
+        .filter_map(|delete| delete.equality_ids.as_ref())
+        .flatten()
+        .copied()
+        .filter(|id| !is_metadata_field(*id) && task.schema.field_by_id(*id).is_none())
+        .collect();
+    absent.sort_unstable();
+    absent.dedup();
+    if absent.is_empty() {
+        return Ok(None);
+    }
+    let Some(leaf_lists) = build_field_id_leaf_lists(parquet_schema)? else {
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "cannot apply equality deletes on dropped column ids {absent:?} to data file \
+                 '{}': the data file carries no embedded Parquet field ids to map them by",
+                task.data_file_path
+            ),
+        ));
+    };
+    let leaves: Vec<usize> = absent
+        .iter()
+        .flat_map(|id| leaf_lists.get(id).into_iter().flatten().copied())
+        .collect();
+    Ok(Some(ProjectionMask::leaves(parquet_schema, leaves)))
 }
 
 pub(crate) fn top_level_ancestor_id(schema: &Schema, field_id: i32) -> Option<i32> {
