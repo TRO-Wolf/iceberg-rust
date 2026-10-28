@@ -44,6 +44,8 @@ mod open_parquet;
 pub(crate) mod orc_reader;
 pub(crate) mod partition_constant;
 mod pos_apply;
+pub(crate) mod pos_del_claim;
+pub(crate) mod pos_delete_parse;
 mod ranges;
 mod reader;
 pub(crate) mod record_batch_predicate;

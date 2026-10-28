@@ -165,10 +165,7 @@ impl<'a> PageIndexEvaluator<'a> {
         };
 
         let Some(field) = self.snapshot_schema.field_by_id(field_id) else {
-            return Err(Error::new(
-                ErrorKind::Unexpected,
-                format!("Field with id {field_id} missing from snapshot schema"),
-            ));
+            return self.select_all_rows();
         };
 
         let Some(field_type) = field.field_type.as_primitive_type() else {

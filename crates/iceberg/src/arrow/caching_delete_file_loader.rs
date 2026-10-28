@@ -19,11 +19,13 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Not;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Int64Array, StringArray, StructArray};
+use arrow_array::{Array, ArrayRef, StructArray};
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
-use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard, pos_del_claim_key};
+use super::delete_filter::{DeleteFilter, PosDelLoadAction, PosDelLoadGuard};
+use super::pos_del_claim::pos_del_claim_key;
+use super::pos_delete_parse::parse_positional_deletes_record_batch_stream;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
 use crate::arrow::equality_delete_set::EqDeleteKeySet;
 use crate::arrow::null_propagation::propagate_struct_validity;
@@ -72,8 +74,9 @@ enum DeleteFileContext {
     },
     FreshEqDel {
         batch_stream: ArrowRecordBatchStream,
+        delete_schema: SchemaRef,
         equality_ids: HashSet<i32>,
-        sender: tokio::sync::oneshot::Sender<(Predicate, Option<EqDeleteKeySet>)>,
+        sender: tokio::sync::oneshot::Sender<(Predicate, SchemaRef, Option<EqDeleteKeySet>)>,
     },
 }
 
@@ -300,23 +303,28 @@ impl CachingDeleteFileLoader {
                         ),
                     ));
                 };
-                // Project only the equality_ids key columns. The read falls back to a full read when
-                // the ProjectionMask cannot be built safely.
+                let (raw_stream, delete_arrow_schema) = basic_delete_file_loader
+                    .parquet_stream_and_arrow_schema(
+                        &task.file_path,
+                        task.file_size_in_bytes,
+                        Some(equality_ids_vec.as_slice()),
+                    )
+                    .await?;
+                let delete_schema = Arc::new(BasicDeleteFileLoader::equality_delete_schema(
+                    &schema,
+                    &delete_arrow_schema,
+                    &equality_ids_vec,
+                )?);
                 let evolved_stream = BasicDeleteFileLoader::evolve_schema(
-                    basic_delete_file_loader
-                        .parquet_to_batch_stream_with_projection(
-                            &task.file_path,
-                            task.file_size_in_bytes,
-                            Some(equality_ids_vec.as_slice()),
-                        )
-                        .await?,
-                    schema,
+                    raw_stream,
+                    delete_schema.clone(),
                     &equality_ids_vec,
                 )
                 .await?;
 
                 Ok(DeleteFileContext::FreshEqDel {
                     batch_stream: evolved_stream,
+                    delete_schema,
                     sender,
                     equality_ids: HashSet::from_iter(equality_ids_vec),
                 })
@@ -433,10 +441,9 @@ impl CachingDeleteFileLoader {
                 file_path,
                 stream,
             } => {
-                let del_vecs =
-                    Self::parse_positional_deletes_record_batch_stream(&file_path, stream)
-                        .await
-                        .map_err(|error| guard.note_failure(error))?;
+                let del_vecs = parse_positional_deletes_record_batch_stream(&file_path, stream)
+                    .await
+                    .map_err(|error| guard.note_failure(error))?;
                 Ok(ParsedDeleteFileContext::DelVecs {
                     guard,
                     results: del_vecs,
@@ -458,13 +465,14 @@ impl CachingDeleteFileLoader {
             DeleteFileContext::FreshEqDel {
                 sender,
                 batch_stream,
+                delete_schema,
                 equality_ids,
             } => {
-                let predicate_and_set =
+                let (predicate, key_set) =
                     Self::parse_equality_deletes_with_keyset(batch_stream, equality_ids).await?;
 
                 sender
-                    .send(predicate_and_set)
+                    .send((predicate, delete_schema, key_set))
                     .map_err(|_| {
                         Error::new(
                             ErrorKind::Unexpected,
@@ -474,127 +482,6 @@ impl CachingDeleteFileLoader {
                     .map(|_| ParsedDeleteFileContext::EqDel)
             }
         }
-    }
-
-    /// Convert one position-delete row's untrusted `pos` value into a bitmap position. # Errors
-    /// Fails on a negative position. A `pos as u64` cast wraps it to a huge position that matches
-    /// no row, so the delete fails open and the deleted rows resurrect.
-    fn checked_delete_position(
-        delete_file_path: &str,
-        data_file_path: &str,
-        pos: i64,
-    ) -> Result<u64> {
-        u64::try_from(pos).map_err(|_| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Invalid position delete file '{delete_file_path}': negative position \
-                     {pos} for data file '{data_file_path}'"
-                ),
-            )
-        })
-    }
-
-    /// Parses a record batch stream coming from the positional delete file at
-    /// `delete_file_path` (named in errors so corrupt input is identifiable).
-    ///
-    /// Returns a map of data file path to a delete vector
-    async fn parse_positional_deletes_record_batch_stream(
-        delete_file_path: &str,
-        mut stream: ArrowRecordBatchStream,
-    ) -> Result<HashMap<String, DeleteVector>> {
-        let mut result: HashMap<String, DeleteVector> = HashMap::default();
-
-        while let Some(batch) = stream.next().await {
-            let batch = batch?;
-            let columns = batch.columns();
-
-            // This reader takes the two spec-required columns positionally: `file_path`, then `pos`. A
-            // delete file is untrusted input, so a batch with fewer than two columns fails closed with
-            // a typed error naming the file. An index panic here aborts the scan task's process.
-            let [file_paths, positions, ..] = columns else {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid position delete file '{delete_file_path}': expected at least 2 \
-                         columns (file_path, pos), found {}",
-                        columns.len()
-                    ),
-                ));
-            };
-
-            let Some(file_paths) = file_paths.as_any().downcast_ref::<StringArray>() else {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Could not downcast file paths array to StringArray",
-                ));
-            };
-            let Some(positions) = positions.as_any().downcast_ref::<Int64Array>() else {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Could not downcast positions array to Int64Array",
-                ));
-            };
-
-            // Position-delete files sort by (path, pos), so equal paths arrive in contiguous runs.
-            // `current` caches the last-seen path and its vector, and the code re-resolves the map
-            // entry only when the path changes. The resulting map matches the per-row form exactly.
-            // An unsorted file still lands every position in the right entry; it only re-resolves more
-            // often. The vector splices back into the map on each change and at end-of-batch.
-            let mut current: Option<(&str, DeleteVector)> = None;
-            for (file_path, pos) in file_paths.iter().zip(positions.iter()) {
-                // The spec requires both columns. A null in either is corrupt input. Fail closed with
-                // a typed error naming the delete file. Never panic, and never skip the row.
-                let Some(file_path) = file_path else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Invalid position delete file '{delete_file_path}': null file_path \
-                             value (the file_path column is required)"
-                        ),
-                    ));
-                };
-                let Some(pos) = pos else {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Invalid position delete file '{delete_file_path}': null position \
-                             value for data file '{file_path}' (the pos column is required)"
-                        ),
-                    ));
-                };
-
-                match &mut current {
-                    Some((path, vector)) if *path == file_path => {
-                        vector.insert(Self::checked_delete_position(
-                            delete_file_path,
-                            file_path,
-                            pos,
-                        )?);
-                    }
-                    _ => {
-                        // Flush the previous run's vector into the map, merging when the path recurs in
-                        // a later run. Then start the new run from the positions the map already holds.
-                        if let Some((path, vector)) = current.take() {
-                            *result.entry(path.to_string()).or_default() |= vector;
-                        }
-                        let mut vector =
-                            std::mem::take(result.entry(file_path.to_string()).or_default());
-                        vector.insert(Self::checked_delete_position(
-                            delete_file_path,
-                            file_path,
-                            pos,
-                        )?);
-                        current = Some((file_path, vector));
-                    }
-                }
-            }
-            if let Some((path, vector)) = current.take() {
-                *result.entry(path.to_string()).or_default() |= vector;
-            }
-        }
-
-        Ok(result)
     }
 
     /// Parse an equality-delete file's record-batch stream into its survival [`Predicate`]. The
@@ -1221,7 +1108,7 @@ mod tests {
         let stream_batches: Vec<crate::Result<RecordBatch>> =
             batches.iter().cloned().map(Ok).collect();
         let stream = Box::pin(stream::iter(stream_batches)) as ArrowRecordBatchStream;
-        let actual_map = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+        let actual_map = parse_positional_deletes_record_batch_stream(
             "pos-dels.parquet",
             stream,
         )
@@ -1515,7 +1402,7 @@ mod tests {
 
         for (batch, arity) in [(one_col, 1usize), (no_col, 0usize)] {
             let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
-            let error = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+            let error = parse_positional_deletes_record_batch_stream(
                 "truncated-pos-dels.parquet",
                 stream,
             )
@@ -1560,7 +1447,7 @@ mod tests {
         .expect("build three-column position delete batch");
         let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
 
-        let result = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+        let result = parse_positional_deletes_record_batch_stream(
             "pos-dels-with-row.parquet",
             stream,
         )
@@ -1593,7 +1480,7 @@ mod tests {
         .expect("build batch with null file_path");
         let stream = Box::pin(stream::iter(vec![Ok(batch)])) as ArrowRecordBatchStream;
 
-        let error = CachingDeleteFileLoader::parse_positional_deletes_record_batch_stream(
+        let error = parse_positional_deletes_record_batch_stream(
             "corrupt-pos-dels.parquet",
             stream,
         )
