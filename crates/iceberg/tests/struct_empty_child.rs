@@ -182,6 +182,21 @@ async fn add_column(catalog: &impl Catalog, table: &Table, name: &str, ty: Type)
     tx.commit(catalog).await.expect("commit add column")
 }
 
+async fn add_child(catalog: &impl Catalog, table: &Table, parent: &str, name: &str) -> Table {
+    let tx = Transaction::new(table);
+    let tx = tx
+        .update_schema()
+        .add_column_to(
+            Some(parent),
+            name,
+            Type::Primitive(PrimitiveType::Int),
+            None,
+        )
+        .apply(tx)
+        .expect("apply add nested column");
+    tx.commit(catalog).await.expect("commit add nested column")
+}
+
 async fn scan(table: &Table, columns: Option<&[&str]>) -> RecordBatch {
     let builder = table.scan();
     let builder = match columns {
@@ -529,6 +544,142 @@ async fn map_of_struct_with_children_dropped_keeps_entries() {
     assert_eq!(m.value_length(0), 1);
     assert_eq!(m.values().data_type(), &DataType::Struct(Fields::empty()));
     assert_eq!(validity(m.values().as_ref()), vec![true]);
+}
+
+fn as_struct(array: &dyn Array) -> &StructArray {
+    array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("column is a StructArray")
+}
+
+fn child_ints(parent: &StructArray, name: &str) -> Vec<Option<i32>> {
+    parent
+        .column_by_name(name)
+        .expect("child present")
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .expect("child is an int column")
+        .iter()
+        .collect()
+}
+
+fn child_names(parent: &StructArray) -> Vec<String> {
+    parent.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+async fn absent_children_table(catalog: &impl Catalog, location: &str, valid: &[bool]) -> Table {
+    let schema = table_schema(NestedField::optional(
+        2,
+        "s",
+        struct_type(vec![int_field(3, "d")]),
+    ));
+    let table = create_table(catalog, location, schema).await;
+    let s_type = column_type(&table, 1);
+    let d: Vec<Option<i32>> = valid.iter().map(|v| v.then_some(1)).collect();
+    let s = struct_array(&s_type, vec![ints(&d)], valid);
+    let ids: Vec<i32> = (1..=valid.len() as i32).collect();
+    let file = write_file(&table, &ids, s).await;
+    let table = append(catalog, &table, file).await;
+    let table = add_child(catalog, &table, "s", "k").await;
+    drop_column(catalog, &table, "s.d").await
+}
+
+#[tokio::test]
+async fn struct_whose_task_children_are_all_absent_from_the_file_reads_non_null() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let catalog = load_catalog(&warehouse).await;
+    let table = absent_children_table(&catalog, &format!("{warehouse}/t"), &[true]).await;
+
+    let batch = scan(&table, None).await;
+    assert_eq!(id_values(&batch), vec![1]);
+    let s = as_struct(batch.column_by_name("s").expect("s present").as_ref());
+    assert_eq!(child_names(s), vec!["k".to_string()]);
+    assert_eq!(validity(s), vec![true]);
+    assert_eq!(child_ints(s, "k"), vec![None]);
+
+    let only_s = scan(&table, Some(&["s"])).await;
+    assert_eq!(only_s.num_columns(), 1);
+    let s = as_struct(only_s.column(0).as_ref());
+    assert_eq!(child_names(s), vec!["k".to_string()]);
+    assert_eq!(validity(s), vec![true]);
+}
+
+#[tokio::test]
+async fn struct_whose_task_children_are_all_absent_keeps_a_null_row_null() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let catalog = load_catalog(&warehouse).await;
+    let table = absent_children_table(&catalog, &format!("{warehouse}/t"), &[true, false]).await;
+
+    let batch = scan(&table, None).await;
+    assert_eq!(id_values(&batch), vec![1, 2]);
+    let s = as_struct(batch.column_by_name("s").expect("s present").as_ref());
+    assert_eq!(child_names(s), vec!["k".to_string()]);
+    assert_eq!(validity(s), vec![true, false]);
+    assert_eq!(child_ints(s, "k"), vec![None, None]);
+}
+
+#[tokio::test]
+async fn nested_struct_whose_task_children_are_all_absent_keeps_file_validity() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let catalog = load_catalog(&warehouse).await;
+    let inner = NestedField::optional(3, "s", struct_type(vec![int_field(4, "d")]));
+    let schema = table_schema(NestedField::optional(2, "o", struct_type(vec![inner])));
+    let table = create_table(&catalog, &format!("{warehouse}/t"), schema).await;
+    let o_type = column_type(&table, 1);
+    let s_type = struct_fields(&o_type)[0].data_type().clone();
+    let s = struct_array(&s_type, vec![ints(&[Some(1), None, None])], &[
+        true, false, false,
+    ]);
+    let o = struct_array(&o_type, vec![s], &[true, true, false]);
+    let file = write_file(&table, &[1, 2, 3], o).await;
+    let table = append(&catalog, &table, file).await;
+    let table = add_child(&catalog, &table, "o.s", "k").await;
+    let table = drop_column(&catalog, &table, "o.s.d").await;
+
+    let batch = scan(&table, None).await;
+    assert_eq!(id_values(&batch), vec![1, 2, 3]);
+    let o = as_struct(batch.column_by_name("o").expect("o present").as_ref());
+    assert_eq!(child_names(o), vec!["s".to_string()]);
+    assert_eq!(validity(o), vec![true, true, false]);
+    let s = as_struct(o.column_by_name("s").expect("o.s present").as_ref());
+    assert_eq!(child_names(s), vec!["k".to_string()]);
+    assert_eq!(validity(s), vec![true, false, false]);
+    assert_eq!(child_ints(s, "k"), vec![None, None, None]);
+}
+
+#[tokio::test]
+async fn struct_whose_task_children_are_partly_in_the_file_is_unchanged() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let warehouse = tmp.path().to_string_lossy().to_string();
+    let catalog = load_catalog(&warehouse).await;
+    let schema = table_schema(NestedField::optional(
+        2,
+        "s",
+        struct_type(vec![int_field(3, "d"), int_field(4, "e")]),
+    ));
+    let table = create_table(&catalog, &format!("{warehouse}/t"), schema).await;
+    let s_type = column_type(&table, 1);
+    let s = struct_array(
+        &s_type,
+        vec![ints(&[Some(1), None]), ints(&[Some(2), None])],
+        &[true, false],
+    );
+    let file = write_file(&table, &[1, 2], s).await;
+    let table = append(&catalog, &table, file).await;
+    let table = add_child(&catalog, &table, "s", "k").await;
+    let table = drop_column(&catalog, &table, "s.d").await;
+
+    let batch = scan(&table, None).await;
+    assert_eq!(id_values(&batch), vec![1, 2]);
+    let s = as_struct(batch.column_by_name("s").expect("s present").as_ref());
+    assert_eq!(child_names(s), vec!["e".to_string(), "k".to_string()]);
+    assert_eq!(validity(s), vec![true, false]);
+    assert_eq!(child_ints(s, "e"), vec![Some(2), None]);
+    assert_eq!(child_ints(s, "k"), vec![None, None]);
 }
 
 #[tokio::test]

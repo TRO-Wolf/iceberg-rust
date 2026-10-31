@@ -239,17 +239,23 @@ pub(crate) fn validity_leaves(
     schema: &Schema,
     arrow_schema: &ArrowSchemaRef,
 ) -> Result<Vec<usize>> {
-    let mut leafless_structs = Vec::new();
-    for field_id in field_ids {
-        if let Some(field) = schema.field_by_id(*field_id) {
-            collect_leafless_structs(field, 0, &mut leafless_structs)?;
-        }
-    }
+    let fields: Vec<&NestedField> = field_ids
+        .iter()
+        .filter_map(|field_id| schema.field_by_id(*field_id).map(|field| field.as_ref()))
+        .collect();
     let mut borrowed = Vec::new();
-    if leafless_structs.is_empty() {
+    let mut holds_struct = false;
+    for field in &fields {
+        holds_struct |= type_holds_struct(&field.field_type, 0)?;
+    }
+    if !holds_struct {
         return Ok(borrowed);
     }
     let groups = index_file_groups(arrow_schema)?;
+    let mut leafless_structs = Vec::new();
+    for field in fields {
+        collect_leafless_structs(field, 0, &groups, None, &mut leafless_structs)?;
+    }
     for struct_id in leafless_structs {
         let Some(group) = groups.get(&struct_id) else {
             continue;
@@ -264,31 +270,69 @@ pub(crate) fn validity_leaves(
     Ok(borrowed)
 }
 
+fn type_holds_struct(field_type: &Type, depth: usize) -> Result<bool> {
+    check_depth(depth)?;
+    Ok(match field_type {
+        Type::Primitive(_) | Type::Variant => false,
+        Type::Struct(_) => true,
+        Type::List(list_type) => type_holds_struct(&list_type.element_field.field_type, depth + 1)?,
+        Type::Map(map_type) => {
+            type_holds_struct(&map_type.key_field.field_type, depth + 1)?
+                || type_holds_struct(&map_type.value_field.field_type, depth + 1)?
+        }
+    })
+}
+
 fn collect_leafless_structs(
     field: &NestedField,
     depth: usize,
+    groups: &HashMap<i32, FileGroup>,
+    within: Option<&Range<usize>>,
     leafless_structs: &mut Vec<i32>,
 ) -> Result<bool> {
     check_depth(depth)?;
+    let Some(group) = groups.get(&field.id).filter(|group| {
+        within
+            .is_none_or(|range| range.start <= group.leaves.start && group.leaves.end <= range.end)
+    }) else {
+        return Ok(false);
+    };
+    let leaves = Some(&group.leaves);
     Ok(match field.field_type.as_ref() {
         Type::Primitive(_) | Type::Variant => true,
         Type::Struct(struct_type) => {
             let mut has_leaf = false;
             for child in struct_type.fields() {
-                has_leaf |= collect_leafless_structs(child, depth + 1, leafless_structs)?;
+                has_leaf |=
+                    collect_leafless_structs(child, depth + 1, groups, leaves, leafless_structs)?;
             }
             if !has_leaf {
                 leafless_structs.push(field.id);
             }
             has_leaf
         }
-        Type::List(list_type) => {
-            collect_leafless_structs(&list_type.element_field, depth + 1, leafless_structs)?
-        }
+        Type::List(list_type) => collect_leafless_structs(
+            &list_type.element_field,
+            depth + 1,
+            groups,
+            leaves,
+            leafless_structs,
+        )?,
         Type::Map(map_type) => {
-            let key = collect_leafless_structs(&map_type.key_field, depth + 1, leafless_structs)?;
-            let value =
-                collect_leafless_structs(&map_type.value_field, depth + 1, leafless_structs)?;
+            let key = collect_leafless_structs(
+                &map_type.key_field,
+                depth + 1,
+                groups,
+                leaves,
+                leafless_structs,
+            )?;
+            let value = collect_leafless_structs(
+                &map_type.value_field,
+                depth + 1,
+                groups,
+                leaves,
+                leafless_structs,
+            )?;
             key || value
         }
     })
