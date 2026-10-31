@@ -25,12 +25,12 @@ use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, RecordBatch, Stru
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
-use crate::Result;
 use crate::arrow::{ArrowArrayAccessor, FieldMatchMode};
 use crate::spec::{
     ListType, MapType, NestedFieldRef, PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor,
     StructType, Type, visit_struct_with_partner,
 };
+use crate::{Error, ErrorKind, Result};
 
 /// Count NaN values in a float/double column, respecting the null bitmap (null is not NaN).
 ///
@@ -172,11 +172,21 @@ impl NanValueCountVisitor {
         let arrow_arr_partner_accessor = ArrowArrayAccessor::new_with_match_mode(self.match_mode);
 
         // Build a StructArray view without taking ownership of `batch` (Arc-clone columns only).
-        let struct_arr = Arc::new(StructArray::new(
-            batch.schema().fields().clone(),
-            batch.columns().to_vec(),
-            None,
-        )) as ArrayRef;
+        let struct_arr = Arc::new(
+            StructArray::try_new_with_length(
+                batch.schema().fields().clone(),
+                batch.columns().to_vec(),
+                None,
+                batch.num_rows(),
+            )
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "failed to view the batch as a struct",
+                )
+                .with_source(e)
+            })?,
+        ) as ArrayRef;
         visit_struct_with_partner(
             schema.as_struct(),
             &struct_arr,
