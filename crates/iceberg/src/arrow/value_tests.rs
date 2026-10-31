@@ -24,6 +24,7 @@ use arrow_array::{
     Int32Array, Int64Array, RecordBatch, StringArray, StructArray, Time64MicrosecondArray,
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
+use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Fields, TimeUnit};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 

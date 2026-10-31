@@ -252,6 +252,12 @@ impl PlanNode {
         depth: usize,
         path: &str,
     ) -> Result<Self> {
+        if target_fields.is_empty() {
+            return Ok(PlanNode::Struct {
+                target_fields: target_fields.clone(),
+                children: Vec::new(),
+            });
+        }
         if !source_fields.is_empty() && source_fields.iter().all(|f| field_id_of(f).is_none()) {
             let source_type = DataType::Struct(source_fields.clone());
             let target_type = DataType::Struct(target_fields.clone());
@@ -402,10 +408,11 @@ impl PlanNode {
                     };
                     columns.push(child.node.apply(child_source, len)?);
                 }
-                StructArray::try_new(
+                StructArray::try_new_with_length(
                     target_fields.clone(),
                     columns,
                     source_struct.nulls().cloned(),
+                    len,
                 )
                 .map(|array| Arc::new(array) as ArrayRef)
                 .map_err(|e| {

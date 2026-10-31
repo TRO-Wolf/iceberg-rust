@@ -690,3 +690,84 @@ fn later_batch_with_a_richer_nested_layout_rebuilds_the_plan() {
     assert_eq!(b.value(0), "keep");
     assert_eq!(b.value(1), "kept");
 }
+
+fn snapshot_schema_with_s(s_type: StructType) -> Arc<Schema> {
+    Arc::new(
+        Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                NestedField::optional(2, "s", Type::Struct(s_type)).into(),
+            ])
+            .build()
+            .expect("build the snapshot schema"),
+    )
+}
+
+#[test]
+fn inner_struct_absent_from_file_and_emptied_fills_null() {
+    let snapshot_schema = snapshot_schema_with_s(StructType::new(vec![
+        NestedField::optional(3, "a", Type::Primitive(PrimitiveType::Int)).into(),
+        NestedField::optional(4, "i", Type::Struct(StructType::new(vec![]))).into(),
+    ]));
+    let s_fields = Fields::from(vec![id_field("a", DataType::Int32, true, 3)]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("s", DataType::Struct(s_fields.clone()), true, 2),
+    ]));
+    let s = StructArray::try_new(
+        s_fields,
+        vec![Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef],
+        Some(NullBuffer::from(vec![true, false])),
+    )
+    .expect("build the file struct");
+    let file_batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(s) as ArrayRef,
+    ])
+    .expect("build the file batch");
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let batch = transformer
+        .process_record_batch(file_batch)
+        .expect("an absent emptied inner struct fills NULL");
+    let s = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .expect("s is a struct");
+    assert!(s.is_valid(0));
+    assert!(s.is_null(1));
+    let i = s.column(1);
+    assert_eq!(i.data_type(), &DataType::Struct(Fields::empty()));
+    assert_eq!(i.len(), 2);
+    assert_eq!(i.null_count(), 2);
+}
+
+#[test]
+fn idless_source_struct_to_empty_target_keeps_validity() {
+    let snapshot_schema = snapshot_schema_with_s(StructType::new(vec![]));
+    let s_fields = Fields::from(vec![Field::new("k", DataType::Int32, true)]);
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        id_field("id", DataType::Int32, false, 1),
+        id_field("s", DataType::Struct(s_fields.clone()), true, 2),
+    ]));
+    let s = StructArray::try_new(
+        s_fields,
+        vec![Arc::new(Int32Array::from(vec![Some(7), None])) as ArrayRef],
+        Some(NullBuffer::from(vec![true, false])),
+    )
+    .expect("build the file struct");
+    let file_batch = RecordBatch::try_new(file_schema, vec![
+        Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+        Arc::new(s) as ArrayRef,
+    ])
+    .expect("build the file batch");
+    let mut transformer = RecordBatchTransformerBuilder::new(snapshot_schema, &[1, 2]).build();
+    let batch = transformer
+        .process_record_batch(file_batch)
+        .expect("an id-less struct projects onto an empty struct");
+    let s = batch.column(1);
+    assert_eq!(s.data_type(), &DataType::Struct(Fields::empty()));
+    assert!(s.is_valid(0));
+    assert!(s.is_null(1));
+}

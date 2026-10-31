@@ -264,3 +264,20 @@
             .expect_err("zero-width FixedSizeList must error, not divide-by-zero");
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
+
+    #[test]
+    fn test_create_primitive_array_repeated_empty_struct_null() {
+        let array = create_primitive_array_repeated(&DataType::Struct(Fields::empty()), &None, 3)
+            .expect("an empty struct type builds a null column");
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.null_count(), 3);
+        assert_eq!(array.data_type(), &DataType::Struct(Fields::empty()));
+    }
+
+    #[test]
+    fn test_create_primitive_array_single_element_empty_struct_null() {
+        let array = create_primitive_array_single_element(&DataType::Struct(Fields::empty()), &None)
+            .expect("an empty struct type builds a single null element");
+        assert_eq!(array.len(), 1);
+        assert_eq!(array.null_count(), 1);
+    }
