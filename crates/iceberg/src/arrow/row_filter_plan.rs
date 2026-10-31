@@ -16,16 +16,18 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::str::FromStr;
 
 use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, DataType, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{ArrowError, DataType, Field, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{ConvertedType, LogicalType};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
+use crate::arrow::nested_projection::MAX_NESTED_PROJECTION_DEPTH;
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::expr::BoundPredicate;
 use crate::metadata_columns::is_metadata_field;
@@ -230,6 +232,133 @@ pub(crate) fn unmapped_group_leaf_indices(
         leaf_idx += count;
     }
     indices
+}
+
+pub(crate) fn validity_leaves(
+    field_ids: &[i32],
+    schema: &Schema,
+    arrow_schema: &ArrowSchemaRef,
+) -> Result<Vec<usize>> {
+    let mut leafless_structs = Vec::new();
+    for field_id in field_ids {
+        if let Some(field) = schema.field_by_id(*field_id) {
+            collect_leafless_structs(field, 0, &mut leafless_structs)?;
+        }
+    }
+    let mut borrowed = Vec::new();
+    if leafless_structs.is_empty() {
+        return Ok(borrowed);
+    }
+    let groups = index_file_groups(arrow_schema)?;
+    for struct_id in leafless_structs {
+        let Some(group) = groups.get(&struct_id) else {
+            continue;
+        };
+        if !group.is_struct || group.leaves.is_empty() {
+            continue;
+        }
+        if !group.leaves.clone().any(|leaf| borrowed.contains(&leaf)) {
+            borrowed.push(group.leaves.start);
+        }
+    }
+    Ok(borrowed)
+}
+
+fn collect_leafless_structs(
+    field: &NestedField,
+    depth: usize,
+    leafless_structs: &mut Vec<i32>,
+) -> Result<bool> {
+    check_depth(depth)?;
+    Ok(match field.field_type.as_ref() {
+        Type::Primitive(_) | Type::Variant => true,
+        Type::Struct(struct_type) => {
+            let mut has_leaf = false;
+            for child in struct_type.fields() {
+                has_leaf |= collect_leafless_structs(child, depth + 1, leafless_structs)?;
+            }
+            if !has_leaf {
+                leafless_structs.push(field.id);
+            }
+            has_leaf
+        }
+        Type::List(list_type) => {
+            collect_leafless_structs(&list_type.element_field, depth + 1, leafless_structs)?
+        }
+        Type::Map(map_type) => {
+            let key = collect_leafless_structs(&map_type.key_field, depth + 1, leafless_structs)?;
+            let value =
+                collect_leafless_structs(&map_type.value_field, depth + 1, leafless_structs)?;
+            key || value
+        }
+    })
+}
+
+struct FileGroup {
+    is_struct: bool,
+    leaves: Range<usize>,
+}
+
+fn index_file_groups(arrow_schema: &ArrowSchemaRef) -> Result<HashMap<i32, FileGroup>> {
+    let mut groups = HashMap::new();
+    let mut next_leaf = 0;
+    for field in arrow_schema.fields() {
+        index_field(field, 0, &mut next_leaf, &mut groups)?;
+    }
+    Ok(groups)
+}
+
+fn index_field(
+    field: &Field,
+    depth: usize,
+    next_leaf: &mut usize,
+    groups: &mut HashMap<i32, FileGroup>,
+) -> Result<()> {
+    check_depth(depth)?;
+    let start = *next_leaf;
+    let data_type = match field.data_type() {
+        DataType::Dictionary(_, value) => value.as_ref(),
+        DataType::RunEndEncoded(_, value) => value.data_type(),
+        other => other,
+    };
+    match data_type {
+        DataType::Struct(children) => {
+            for child in children {
+                index_field(child, depth + 1, next_leaf, groups)?;
+            }
+        }
+        DataType::Union(children, _) => {
+            for (_, child) in children.iter() {
+                index_field(child, depth + 1, next_leaf, groups)?;
+            }
+        }
+        DataType::List(child)
+        | DataType::LargeList(child)
+        | DataType::FixedSizeList(child, _)
+        | DataType::Map(child, _) => index_field(child, depth + 1, next_leaf, groups)?,
+        _ => *next_leaf += 1,
+    }
+    let field_id = field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|id| i32::from_str(id).ok());
+    if let Some(field_id) = field_id {
+        groups.insert(field_id, FileGroup {
+            is_struct: matches!(data_type, DataType::Struct(_)),
+            leaves: start..*next_leaf,
+        });
+    }
+    Ok(())
+}
+
+fn check_depth(depth: usize) -> Result<()> {
+    if depth > MAX_NESTED_PROJECTION_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("nested schema exceeds depth {MAX_NESTED_PROJECTION_DEPTH}"),
+        ));
+    }
+    Ok(())
 }
 
 fn build_field_id_leaf_lists(

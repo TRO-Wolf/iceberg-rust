@@ -43,7 +43,7 @@
 
 use arrow_array::{Array, ArrayRef, StructArray, make_array};
 use arrow_buffer::NullBuffer;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Fields};
 
 use crate::{Error, ErrorKind, Result};
 
@@ -213,6 +213,19 @@ fn propagate(
             .with_source(err)
         })?;
     Ok(Some(std::sync::Arc::new(rebuilt) as ArrayRef))
+}
+
+pub(crate) fn null_struct(fields: &Fields, arrays: Vec<ArrayRef>, len: usize) -> Result<ArrayRef> {
+    let nulls = Some(NullBuffer::new_null(len));
+    StructArray::try_new_with_length(fields.clone(), arrays, nulls, len)
+        .map(|array| std::sync::Arc::new(array) as ArrayRef)
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "failed to build a null struct column",
+            )
+            .with_source(e)
+        })
 }
 
 #[cfg(test)]

@@ -24,11 +24,12 @@ use arrow_array::{
     StringViewArray, StructArray, Time64MicrosecondArray, TimestampMicrosecondArray,
     TimestampNanosecondArray, new_null_array,
 };
-use arrow_buffer::{Buffer, NullBuffer};
+use arrow_buffer::Buffer;
 use arrow_schema::{DataType, FieldRef, TimeUnit};
 use uuid::Uuid;
 
 use super::get_field_id_from_metadata;
+use super::null_propagation::null_struct;
 use crate::spec::{
     ListType, Literal, Map, MapType, NestedField, PartnerAccessor, PrimitiveLiteral, PrimitiveType,
     SchemaWithPartnerVisitor, Struct, StructType, Type, visit_struct_with_partner,
@@ -885,11 +886,7 @@ pub(crate) fn create_primitive_array_single_element(
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(arrow_array::StructArray::new(
-                fields.clone(),
-                null_arrays,
-                Some(arrow_buffer::NullBuffer::new_null(1)),
-            )))
+            null_struct(fields, null_arrays, 1)
         }
         _ => Err(Error::new(
             ErrorKind::Unexpected,
@@ -1053,11 +1050,7 @@ pub(crate) fn create_primitive_array_repeated(
                 .map(|field| create_primitive_array_repeated(field.data_type(), &None, num_rows))
                 .collect::<Result<Vec<_>>>()?;
 
-            Arc::new(StructArray::new(
-                fields.clone(),
-                null_arrays,
-                Some(NullBuffer::new_null(num_rows)),
-            ))
+            null_struct(fields, null_arrays, num_rows)?
         }
         (DataType::Time64(TimeUnit::Microsecond), Some(PrimitiveLiteral::Long(value))) => {
             Arc::new(Time64MicrosecondArray::from(vec![*value; num_rows]))

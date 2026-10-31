@@ -57,7 +57,7 @@ use crate::arrow::record_batch_transformer::{
 };
 use crate::arrow::row_filter_plan::{
     RowFilterPlan, dropped_equality_key_mask, leaf_count, plan_row_filter, top_level_ancestor_id,
-    unmapped_group_leaf_indices,
+    unmapped_group_leaf_indices, validity_leaves,
 };
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -1307,17 +1307,15 @@ impl ArrowReader {
 
         let mut leaf_field_ids = vec![];
         for field_id in field_ids {
-            let field = iceberg_schema_of_task
-                .field_by_id(*field_id)
-                .cloned()
-                .or_else(|| get_metadata_field(*field_id).ok().cloned());
-            if let Some(field) = field {
-                Self::include_leaf_field_id(&field, &mut leaf_field_ids);
+            let field = iceberg_schema_of_task.field_by_id(*field_id);
+            if let Some(field) = field.or_else(|| get_metadata_field(*field_id).ok()) {
+                Self::include_leaf_field_id(field, &mut leaf_field_ids);
             }
         }
 
         Self::get_arrow_projection_mask_with_field_ids(
             &leaf_field_ids,
+            field_ids,
             iceberg_schema_of_task,
             parquet_schema,
             arrow_schema,
@@ -1328,6 +1326,7 @@ impl ArrowReader {
 
     fn get_arrow_projection_mask_with_field_ids(
         leaf_field_ids: &[i32],
+        top_ids: &[i32],
         iceberg_schema_of_task: &Schema,
         parquet_schema: &SchemaDescriptor,
         arrow_schema: &ArrowSchemaRef,
@@ -1336,16 +1335,17 @@ impl ArrowReader {
     ) -> Result<ProjectionMask> {
         let mut column_map = HashMap::new();
         let fields = arrow_schema.fields();
+        let mut indices = validity_leaves(top_ids, iceberg_schema_of_task, arrow_schema)?;
 
         let mut projected_fields: HashMap<FieldRef, i32> = HashMap::new();
         let projected_arrow_schema = ArrowSchema::new_with_metadata(
-            fields.filter_leaves(|_, f| {
+            fields.filter_leaves(|idx, f| {
                 f.metadata()
                     .get(PARQUET_FIELD_ID_META_KEY)
                     .and_then(|field_id| i32::from_str(field_id).ok())
                     .is_some_and(|field_id| {
                         projected_fields.insert((*f).clone(), field_id);
-                        leaf_field_ids.contains(&field_id)
+                        leaf_field_ids.contains(&field_id) || indices.contains(&idx)
                     })
             }),
             arrow_schema.metadata().clone(),
@@ -1382,7 +1382,6 @@ impl ArrowReader {
             true
         });
 
-        let mut indices = vec![];
         for field_id in leaf_field_ids {
             if let Some(col_idx) = column_map.get(field_id) {
                 indices.push(*col_idx);
