@@ -19,6 +19,14 @@
 
 # F-EQDEL-DROPPED-KEY-1 — equality deletes survive a dropped, renamed or re-added key column
 
+**Errata (2026-10-31).** Row F2-6 is closed by F-STRUCT-EMPTY-CHILD-PANIC-1
+(ledger `task/f-struct-empty-child-panic-1-ledger.md` on branch
+`fix/struct-empty-child-panic-1`). When F2-6 was written no RePark card
+existed, so its "carded on the RePark side" was wrong at the time. The card
+`task/roadmap/mid-term/f-struct-empty-child-panic-1-card-2026-10-29.md` in the
+RePark repository was filed on 2026-10-29 from finding AUD-008 of that day's
+re-audit. The F2-6 row below is left as written.
+
 **Date:** 2026-10-28. **Base:** fork `main` `ea0b7741`, rebased in fold-2 onto
 `56aa8913` (F-POSDEL-FORMAT-READ-1, fork PR #375). **Branch:**
 `fix/eqdel-dropped-key-1`. Fold-1 commits (rebased): `988bebdf` (fix),
