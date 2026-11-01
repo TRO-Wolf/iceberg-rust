@@ -174,7 +174,10 @@ fn stamp_mapped(
 ) -> Result<Field> {
     check_depth(depth)?;
     let Some((mapped, field_id)) = mapped.and_then(|m| m.field_id().map(|id| (m, id))) else {
-        return Ok(left_unstamped(field));
+        return Ok(match depth {
+            0 => field.clone(),
+            _ => left_unstamped(field),
+        });
     };
     let children = child_slots(field.data_type())
         .into_iter()
