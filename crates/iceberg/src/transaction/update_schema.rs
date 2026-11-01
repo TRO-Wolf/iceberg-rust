@@ -1929,37 +1929,6 @@ mod tests {
         assert!(field.required, "the added column must be required");
     }
 
-    // ----- renameColumn -----
-
-    // RISK: rename must change the name but PRESERVE the field id (so data stays addressable) and type.
-    #[tokio::test]
-    async fn test_rename_preserves_id_and_type() {
-        let table = v2_table();
-        let updates = run(
-            UpdateSchemaAction::new().rename_column("y", "y_renamed"),
-            &table,
-        )
-        .await;
-        let schema = added_schema(&updates);
-        let field = schema.field_by_name("y_renamed").expect("renamed column");
-        assert_eq!(field.id, 2, "rename preserves the field id");
-        assert_eq!(
-            field.field_type.as_ref(),
-            &Type::Primitive(PrimitiveType::Long)
-        );
-        assert!(schema.field_by_name("y").is_none(), "old name must be gone");
-    }
-
-    // RISK: renaming a missing column must fail loudly, not silently no-op.
-    #[tokio::test]
-    async fn test_rename_missing_column_rejected() {
-        let table = v2_table();
-        let result = Arc::new(UpdateSchemaAction::new().rename_column("nope", "x2"))
-            .commit(&table)
-            .await;
-        assert!(result.is_err());
-    }
-
     // ----- updateColumn: type promotion accept + reject -----
 
     // RISK: a legal widening must succeed. Add an int column, then promote it to long.
@@ -3593,3 +3562,7 @@ mod tests {
         assert_data_invalid(&error, "Cannot change column type: v: variant -> string");
     }
 }
+
+#[cfg(test)]
+#[path = "update_schema_mapping_tests.rs"]
+mod mapping_tests;
