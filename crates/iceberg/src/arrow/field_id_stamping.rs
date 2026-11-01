@@ -112,7 +112,9 @@ fn with_children(data_type: &DataType, children: Vec<Field>) -> DataType {
 
 fn with_field_id(field: &Field, field_id: i32, data_type: DataType) -> Field {
     let mut metadata = field.metadata().clone();
-    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+    metadata
+        .entry(PARQUET_FIELD_ID_META_KEY.to_string())
+        .or_insert_with(|| field_id.to_string());
     field
         .clone()
         .with_data_type(data_type)
@@ -120,27 +122,33 @@ fn with_field_id(field: &Field, field_id: i32, data_type: DataType) -> Field {
 }
 
 fn left_unstamped(field: &Field) -> Field {
+    if field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
+        return field.clone();
+    }
     let mut metadata = field.metadata().clone();
     metadata.insert(LEFT_UNSTAMPED_META_KEY.to_string(), "true".to_string());
     field.clone().with_metadata(metadata)
 }
 
-fn has_no_field_ids(arrow_schema: &ArrowSchema) -> bool {
-    arrow_schema
-        .fields()
-        .iter()
-        .next()
-        .is_none_or(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())
+pub(crate) fn file_has_field_ids(arrow_schema: &ArrowSchema) -> bool {
+    let mut pending: Vec<&Field> = arrow_schema.fields().iter().map(|f| f.as_ref()).collect();
+    while let Some(field) = pending.pop() {
+        if field.metadata().contains_key(PARQUET_FIELD_ID_META_KEY) {
+            return true;
+        }
+        pending.extend(
+            child_slots(field.data_type())
+                .into_iter()
+                .map(|(child, _)| child),
+        );
+    }
+    false
 }
 
 pub(crate) fn apply_name_mapping_to_arrow_schema(
     arrow_schema: ArrowSchemaRef,
     name_mapping: &NameMapping,
 ) -> Result<ArrowSchemaRef> {
-    debug_assert!(
-        has_no_field_ids(&arrow_schema),
-        "Schema already has field IDs - name mapping should not be applied"
-    );
     let fields = arrow_schema
         .fields()
         .iter()
@@ -288,10 +296,6 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
     arrow_schema: &ArrowSchemaRef,
     table_schema: &Schema,
 ) -> Result<ArrowSchemaRef> {
-    debug_assert!(
-        has_no_field_ids(arrow_schema),
-        "Schema already has field IDs"
-    );
     let too_many = || {
         Error::new(
             ErrorKind::DataInvalid,

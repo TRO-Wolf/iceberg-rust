@@ -47,7 +47,7 @@ use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::equality_delete_set::{EqDeleteKeySet, eq_delete_key_fields_projected};
 use crate::arrow::field_id_stamping::{
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema, file_has_field_ids,
     stamped_field_id_map,
 };
 use crate::arrow::footer_cache::TableFooterCache;
@@ -475,12 +475,7 @@ impl ArrowReader {
         .await?;
 
         // Java `ParquetSchemaUtil.hasIds()`.
-        let missing_field_ids = arrow_metadata
-            .schema()
-            .fields()
-            .iter()
-            .next()
-            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
+        let missing_field_ids = !file_has_field_ids(arrow_metadata.schema());
 
         // Projection reads columns by field id (spec, Column Projection). A file written by a
         // Hive or Spark migration carries no field ids, so this must assign them before the read.
