@@ -318,3 +318,26 @@ async fn test_rename_missing_column_rejected() {
         .await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn test_rename_identifier_field_preserves_identifier_id() {
+    let table = make_v2_table();
+    let mut action_commit = commit(
+        UpdateSchemaAction::new()
+            .set_identifier_fields(["x"])
+            .rename_column("x", "x_renamed"),
+        &table,
+    )
+    .await;
+    let updates = action_commit.take_updates();
+    let TableUpdate::AddSchema { schema } = &updates[0] else {
+        panic!("the first update adds the schema: {:?}", kinds(&updates));
+    };
+    let ids: Vec<i32> = schema.identifier_field_ids().collect();
+    assert_eq!(ids, vec![1], "identifier id unchanged after rename");
+    assert_eq!(
+        schema.field_by_name("x_renamed").expect("renamed").id,
+        1,
+        "identifier resolves to the new name"
+    );
+}

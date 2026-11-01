@@ -33,6 +33,7 @@ use crate::spec::{
     Type, ensure_promotion_allowed,
 };
 use crate::table::Table;
+use crate::transaction::update_schema_mapping::name_mapping_update;
 use crate::transaction::{ActionCommit, TransactionAction};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
@@ -1175,16 +1176,23 @@ impl TransactionAction for UpdateSchemaAction {
         for op in &self.ops {
             evolution.replay(op)?;
         }
+        let mapping_update = name_mapping_update(
+            metadata.properties(),
+            &evolution.updates,
+            &evolution.parent_to_added_ids,
+            &evolution.added_fields,
+        );
         let new_schema = evolution.apply()?;
         if new_schema.is_same_schema(schema) {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
-        let updates = vec![
+        let mut updates = vec![
             TableUpdate::AddSchema { schema: new_schema },
             TableUpdate::SetCurrentSchema {
                 schema_id: LAST_ADDED_SCHEMA_ID,
             },
         ];
+        updates.extend(mapping_update);
 
         // Optimistic-concurrency guards. Java's `UpdateRequirements` attaches
         // `AssertLastAssignedFieldId(base.lastColumnId())` for the `AddSchema` update and
@@ -2668,27 +2676,6 @@ mod tests {
 
     // ----- identifier-field id STABILITY across rename / move -----
 
-    // RISK: renaming an identifier field must keep the same field id in the identifier set.
-    #[tokio::test]
-    async fn test_rename_identifier_field_preserves_identifier_id() {
-        let table = v2_table(); // identifier ids [1,2] = x,y
-        let updates = run(
-            UpdateSchemaAction::new()
-                .set_identifier_fields(["x"])
-                .rename_column("x", "x_renamed"),
-            &table,
-        )
-        .await;
-        let schema = added_schema(&updates);
-        let ids: Vec<i32> = schema.identifier_field_ids().collect();
-        assert_eq!(ids, vec![1], "identifier id unchanged after rename");
-        assert_eq!(
-            schema.field_by_name("x_renamed").expect("renamed").id,
-            1,
-            "identifier resolves to the new name"
-        );
-    }
-
     // RISK: moving an identifier field must not change its identifier id (Java testMoveIdentifierFields).
     #[tokio::test]
     async fn test_move_identifier_field_preserves_identifier_id() {
@@ -3562,7 +3549,3 @@ mod tests {
         assert_data_invalid(&error, "Cannot change column type: v: variant -> string");
     }
 }
-
-#[cfg(test)]
-#[path = "update_schema_mapping_tests.rs"]
-mod mapping_tests;
