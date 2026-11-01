@@ -105,7 +105,33 @@ fn update_fields<'a>(
     for field in fields {
         updated.push(update_field(field, changes, depth)?);
     }
+    let updated = without_reassigned_names(updated, changes);
     add_new_fields(updated, parent_id, changes, depth)
+}
+
+fn without_reassigned_names(
+    fields: Vec<MappedField>,
+    changes: &MappingChanges<'_>,
+) -> Vec<MappedField> {
+    let assignments: HashMap<&str, i32> = fields
+        .iter()
+        .filter_map(MappedField::field_id)
+        .filter_map(|id| changes.renames.get(&id).map(|name| (*name, id)))
+        .collect();
+    if assignments.is_empty() {
+        return fields;
+    }
+    fields
+        .into_iter()
+        .map(|field| {
+            let reassigned: HashSet<&str> = assignments
+                .iter()
+                .filter(|(_, id)| Some(**id) != field.field_id())
+                .map(|(name, _)| *name)
+                .collect();
+            without_names(field, &reassigned)
+        })
+        .collect()
 }
 
 fn update_field(

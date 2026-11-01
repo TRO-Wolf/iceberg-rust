@@ -150,14 +150,21 @@ pub(crate) fn apply_name_mapping_to_arrow_schema(
     name_mapping: &NameMapping,
     projected_field_ids: &[i32],
 ) -> Result<ArrowSchemaRef> {
-    let fields = arrow_schema
+    let matches: Vec<Option<&MappedField>> = arrow_schema
         .fields()
         .iter()
         .map(|field| {
-            let mapped = name_mapping
+            name_mapping
                 .fields()
                 .iter()
-                .find(|mapped| mapped.names().iter().any(|name| name == field.name()));
+                .find(|mapped| mapped.names().iter().any(|name| name == field.name()))
+        })
+        .collect();
+    let fields = arrow_schema
+        .fields()
+        .iter()
+        .zip(last_match_per_id(&matches))
+        .map(|(field, mapped)| {
             stamp_mapped(field, mapped, field.name(), 0, projected_field_ids, false)
         })
         .collect::<Result<Vec<_>>>()?;
@@ -165,6 +172,20 @@ pub(crate) fn apply_name_mapping_to_arrow_schema(
         fields,
         arrow_schema.metadata().clone(),
     )))
+}
+
+fn last_match_per_id<'a>(matches: &[Option<&'a MappedField>]) -> Vec<Option<&'a MappedField>> {
+    let mut seen = HashSet::new();
+    let mut kept: Vec<Option<&MappedField>> = matches
+        .iter()
+        .rev()
+        .map(|mapped| match mapped.and_then(MappedField::field_id) {
+            Some(field_id) if !seen.insert(field_id) => None,
+            _ => *mapped,
+        })
+        .collect();
+    kept.reverse();
+    kept
 }
 
 fn stamp_mapped(
@@ -183,15 +204,23 @@ fn stamp_mapped(
         });
     };
     let projected = projected || projected_field_ids.contains(&field_id);
-    let children = child_slots(field.data_type())
-        .into_iter()
+    let slots = child_slots(field.data_type());
+    let matches: Vec<Option<&MappedField>> = slots
+        .iter()
         .map(|(child, slot)| {
             let name = slot.mapping_name(child);
-            let child_mapping = mapped
+            mapped
                 .fields()
                 .iter()
                 .map(|f| f.as_ref())
-                .find(|f| f.names().iter().any(|n| n == name));
+                .find(|f| f.names().iter().any(|n| n == name))
+        })
+        .collect();
+    let children = slots
+        .into_iter()
+        .zip(matches.iter().zip(last_match_per_id(&matches)))
+        .map(|((child, slot), (child_match, child_mapping))| {
+            let name = slot.mapping_name(child);
             let kind = match slot {
                 Slot::Member => None,
                 Slot::Element => Some("list"),
@@ -199,7 +228,7 @@ fn stamp_mapped(
             };
             if let Some(kind) = kind
                 && projected
-                && child_mapping.and_then(MappedField::field_id).is_none()
+                && child_match.and_then(MappedField::field_id).is_none()
             {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
