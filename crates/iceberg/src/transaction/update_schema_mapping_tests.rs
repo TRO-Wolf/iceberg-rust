@@ -341,3 +341,50 @@ async fn test_rename_identifier_field_preserves_identifier_id() {
         "identifier resolves to the new name"
     );
 }
+
+fn sibling_rename_update(mapping: &Value, new_name: &str) -> Option<Value> {
+    let properties = HashMap::from([(MAPPING.to_string(), mapping.to_string())]);
+    let updates = HashMap::from([(3, int_field(3, new_name))]);
+    let update =
+        super::name_mapping_update(&properties, &updates, &HashMap::new(), &HashMap::new());
+    update.map(|update| {
+        let TableUpdate::SetProperties { updates } = update else {
+            panic!("the mapping update sets the property");
+        };
+        serde_json::from_str(&updates[MAPPING]).expect("the written mapping is JSON")
+    })
+}
+
+#[test]
+fn rename_takes_its_new_name_from_the_sibling_that_holds_it() {
+    let base = json!([
+        mapped(1, &["id"], vec![]),
+        mapped(2, &["x"], vec![]),
+        mapped(3, &["y"], vec![]),
+    ]);
+    assert_eq!(
+        sibling_rename_update(&base, "x"),
+        Some(json!([
+            mapped(1, &["id"], vec![]),
+            mapped(2, &[], vec![]),
+            mapped(3, &["y", "x"], vec![]),
+        ]))
+    );
+}
+
+#[test]
+fn rename_onto_a_name_no_sibling_holds_leaves_the_siblings_untouched() {
+    let base = json!([
+        mapped(1, &["id"], vec![]),
+        mapped(2, &["x"], vec![mapped(4, &["x"], vec![])]),
+        mapped(3, &["y"], vec![]),
+    ]);
+    assert_eq!(
+        sibling_rename_update(&base, "w"),
+        Some(json!([
+            mapped(1, &["id"], vec![]),
+            mapped(2, &["x"], vec![mapped(4, &["x"], vec![])]),
+            mapped(3, &["y", "w"], vec![]),
+        ]))
+    );
+}
