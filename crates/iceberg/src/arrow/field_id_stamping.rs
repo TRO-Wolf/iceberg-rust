@@ -149,7 +149,7 @@ pub(crate) fn apply_name_mapping_to_arrow_schema(
                 .fields()
                 .iter()
                 .find(|mapped| mapped.names().iter().any(|name| name == field.name()));
-            stamp_mapped(field, mapped, 0)
+            stamp_mapped(field, mapped, field.name(), 0)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(ArrowSchema::new_with_metadata(
@@ -158,7 +158,12 @@ pub(crate) fn apply_name_mapping_to_arrow_schema(
     )))
 }
 
-fn stamp_mapped(field: &Field, mapped: Option<&MappedField>, depth: usize) -> Result<Field> {
+fn stamp_mapped(
+    field: &Field,
+    mapped: Option<&MappedField>,
+    path: &str,
+    depth: usize,
+) -> Result<Field> {
     check_depth(depth)?;
     let Some((mapped, field_id)) = mapped.and_then(|m| m.field_id().map(|id| (m, id))) else {
         return Ok(left_unstamped(field));
@@ -172,7 +177,22 @@ fn stamp_mapped(field: &Field, mapped: Option<&MappedField>, depth: usize) -> Re
                 .iter()
                 .map(|f| f.as_ref())
                 .find(|f| f.names().iter().any(|n| n == name));
-            stamp_mapped(child, child_mapping, depth + 1)
+            let kind = match slot {
+                Slot::Member => None,
+                Slot::Element => Some("list"),
+                Slot::Key | Slot::Value => Some("map"),
+            };
+            if let Some(kind) = kind
+                && child_mapping.and_then(MappedField::field_id).is_none()
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "the name mapping names {kind} '{path}' but has no '{name}' entry with a field id for it"
+                    ),
+                ));
+            }
+            stamp_mapped(child, child_mapping, &format!("{path}.{name}"), depth + 1)
         })
         .collect::<Result<Vec<_>>>()?;
     let data_type = with_children(field.data_type(), children);
