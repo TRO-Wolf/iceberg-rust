@@ -771,3 +771,99 @@ fn idless_source_struct_to_empty_target_keeps_validity() {
     assert!(s.is_valid(0));
     assert!(s.is_null(1));
 }
+
+fn d_e_target() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        id_field("d", DataType::Int32, true, 3),
+        id_field("e", DataType::Int32, true, 4),
+    ]))
+}
+
+fn d_e_table_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+            NestedField::optional(
+                2,
+                "s",
+                Type::Struct(StructType::new(vec![
+                    NestedField::optional(3, "d", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(4, "e", Type::Primitive(PrimitiveType::Int)).into(),
+                ])),
+            )
+            .into(),
+        ])
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn mixed_ids_refusal_hint_asks_for_ids_and_never_for_a_name_mapping() {
+    let source = DataType::Struct(Fields::from(vec![
+        id_field("d", DataType::Int32, true, 3),
+        Field::new("e", DataType::Int32, true),
+    ]));
+    let err = NestedProjectionPlan::build(&source, &d_e_target(), &d_e_table_schema(), "s")
+        .unwrap_err();
+    let message = err.to_string();
+    assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    assert!(
+        message.contains("the data file must carry a field id on every nested field"),
+        "{message}"
+    );
+    assert!(!message.contains("mapping"), "{message}");
+}
+
+#[test]
+fn unstamped_children_of_a_file_with_ids_refuse_without_a_name_mapping_hint() {
+    let source = DataType::Struct(Fields::from(vec![
+        Field::new("d", DataType::Int32, true),
+        Field::new("e", DataType::Int32, true),
+    ]));
+    let err = NestedProjectionPlan::build(&source, &d_e_target(), &d_e_table_schema(), "s")
+        .unwrap_err();
+    let message = err.to_string();
+    assert_eq!(err.kind(), crate::ErrorKind::DataInvalid);
+    assert!(message.contains("'s'") && message.contains("no field ids"), "{message}");
+    assert!(!message.contains("mapping"), "{message}");
+}
+
+#[test]
+fn children_the_reader_left_unstamped_fill_null() {
+    let file_schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                Field::new("x", DataType::Int32, true),
+                Field::new("y", DataType::Int32, true),
+            ])),
+            true,
+        ),
+    ]));
+    let table_schema = d_e_table_schema();
+    let stamped = crate::arrow::field_id_stamping::add_fallback_field_ids_to_arrow_schema(
+        &file_schema,
+        &table_schema,
+    )
+    .unwrap();
+    let source = stamped.field(1).data_type().clone();
+    let mut plan =
+        NestedProjectionPlan::build(&source, &d_e_target(), &table_schema, "s").unwrap();
+    let DataType::Struct(source_fields) = source else {
+        panic!("s is a struct")
+    };
+    let s = StructArray::new(
+        source_fields,
+        vec![
+            Arc::new(Int32Array::from(vec![1])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![2])) as ArrayRef,
+        ],
+        None,
+    );
+    let projected = plan.apply(Arc::new(s)).unwrap();
+    let projected = projected.as_any().downcast_ref::<StructArray>().unwrap();
+    assert_eq!(projected.num_columns(), 2);
+    assert!(projected.is_valid(0));
+    assert!(projected.column(0).is_null(0) && projected.column(1).is_null(0));
+}

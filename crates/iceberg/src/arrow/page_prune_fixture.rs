@@ -31,13 +31,13 @@ use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use parquet::basic::Compression;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::properties::WriterProperties;
+use parquet::schema::types::SchemaDescriptor;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use super::reader::{
-    ArrowReader, ArrowReaderBuilder, build_fallback_field_id_map, build_field_id_map,
-};
+use super::reader::{ArrowReader, ArrowReaderBuilder, build_field_id_map};
 use crate::Result;
+use crate::arrow::row_filter_plan::leaf_count;
 use crate::expr::{Bind, BoundPredicate, Predicate};
 use crate::io::{
     FileIO, FileIOBuilder, FileInfo, FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage,
@@ -577,4 +577,19 @@ pub(crate) fn any_read_intersects(
                     .iter()
                     .any(|r| read.start < r.end && r.start < read.end)
         })
+}
+
+fn build_fallback_field_id_map(parquet_schema: &SchemaDescriptor) -> HashMap<i32, usize> {
+    let mut column_map = HashMap::new();
+    let mut leaf_idx = 0;
+
+    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
+        let field_id = (top_pos + 1) as i32;
+        if field.is_primitive() {
+            column_map.insert(field_id, leaf_idx);
+        }
+        leaf_idx += leaf_count(field);
+    }
+
+    column_map
 }

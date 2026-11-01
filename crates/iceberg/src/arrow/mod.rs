@@ -36,6 +36,9 @@ pub(crate) mod delete_filter;
 pub(crate) mod eq_delete_schema;
 pub use delete_filter::DeleteFilter;
 pub(crate) mod equality_delete_set;
+mod field_id_stamping;
+#[cfg(test)]
+mod field_id_stamping_tests;
 
 mod footer_cache;
 pub use footer_cache::{ParquetFooterCache, ParquetFooterCacheStats, TableFooterCache};

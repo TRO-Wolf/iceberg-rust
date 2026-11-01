@@ -33,6 +33,8 @@ use crate::{Error, ErrorKind, Result};
 
 pub(crate) const MAX_NESTED_PROJECTION_DEPTH: usize = 128;
 
+pub(crate) const LEFT_UNSTAMPED_META_KEY: &str = "iceberg.reader.left-unstamped";
+
 pub(crate) fn nested_projection_applies(source: &DataType, target: &DataType) -> bool {
     matches!(
         (source, target),
@@ -258,14 +260,17 @@ impl PlanNode {
                 children: Vec::new(),
             });
         }
-        if !source_fields.is_empty() && source_fields.iter().all(|f| field_id_of(f).is_none()) {
-            let source_type = DataType::Struct(source_fields.clone());
-            let target_type = DataType::Struct(target_fields.clone());
-            return Ok(if source_type.equals_datatype(&target_type) {
-                PlanNode::Passthrough
-            } else {
-                PlanNode::Cast { target_type }
-            });
+        let all_unstamped = source_fields.iter().all(|f| field_id_of(f).is_none());
+        let left_by_reader = source_fields
+            .iter()
+            .all(|f| f.metadata().contains_key(LEFT_UNSTAMPED_META_KEY));
+        if all_unstamped && !left_by_reader {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "struct '{path}' has no field ids on its nested fields in a data file that carries field ids; the data file must carry a field id on every nested field"
+                ),
+            ));
         }
         let mut source_by_id: HashMap<i32, usize> = HashMap::with_capacity(source_fields.len());
         let mut source_by_name: HashMap<&str, usize> = HashMap::new();
@@ -283,11 +288,11 @@ impl PlanNode {
             let source_index = match source_index {
                 Some(index) => Some(index),
                 None => {
-                    if source_by_name.contains_key(target_child.name().as_str()) {
+                    if !all_unstamped && source_by_name.contains_key(target_child.name().as_str()) {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
                             format!(
-                                "file mixes stamped and unstamped nested field ids in struct '{path}' at child '{}'; set a name mapping (schema.name-mapping.default) to resolve it",
+                                "file mixes stamped and unstamped nested field ids in struct '{path}' at child '{}'; the data file must carry a field id on every nested field",
                                 target_child.name()
                             ),
                         ));

@@ -46,6 +46,10 @@ use crate::arrow::arrow_schema_to_schema;
 use crate::arrow::avro_reader::read_avro_data_file;
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::equality_delete_set::{EqDeleteKeySet, eq_delete_key_fields_projected};
+use crate::arrow::field_id_stamping::{
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema, file_has_field_ids,
+    stamped_field_id_map,
+};
 use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
@@ -56,8 +60,8 @@ use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
 use crate::arrow::row_filter_plan::{
-    RowFilterPlan, dropped_equality_key_mask, leaf_count, plan_row_filter, top_level_ancestor_id,
-    unmapped_group_leaf_indices, validity_leaves,
+    RowFilterPlan, dropped_equality_key_mask, plan_row_filter, top_level_ancestor_id,
+    validity_leaves,
 };
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -72,7 +76,7 @@ use crate::metadata_columns::{
     is_metadata_field, is_row_lineage_field,
 };
 use crate::scan::{ArrowRecordBatchStream, FileScanTask, FileScanTaskStream};
-use crate::spec::{DataFileFormat, Datum, NameMapping, NestedField, PrimitiveType, Schema, Type};
+use crate::spec::{DataFileFormat, Datum, NestedField, PrimitiveType, Schema, Type};
 use crate::utils::available_parallelism;
 use crate::{Error, ErrorKind};
 
@@ -471,12 +475,7 @@ impl ArrowReader {
         .await?;
 
         // Java `ParquetSchemaUtil.hasIds()`.
-        let missing_field_ids = arrow_metadata
-            .schema()
-            .fields()
-            .iter()
-            .next()
-            .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none());
+        let missing_field_ids = !file_has_field_ids(arrow_metadata.schema());
 
         // Projection reads columns by field id (spec, Column Projection). A file written by a
         // Hive or Spark migration carries no field ids, so this must assign them before the read.
@@ -494,12 +493,13 @@ impl ArrowReader {
                 apply_name_mapping_to_arrow_schema(
                     Arc::clone(arrow_metadata.schema()),
                     name_mapping,
+                    task.project_field_ids(),
                 )?
             } else {
                 add_fallback_field_ids_to_arrow_schema(
                     arrow_metadata.schema(),
                     task.schema.as_ref(),
-                )
+                )?
             };
 
             let options = ArrowReaderOptions::new().with_schema(arrow_schema);
@@ -700,6 +700,7 @@ impl ArrowReader {
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
                 &predicate,
             )?;
 
@@ -1227,6 +1228,7 @@ impl ArrowReader {
 
     pub(crate) fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         let mut collector = CollectFieldIdVisitor::default();
@@ -1234,10 +1236,9 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
         let field_id_map = match build_field_id_map(parquet_schema)? {
             Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+            None => stamped_field_id_map(arrow_schema),
         };
 
         Ok((iceberg_field_ids, field_id_map))
@@ -1334,6 +1335,7 @@ impl ArrowReader {
         missing_field_ids: bool,
     ) -> Result<ProjectionMask> {
         let mut column_map = HashMap::new();
+        let mut incompatible = None;
         let fields = arrow_schema.fields();
         let mut indices = validity_leaves(top_ids, iceberg_schema_of_task, arrow_schema)?;
 
@@ -1375,6 +1377,19 @@ impl ArrowReader {
                 parquet_iceberg_field.field_type.as_primitive_type(),
                 iceberg_field.field_type.as_primitive_type(),
             ) {
+                if missing_field_ids
+                    && incompatible.is_none()
+                    && top_level_ancestor_id(iceberg_schema_of_task, field_id) != Some(field_id)
+                {
+                    let name = iceberg_schema_of_task
+                        .name_by_field_id(field_id)
+                        .unwrap_or(iceberg_field.name.as_str());
+                    let (file_type, table_type) =
+                        (&parquet_iceberg_field.field_type, &iceberg_field.field_type);
+                    incompatible = Some(format!(
+                        "nested field '{name}' in the data file has type {file_type}, which cannot be read as the table type {table_type}"
+                    ));
+                }
                 return false;
             }
 
@@ -1387,13 +1402,8 @@ impl ArrowReader {
                 indices.push(*col_idx);
             }
         }
-        if missing_field_ids {
-            indices.extend(unmapped_group_leaf_indices(
-                leaf_field_ids,
-                iceberg_schema_of_task,
-                parquet_schema,
-                arrow_schema,
-            ));
+        if let Some(incompatible) = incompatible {
+            return Err(Error::new(ErrorKind::DataInvalid, incompatible));
         }
 
         if indices.is_empty() {
@@ -1566,133 +1576,6 @@ pub(crate) fn build_field_id_map(
     }
 
     Ok(Some(column_map))
-}
-
-/// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
-/// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
-/// to match `add_fallback_field_ids_to_arrow_schema`.
-pub(crate) fn build_fallback_field_id_map(
-    parquet_schema: &SchemaDescriptor,
-) -> HashMap<i32, usize> {
-    let mut column_map = HashMap::new();
-    let mut leaf_idx = 0;
-
-    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
-        let field_id = (top_pos + 1) as i32;
-        if field.is_primitive() {
-            column_map.insert(field_id, leaf_idx);
-        }
-        leaf_idx += leaf_count(field);
-    }
-
-    column_map
-}
-
-/// Assigns Iceberg field ids by column name, so a migrated file projects correctly. Java
-/// `ParquetSchemaUtil.applyNameMapping()`, on an Arrow schema instead of a Parquet `MessageType`. #
-/// Arguments * `arrow_schema` - the Arrow schema read from the file, without field ids *
-/// `name_mapping` - the table's `schema.name-mapping.default` # Returns The Arrow schema with field
-/// ids assigned.
-fn apply_name_mapping_to_arrow_schema(
-    arrow_schema: ArrowSchemaRef,
-    name_mapping: &NameMapping,
-) -> Result<Arc<ArrowSchema>> {
-    debug_assert!(
-        arrow_schema
-            .fields()
-            .iter()
-            .next()
-            .is_none_or(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none()),
-        "Schema already has field IDs - name mapping should not be applied"
-    );
-
-    use arrow_schema::Field;
-
-    let fields_with_mapped_ids: Vec<_> = arrow_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            // Java `ApplyNameMapping` calls `nameMapping.find(currentPath())`.
-            //
-            // A field absent from the mapping keeps no id, as in Java, and projection then
-            // filters it out.
-            let mapped_field_opt = name_mapping
-                .fields()
-                .iter()
-                .find(|f| f.names().contains(&field.name().to_string()));
-
-            let mut metadata = field.metadata().clone();
-
-            if let Some(mapped_field) = mapped_field_opt
-                && let Some(field_id) = mapped_field.field_id()
-            {
-                // The mapping names the field, so assign its id.
-                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-            }
-            // No id, so projection filters the field out.
-
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata)
-        })
-        .collect();
-
-    Ok(Arc::new(ArrowSchema::new_with_metadata(
-        fields_with_mapped_ids,
-        arrow_schema.metadata().clone(),
-    )))
-}
-
-fn add_fallback_field_ids_to_arrow_schema(
-    arrow_schema: &ArrowSchemaRef,
-    table_schema: &Schema,
-) -> Arc<ArrowSchema> {
-    debug_assert!(
-        arrow_schema
-            .fields()
-            .iter()
-            .next()
-            .is_none_or(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none()),
-        "Schema already has field IDs"
-    );
-
-    use arrow_schema::Field;
-
-    let table_top_level_fields = table_schema.as_struct().fields();
-    let mut positional: Vec<Option<i32>> = vec![None; arrow_schema.fields().len()];
-    let mut claimed = HashSet::new();
-    for (pos, field) in arrow_schema.fields().iter().enumerate() {
-        if let Some(table_field) = table_top_level_fields.get(pos)
-            && field.name() == table_field.name.as_str()
-        {
-            positional[pos] = Some(table_field.id);
-            claimed.insert(table_field.id);
-        }
-    }
-    let fields_with_fallback_ids: Vec<_> = arrow_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(pos, field)| {
-            let mut metadata = field.metadata().clone();
-            let counter = (pos + 1) as i32;
-            let stamped = positional[pos].or(if claimed.contains(&counter) {
-                None
-            } else {
-                Some(counter)
-            });
-            if let Some(field_id) = stamped {
-                metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
-            }
-
-            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
-                .with_metadata(metadata)
-        })
-        .collect();
-
-    Arc::new(ArrowSchema::new_with_metadata(
-        fields_with_fallback_ids,
-        arrow_schema.metadata().clone(),
-    ))
 }
 
 /// A visitor to collect field ids from bound predicates.
