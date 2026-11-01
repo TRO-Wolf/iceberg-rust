@@ -26,7 +26,7 @@ use crate::spec::{MappedField, NameMapping, NestedField, Schema, Type};
 use crate::{Error, ErrorKind, Result};
 
 enum Slot {
-    Member(usize),
+    Member,
     Element,
     Key,
     Value,
@@ -35,7 +35,7 @@ enum Slot {
 impl Slot {
     fn mapping_name<'a>(&self, field: &'a Field) -> &'a str {
         match self {
-            Slot::Member(_) => field.name(),
+            Slot::Member => field.name(),
             Slot::Element => "element",
             Slot::Key => "key",
             Slot::Value => "value",
@@ -57,8 +57,7 @@ fn child_slots(data_type: &DataType) -> Vec<(&Field, Slot)> {
     match data_type {
         DataType::Struct(children) => children
             .iter()
-            .enumerate()
-            .map(|(pos, child)| (child.as_ref(), Slot::Member(pos)))
+            .map(|child| (child.as_ref(), Slot::Member))
             .collect(),
         DataType::List(element)
         | DataType::LargeList(element)
@@ -180,10 +179,8 @@ fn table_child<'a>(
     slot: &Slot,
 ) -> Option<&'a NestedField> {
     match (parent?.field_type.as_ref(), slot) {
-        (Type::Struct(table_struct), Slot::Member(pos)) => table_struct
-            .fields()
-            .get(*pos)
-            .filter(|table_field| table_field.name == *field.name())
+        (Type::Struct(table_struct), Slot::Member) => table_struct
+            .field_by_name(field.name())
             .map(|table_field| table_field.as_ref()),
         (Type::List(list), Slot::Element) => Some(list.element_field.as_ref()),
         (Type::Map(map), Slot::Key) => Some(map.key_field.as_ref()),
@@ -211,32 +208,11 @@ fn claim_matches(
 struct FallbackIds<'a> {
     table_schema: &'a Schema,
     claimed: HashSet<i32>,
-    next_counter: i32,
 }
 
 impl FallbackIds<'_> {
-    fn take_counter(&mut self) -> Result<i32> {
-        let counter = self.next_counter;
-        self.next_counter = counter.checked_add(1).ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "file schema has too many fields for fallback field ids",
-            )
-        })?;
-        Ok(counter)
-    }
-
     fn claim(&mut self, field_id: i32) -> Option<i32> {
         self.claimed.insert(field_id).then_some(field_id)
-    }
-
-    fn skip_subtree(&mut self, field: &Field, depth: usize) -> Result<()> {
-        check_depth(depth)?;
-        for (child, _) in child_slots(field.data_type()) {
-            self.take_counter()?;
-            self.skip_subtree(child, depth + 1)?;
-        }
-        Ok(())
     }
 
     fn stamp_children(
@@ -244,9 +220,10 @@ impl FallbackIds<'_> {
         field: &Field,
         field_id: i32,
         table_field: Option<&NestedField>,
-        matched: bool,
+        preclaimed: bool,
         depth: usize,
     ) -> Result<Field> {
+        check_depth(depth)?;
         let table_field = table_field.or_else(|| {
             self.table_schema
                 .field_by_id(field_id)
@@ -254,34 +231,30 @@ impl FallbackIds<'_> {
         });
         let mut children = Vec::new();
         for (child, slot) in child_slots(field.data_type()) {
-            let counter = self.take_counter()?;
-            let candidate = table_child(table_field, child, &slot);
-            children.push(self.stamp_nested(child, candidate, matched, counter, depth + 1)?);
+            let stamped = match table_child(table_field, child, &slot) {
+                Some(table_child) => {
+                    let child_id = if preclaimed {
+                        Some(table_child.id)
+                    } else {
+                        self.claim(table_child.id)
+                    };
+                    match child_id {
+                        Some(child_id) => self.stamp_children(
+                            child,
+                            child_id,
+                            Some(table_child),
+                            preclaimed,
+                            depth + 1,
+                        )?,
+                        None => child.clone(),
+                    }
+                }
+                None => child.clone(),
+            };
+            children.push(stamped);
         }
         let data_type = with_children(field.data_type(), children);
         Ok(with_field_id(field, field_id, data_type))
-    }
-
-    fn stamp_nested(
-        &mut self,
-        field: &Field,
-        candidate: Option<&NestedField>,
-        parent_matched: bool,
-        counter: i32,
-        depth: usize,
-    ) -> Result<Field> {
-        check_depth(depth)?;
-        let (field_id, matched) = match candidate {
-            Some(table_field) if parent_matched => (Some(table_field.id), true),
-            Some(table_field) => (self.claim(table_field.id), false),
-            None => (self.claim(counter), false),
-        };
-        let Some(field_id) = field_id else {
-            self.skip_subtree(field, depth)?;
-            return Ok(field.clone());
-        };
-        let table_field = candidate.filter(|table_field| table_field.id == field_id);
-        self.stamp_children(field, field_id, table_field, matched, depth)
     }
 }
 
@@ -317,26 +290,22 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
             claim_matches(field, table_field, 0, &mut claimed)?;
         }
     }
-    let top_level_count = i32::try_from(arrow_schema.fields().len()).map_err(|_| too_many())?;
     let mut ids = FallbackIds {
         table_schema,
         claimed,
-        next_counter: top_level_count.checked_add(1).ok_or_else(too_many)?,
     };
     let mut fields = Vec::with_capacity(arrow_schema.fields().len());
     for (pos, (field, table_field)) in arrow_schema.fields().iter().zip(&matches).enumerate() {
-        let counter = i32::try_from(pos + 1).map_err(|_| too_many())?;
-        let field_id = match table_field {
-            Some(table_field) => Some(table_field.id),
-            None => ids.claim(counter),
-        };
-        let stamped = match field_id {
-            Some(field_id) => {
-                ids.stamp_children(field, field_id, *table_field, table_field.is_some(), 0)?
+        let stamped = match table_field {
+            Some(table_field) => {
+                ids.stamp_children(field, table_field.id, Some(table_field), true, 0)?
             }
             None => {
-                ids.skip_subtree(field, 0)?;
-                field.as_ref().clone()
+                let counter = i32::try_from(pos + 1).map_err(|_| too_many())?;
+                match ids.claim(counter) {
+                    Some(field_id) => ids.stamp_children(field, field_id, None, false, 0)?,
+                    None => field.as_ref().clone(),
+                }
             }
         };
         fields.push(stamped);

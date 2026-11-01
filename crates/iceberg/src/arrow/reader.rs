@@ -61,7 +61,7 @@ use crate::arrow::record_batch_transformer::{
 };
 use crate::arrow::row_filter_plan::{
     RowFilterPlan, dropped_equality_key_mask, plan_row_filter, top_level_ancestor_id,
-    unmapped_group_leaf_indices, validity_leaves,
+    validity_leaves,
 };
 use crate::delete_vector::DeleteVector;
 use crate::error::Result;
@@ -1339,6 +1339,7 @@ impl ArrowReader {
         missing_field_ids: bool,
     ) -> Result<ProjectionMask> {
         let mut column_map = HashMap::new();
+        let mut incompatible = None;
         let fields = arrow_schema.fields();
         let mut indices = validity_leaves(top_ids, iceberg_schema_of_task, arrow_schema)?;
 
@@ -1380,6 +1381,19 @@ impl ArrowReader {
                 parquet_iceberg_field.field_type.as_primitive_type(),
                 iceberg_field.field_type.as_primitive_type(),
             ) {
+                if missing_field_ids
+                    && incompatible.is_none()
+                    && top_level_ancestor_id(iceberg_schema_of_task, field_id) != Some(field_id)
+                {
+                    let name = iceberg_schema_of_task
+                        .name_by_field_id(field_id)
+                        .unwrap_or(iceberg_field.name.as_str());
+                    let (file_type, table_type) =
+                        (&parquet_iceberg_field.field_type, &iceberg_field.field_type);
+                    incompatible = Some(format!(
+                        "nested field '{name}' in the data file has type {file_type}, which cannot be read as the table type {table_type}"
+                    ));
+                }
                 return false;
             }
 
@@ -1392,13 +1406,8 @@ impl ArrowReader {
                 indices.push(*col_idx);
             }
         }
-        if missing_field_ids {
-            indices.extend(unmapped_group_leaf_indices(
-                leaf_field_ids,
-                iceberg_schema_of_task,
-                parquet_schema,
-                arrow_schema,
-            )?);
+        if let Some(incompatible) = incompatible {
+            return Err(Error::new(ErrorKind::DataInvalid, incompatible));
         }
 
         if indices.is_empty() {

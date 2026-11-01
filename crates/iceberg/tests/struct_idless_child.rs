@@ -678,7 +678,7 @@ async fn top_level_only_mapping_table(warehouse: &str) -> (impl Catalog, Table) 
 }
 
 #[tokio::test]
-async fn idless_struct_without_child_mapping_and_the_same_shape_reads_by_shape() {
+async fn idless_struct_without_child_mapping_reads_its_unmapped_child_as_null() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let warehouse = tmp.path().to_string_lossy().to_string();
     let (_catalog, table) = top_level_only_mapping_table(&warehouse).await;
@@ -687,28 +687,20 @@ async fn idless_struct_without_child_mapping_and_the_same_shape_reads_by_shape()
     assert_eq!(batches.len(), 1);
     let s = column(&batches[0], "s");
     assert_eq!(validity(s), vec![true, false]);
-    assert_eq!(child_ints(s, "d"), vec![Some(1), None]);
+    assert_eq!(child_ints(s, "d"), vec![None, None]);
 }
 
 #[tokio::test]
-async fn idless_struct_without_child_mapping_and_a_different_shape_refuses() {
+async fn idless_struct_without_child_mapping_and_an_added_child_reads_null() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     let warehouse = tmp.path().to_string_lossy().to_string();
     let (catalog, table) = top_level_only_mapping_table(&warehouse).await;
     let table = add_child(&catalog, &table, "s", "k").await;
 
-    let result = table
-        .scan()
-        .build()
-        .expect("build scan")
-        .to_arrow()
-        .await
-        .expect("scan to arrow")
-        .try_collect::<Vec<_>>()
-        .await;
-    let error = result.expect_err("a differently shaped id-less struct refuses");
-    assert_eq!(error.kind(), iceberg::ErrorKind::DataInvalid);
-    let message = error.to_string();
-    assert!(message.contains("struct 's'"), "{message}");
-    assert!(message.contains("schema.name-mapping.default"), "{message}");
+    let batch = scan(&table).await;
+    let s = column(&batch, "s");
+    assert_eq!(child_names(s), vec!["d".to_string(), "k".to_string()]);
+    assert_eq!(validity(s), vec![true, false]);
+    assert_eq!(child_ints(s, "d"), vec![None, None]);
+    assert_eq!(child_ints(s, "k"), vec![None, None]);
 }

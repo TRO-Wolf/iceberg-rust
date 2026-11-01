@@ -25,7 +25,8 @@ use crate::arrow::field_id_stamping::{
     stamped_field_id_map,
 };
 use crate::spec::{
-    ListType, MappedField, NameMapping, NestedField, PrimitiveType, Schema, StructType, Type,
+    ListType, MapType, MappedField, NameMapping, NestedField, PrimitiveType, Schema, StructType,
+    Type,
 };
 
 fn int_field(id: i32, name: &str) -> NestedField {
@@ -140,50 +141,6 @@ fn nested_name_mapping_leaves_an_unmapped_child_without_an_id() {
 }
 
 #[test]
-fn fallback_stamps_a_nested_child_by_name_and_position() {
-    let file = file_schema(vec![
-        Field::new("id", DataType::Int32, false),
-        file_struct("s", vec![file_int("d"), file_int("e")]),
-    ]);
-    let schema = table(vec![
-        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
-        NestedField::optional(
-            2,
-            "s",
-            struct_of(vec![int_field(7, "d"), int_field(9, "e")]),
-        ),
-    ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
-    assert_eq!(id_of(field_at(&stamped, &["id"])), Some(1));
-    assert_eq!(id_of(field_at(&stamped, &["s"])), Some(2));
-    assert_eq!(id_of(field_at(&stamped, &["s", "d"])), Some(7));
-    assert_eq!(id_of(field_at(&stamped, &["s", "e"])), Some(9));
-}
-
-#[test]
-fn fallback_gives_an_unmatched_nested_child_its_preorder_counter() {
-    let file = file_schema(vec![
-        Field::new("id", DataType::Int32, false),
-        file_struct("s", vec![file_struct("t", vec![file_int("d")])]),
-    ]);
-    let schema = table(vec![
-        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
-        NestedField::optional(
-            2,
-            "s",
-            struct_of(vec![NestedField::optional(
-                3,
-                "t",
-                struct_of(vec![int_field(5, "k")]),
-            )]),
-        ),
-    ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
-    assert_eq!(id_of(field_at(&stamped, &["s", "t"])), Some(3));
-    assert_eq!(id_of(field_at(&stamped, &["s", "t", "d"])), Some(4));
-}
-
-#[test]
 fn fallback_matches_a_list_element_structurally() {
     let file = file_schema(vec![
         Field::new("id", DataType::Int32, false),
@@ -214,7 +171,68 @@ fn fallback_matches_a_list_element_structurally() {
 }
 
 #[test]
-fn fallback_counter_that_collides_with_a_claimed_id_yields_no_id() {
+fn fallback_keeps_the_top_level_counter_and_name_match() {
+    let file = file_schema(vec![
+        Field::new("a", DataType::Int32, true),
+        Field::new("renamed", DataType::Int32, true),
+    ]);
+    let schema = table(vec![int_field(1, "a"), int_field(2, "b")]);
+    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
+    assert_eq!(id_of(field_at(&stamped, &["a"])), Some(1));
+    assert_eq!(id_of(field_at(&stamped, &["renamed"])), Some(2));
+}
+
+#[test]
+fn fallback_stamps_a_nested_child_by_name_at_any_position() {
+    let file = file_schema(vec![
+        Field::new("id", DataType::Int32, false),
+        file_struct("s", vec![file_int("e"), file_int("d")]),
+    ]);
+    let schema = table(vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+        NestedField::optional(
+            2,
+            "s",
+            struct_of(vec![int_field(7, "d"), int_field(9, "e")]),
+        ),
+    ]);
+    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
+    assert_eq!(id_of(field_at(&stamped, &["id"])), Some(1));
+    assert_eq!(id_of(field_at(&stamped, &["s"])), Some(2));
+    assert_eq!(id_of(field_at(&stamped, &["s", "d"])), Some(7));
+    assert_eq!(id_of(field_at(&stamped, &["s", "e"])), Some(9));
+}
+
+#[test]
+fn fallback_leaves_an_unmatched_nested_child_and_its_subtree_without_an_id() {
+    let file = file_schema(vec![
+        Field::new("id", DataType::Int32, false),
+        file_struct("s", vec![
+            file_struct("t", vec![file_int("d")]),
+            file_struct("x", vec![file_int("y")]),
+        ]),
+    ]);
+    let schema = table(vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+        NestedField::optional(
+            2,
+            "s",
+            struct_of(vec![NestedField::optional(
+                3,
+                "t",
+                struct_of(vec![int_field(4, "k")]),
+            )]),
+        ),
+    ]);
+    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
+    assert_eq!(id_of(field_at(&stamped, &["s", "t"])), Some(3));
+    assert_eq!(id_of(field_at(&stamped, &["s", "t", "d"])), None);
+    assert_eq!(id_of(field_at(&stamped, &["s", "x"])), None);
+    assert_eq!(id_of(field_at(&stamped, &["s", "x", "y"])), None);
+}
+
+#[test]
+fn fallback_never_stamps_a_nested_child_from_a_counter() {
     let file = file_schema(vec![
         Field::new("id", DataType::Int32, false),
         file_struct("s", vec![file_int("x"), file_int("y")]),
@@ -226,21 +244,78 @@ fn fallback_counter_that_collides_with_a_claimed_id_yields_no_id() {
         NestedField::optional(3, "t", struct_of(vec![int_field(5, "b")])),
     ]);
     let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
-    assert_eq!(id_of(field_at(&stamped, &["s", "x"])), Some(4));
+    assert_eq!(id_of(field_at(&stamped, &["s", "x"])), None);
     assert_eq!(id_of(field_at(&stamped, &["s", "y"])), None);
     assert_eq!(id_of(field_at(&stamped, &["t", "b"])), Some(5));
 }
 
 #[test]
-fn fallback_keeps_the_top_level_counter_and_name_match() {
+fn fallback_top_level_counter_field_stamps_its_children_by_name() {
     let file = file_schema(vec![
-        Field::new("a", DataType::Int32, true),
-        Field::new("renamed", DataType::Int32, true),
+        Field::new("id", DataType::Int32, false),
+        file_struct("renamed", vec![file_int("e"), file_int("d")]),
     ]);
-    let schema = table(vec![int_field(1, "a"), int_field(2, "b")]);
+    let schema = table(vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+        NestedField::optional(
+            2,
+            "s",
+            struct_of(vec![int_field(3, "d"), int_field(4, "e")]),
+        ),
+    ]);
     let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
-    assert_eq!(id_of(field_at(&stamped, &["a"])), Some(1));
     assert_eq!(id_of(field_at(&stamped, &["renamed"])), Some(2));
+    assert_eq!(id_of(field_at(&stamped, &["renamed", "d"])), Some(3));
+    assert_eq!(id_of(field_at(&stamped, &["renamed", "e"])), Some(4));
+}
+
+#[test]
+fn fallback_matches_map_key_and_value_and_their_children_by_name() {
+    let value = DataType::Struct(Fields::from(vec![file_int("b"), file_int("a")]));
+    let entries = Field::new(
+        "key_value",
+        DataType::Struct(Fields::from(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("value", value, true),
+        ])),
+        false,
+    );
+    let file = file_schema(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("m", DataType::Map(Arc::new(entries), false), true),
+    ]);
+    let schema = table(vec![
+        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)),
+        NestedField::optional(
+            2,
+            "m",
+            Type::Map(MapType {
+                key_field: NestedField::map_key_element(3, Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                value_field: NestedField::map_value_element(
+                    4,
+                    struct_of(vec![int_field(5, "a"), int_field(6, "b")]),
+                    false,
+                )
+                .into(),
+            }),
+        ),
+    ]);
+    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
+    let DataType::Map(entries, _) = field_at(&stamped, &["m"]).data_type() else {
+        panic!("m is a map");
+    };
+    let DataType::Struct(key_value) = entries.data_type() else {
+        panic!("map entries are a struct");
+    };
+    assert_eq!(id_of(entries), None);
+    assert_eq!(id_of(&key_value[0]), Some(3));
+    assert_eq!(id_of(&key_value[1]), Some(4));
+    let DataType::Struct(value_children) = key_value[1].data_type() else {
+        panic!("the map value is a struct");
+    };
+    assert_eq!(id_of(&value_children[0]), Some(6));
+    assert_eq!(id_of(&value_children[1]), Some(5));
 }
 
 #[test]
