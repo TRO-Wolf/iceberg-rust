@@ -158,7 +158,7 @@ head are listed in the Fix round 1 section.
 | S-7 | An emptied id-less struct, every child dropped, reads a non-null empty struct where the file row was non-null and NULL where it was NULL. This closes the emptied half of the parent ledger's S-11 by citation | PROVEN | The `idless_emptied_struct_reads_empty_struct_per_row_validity` pins, both routes. Green on the base too: it was correct there and unpinned |
 | S-8 | No regression: a struct whose task children are all in the file is unchanged, on both routes | PROVEN | The `idless_struct_with_every_child_in_the_task_schema_is_unchanged` pins. Green on the base |
 | S-9 | The nested shape (f) and the list shape (g) read the table's shape per row, with the file's validity at each level | PROVEN | The `idless_nested_struct_dropped_child_new_child_reads_null_per_row` pins and the `idless_list_element_struct_dropped_child_new_child_reads_null` pins, both routes |
-| S-10 | Round-0 claim: without a child mapping, a file struct whose children differ from the table refuses with `DataInvalid`, naming the struct path and `schema.name-mapping.default`; a file struct of the same shape reads by shape | SUPERSEDED by S-19 (fix round 1, ruling 2) | The two no-mapping pins were rewritten at `85687ce0`; the refusal is gone from the id-less route |
+| S-10 | Round-0 claim: without a child mapping, a file struct whose children differ from the table refuses with `DataInvalid`, naming the struct path and `schema.name-mapping.default`; a file struct of the same shape reads by shape | REJECTED | The round-0 refusal claim was withdrawn by ruling 2 of fix round 1 and replaced by S-19 (the NULL answer). The two no-mapping pins were rewritten at `85687ce0`; the refusal is gone from the id-less route |
 | S-11 | Spark 4.1.2 answers for the id-less shapes, measured 2026-11-01 (see the Spark section, including the fix round 1 additions). The NULL-row answer differs from the fork's; that difference is the per-write NULL collapse of the struct ledger's S-13, ruled 2026-10-31 and not copied. Spark and RePark's `add_files` install `schema.name-mapping.default`, so every id-less file either of them reads takes the mapping route. The claim holds for the mapping route. On the fallback route a rename reads NULL (S-18), which Spark never reaches | PROVEN (mapping route) | Orchestrator measurement 2026-11-01, copied; the mapping-route pins of S-18 and S-19 |
 | S-12 | Java note, restated: Java's `ParquetSchemaUtil.addFallbackIds` stamps top-level ordinals only, and its fallback read builder reads nested structs by position. This is the builder's recollection and stands unverified. The measured fact is that Spark always reads an id-less file through the mapping `add_files` installs, and the fork's fallback rule is by name with no counter (fix round 1), so the counter-order question no longer changes any fork answer | OPEN | Not checked against the Java source. No Java checkout was used |
 | S-13 | Pruning: on an id-less file, row-group and page-index pruning map field ids to Parquet columns through the ids the reader stamped on the Arrow schema (the mapping or the fallback rule), at every depth. A column with no stamped id has no entry, so a filter on it keeps every row group. Before fix round 1 the map was positional (`build_fallback_field_id_map`), which read the wrong column's statistics when a mapping or the fallback rule gave other ids (F4) | PROVEN | Fix round 1 (`cc213112`). Integration pins `idless_row_group_pruning_uses_the_mapped_ids` and `idless_row_group_pruning_uses_the_fallback_ids_after_a_leading_drop`, both red at `bc6a2e67`; unit `stamped_field_id_map_indexes_stamped_leaves_at_every_depth` |
@@ -174,7 +174,7 @@ head are listed in the Fix round 1 section.
 | S-23 | An incompatible nested type on a file WITH embedded field ids (table `s<d: string>`, file `s<d: int>` with embedded ids `1, 2, 3`, values `[1, NULL]`) still collapses the struct validity to `[false, false]` with a NULL `StringArray` child at `85687ce0`. The item-7 refusal is gated on `missing_field_ids`, so this case is outside this unit's scope and the reader behaves as at round 0 | OPEN | Measured at `85687ce0`. A candidate card, a follow-up to the card of S-20 or to a new unit |
 
 VERDICT (2026-11-01, fix round 1 records): 17 PROVEN, 5 OPEN (S-12, S-17,
-S-20, S-22, S-23), 1 SUPERSEDED (S-10), of 23 clauses. S-17 stays OPEN.
+S-20, S-22, S-23), 1 REJECTED (S-10), of 23 clauses. S-17 stays OPEN.
 
 ## Spark 4.1.2 measurement (2026-11-01, S-11)
 
@@ -473,7 +473,7 @@ test since deleted.
 
 - **S-3** rewritten: the nested counter is gone; the by-name rule is in place.
 - **S-5** kept PROVEN, with a note that the round-0 passthrough was removed.
-- **S-10** SUPERSEDED by S-19.
+- **S-10** REJECTED, replaced by S-19.
 - **S-11** restated for the mapping route, with the fix round 1 Spark additions.
 - **S-12** restated; still OPEN.
 - **S-13** PROVEN with the F4 pins.
