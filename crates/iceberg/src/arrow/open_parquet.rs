@@ -335,8 +335,11 @@ impl ArrowReader {
         let Some(predicate) = task.predicate.as_deref().filter(|_| decide_early) else {
             return Ok((arrow_metadata, None, None));
         };
-        let (_, field_id_map) =
-            Self::build_field_id_set_and_map(arrow_metadata.parquet_schema(), predicate)?;
+        let (_, field_id_map) = Self::build_field_id_set_and_map(
+            arrow_metadata.parquet_schema(),
+            arrow_metadata.schema(),
+            predicate,
+        )?;
         let mut selected_row_group_indices = (task.start != 0 || task.length != 0)
             .then(|| {
                 Self::filter_row_groups_by_byte_range(

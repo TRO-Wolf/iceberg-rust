@@ -22,6 +22,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::field_id_stamping::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    stamped_field_id_map,
 };
 use crate::spec::{
     ListType, MappedField, NameMapping, NestedField, PrimitiveType, Schema, StructType, Type,
@@ -240,4 +241,32 @@ fn fallback_keeps_the_top_level_counter_and_name_match() {
     let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["a"])), Some(1));
     assert_eq!(id_of(field_at(&stamped, &["renamed"])), Some(2));
+}
+
+#[test]
+fn stamped_field_id_map_indexes_stamped_leaves_at_every_depth() {
+    let file = file_schema(vec![
+        Field::new("b", DataType::Int32, true),
+        file_struct("s", vec![file_int("x"), file_int("d")]),
+        Field::new("a", DataType::Int32, true),
+    ]);
+    let mapping = NameMapping::new(vec![
+        mapped(1, "a", vec![]),
+        mapped(2, "b", vec![]),
+        mapped(3, "s", vec![mapped(4, "d", vec![])]),
+    ]);
+    let stamped = apply_name_mapping_to_arrow_schema(file, &mapping).expect("apply the mapping");
+    let map = stamped_field_id_map(&stamped);
+    assert_eq!(map.get(&2), Some(&0));
+    assert_eq!(map.get(&4), Some(&2));
+    assert_eq!(map.get(&1), Some(&3));
+    assert_eq!(map.len(), 3);
+    let fallback = add_fallback_field_ids_to_arrow_schema(
+        &file_schema(vec![file_int("a"), file_int("b")]),
+        &table(vec![int_field(2, "a"), int_field(3, "b")]),
+    )
+    .expect("stamp ids");
+    let map = stamped_field_id_map(&fallback);
+    assert_eq!(map.get(&2), Some(&0));
+    assert_eq!(map.get(&3), Some(&1));
 }

@@ -48,6 +48,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::equality_delete_set::{EqDeleteKeySet, eq_delete_key_fields_projected};
 use crate::arrow::field_id_stamping::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    stamped_field_id_map,
 };
 use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
@@ -59,7 +60,7 @@ use crate::arrow::record_batch_transformer::{
     RecordBatchTransformer, RecordBatchTransformerBuilder,
 };
 use crate::arrow::row_filter_plan::{
-    RowFilterPlan, dropped_equality_key_mask, leaf_count, plan_row_filter, top_level_ancestor_id,
+    RowFilterPlan, dropped_equality_key_mask, plan_row_filter, top_level_ancestor_id,
     unmapped_group_leaf_indices, validity_leaves,
 };
 use crate::delete_vector::DeleteVector;
@@ -703,6 +704,7 @@ impl ArrowReader {
         if let Some(predicate) = final_predicate {
             let (iceberg_field_ids, field_id_map) = Self::build_field_id_set_and_map(
                 record_batch_stream_builder.parquet_schema(),
+                record_batch_stream_builder.schema(),
                 &predicate,
             )?;
 
@@ -1230,6 +1232,7 @@ impl ArrowReader {
 
     pub(crate) fn build_field_id_set_and_map(
         parquet_schema: &SchemaDescriptor,
+        arrow_schema: &ArrowSchemaRef,
         predicate: &BoundPredicate,
     ) -> Result<(HashSet<i32>, HashMap<i32, usize>)> {
         let mut collector = CollectFieldIdVisitor::default();
@@ -1237,10 +1240,9 @@ impl ArrowReader {
 
         let iceberg_field_ids = collector.field_ids();
 
-        // Without embedded field IDs, we fall back to position-based mapping for compatibility
         let field_id_map = match build_field_id_map(parquet_schema)? {
             Some(map) => map,
-            None => build_fallback_field_id_map(parquet_schema),
+            None => stamped_field_id_map(arrow_schema),
         };
 
         Ok((iceberg_field_ids, field_id_map))
@@ -1569,26 +1571,6 @@ pub(crate) fn build_field_id_map(
     }
 
     Ok(Some(column_map))
-}
-
-/// Maps fallback field ids to leaf column indices, for primitive top-level fields only. Java
-/// `ParquetSchemaUtil.addFallbackIds()`. # Notes Use top-level field positions, not leaf positions,
-/// to match `add_fallback_field_ids_to_arrow_schema`.
-pub(crate) fn build_fallback_field_id_map(
-    parquet_schema: &SchemaDescriptor,
-) -> HashMap<i32, usize> {
-    let mut column_map = HashMap::new();
-    let mut leaf_idx = 0;
-
-    for (top_pos, field) in parquet_schema.root_schema().get_fields().iter().enumerate() {
-        let field_id = (top_pos + 1) as i32;
-        if field.is_primitive() {
-            column_map.insert(field_id, leaf_idx);
-        }
-        leaf_idx += leaf_count(field);
-    }
-
-    column_map
 }
 
 /// A visitor to collect field ids from bound predicates.

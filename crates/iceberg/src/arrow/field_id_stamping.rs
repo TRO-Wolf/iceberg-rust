@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -345,4 +345,19 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
         fields,
         arrow_schema.metadata().clone(),
     )))
+}
+
+pub(crate) fn stamped_field_id_map(arrow_schema: &ArrowSchemaRef) -> HashMap<i32, usize> {
+    let mut column_map = HashMap::new();
+    arrow_schema.fields().filter_leaves(|idx, field| {
+        if let Some(field_id) = field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| id.parse::<i32>().ok())
+        {
+            column_map.insert(field_id, idx);
+        }
+        false
+    });
+    column_map
 }
