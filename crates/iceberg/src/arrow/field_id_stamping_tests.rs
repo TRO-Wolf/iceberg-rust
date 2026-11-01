@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::field_id_stamping::{
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema, file_has_field_ids,
     stamped_field_id_map,
 };
 use crate::spec::{
@@ -347,4 +348,77 @@ fn stamped_field_id_map_indexes_stamped_leaves_at_every_depth() {
     let map = stamped_field_id_map(&fallback);
     assert_eq!(map.get(&2), Some(&0));
     assert_eq!(map.get(&3), Some(&1));
+}
+
+fn embedded_ids_file() -> ArrowSchemaRef {
+    let with_id = |field: Field, id: i32| {
+        field.with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            id.to_string(),
+        )]))
+    };
+    file_schema(vec![
+        file_int("x"),
+        with_id(
+            file_struct("s", vec![
+                with_id(file_int("d"), 3),
+                with_id(file_int("e"), 4),
+            ]),
+            2,
+        ),
+    ])
+}
+
+#[test]
+fn stamping_never_overwrites_an_embedded_nested_id() {
+    let schema = table(vec![
+        int_field(1, "x"),
+        NestedField::optional(
+            2,
+            "s",
+            struct_of(vec![int_field(3, "e"), int_field(4, "d")]),
+        ),
+    ]);
+    let fallback =
+        add_fallback_field_ids_to_arrow_schema(&embedded_ids_file(), &schema).expect("stamp ids");
+    let mapping = NameMapping::new(vec![
+        mapped(1, "x", vec![]),
+        mapped(2, "s", vec![mapped(3, "e", vec![]), mapped(4, "d", vec![])]),
+    ]);
+    let mapped_schema = apply_name_mapping_to_arrow_schema(embedded_ids_file(), &mapping, &[])
+        .expect("apply mapping");
+    let unmapped = NameMapping::new(vec![mapped(2, "s", vec![])]);
+    let unmapped_schema = apply_name_mapping_to_arrow_schema(embedded_ids_file(), &unmapped, &[])
+        .expect("apply mapping");
+    for stamped in [&fallback, &mapped_schema, &unmapped_schema] {
+        assert_eq!(id_of(field_at(stamped, &["s"])), Some(2));
+        assert_eq!(id_of(field_at(stamped, &["s", "d"])), Some(3));
+        assert_eq!(id_of(field_at(stamped, &["s", "e"])), Some(4));
+        for path in [&["s", "d"][..], &["s", "e"][..]] {
+            assert!(
+                !field_at(stamped, path)
+                    .metadata()
+                    .contains_key(crate::arrow::nested_projection::LEFT_UNSTAMPED_META_KEY)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_field_id_at_any_depth_means_the_file_has_ids() {
+    assert!(file_has_field_ids(&embedded_ids_file()));
+    let nested_only = file_schema(vec![
+        file_int("x"),
+        Field::new(
+            "l",
+            DataType::List(Arc::new(file_int("item").with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "7".to_string(),
+            )])))),
+            true,
+        ),
+    ]);
+    assert!(file_has_field_ids(&nested_only));
+    let none = file_schema(vec![file_int("x"), file_struct("s", vec![file_int("d")])]);
+    assert!(!file_has_field_ids(&none));
 }
