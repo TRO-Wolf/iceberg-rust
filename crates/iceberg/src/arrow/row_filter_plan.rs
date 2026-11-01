@@ -27,7 +27,7 @@ use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder,
 use parquet::basic::{ConvertedType, LogicalType};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
-use crate::arrow::nested_projection::MAX_NESTED_PROJECTION_DEPTH;
+use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::expr::BoundPredicate;
 use crate::metadata_columns::is_metadata_field;
@@ -197,6 +197,7 @@ pub(crate) fn validity_leaves(
     schema: &Schema,
     arrow_schema: &ArrowSchemaRef,
 ) -> Result<Vec<usize>> {
+    refuse_collections_without_nested_ids(field_ids, arrow_schema)?;
     let fields: Vec<&NestedField> = field_ids
         .iter()
         .filter_map(|field_id| schema.field_by_id(*field_id).map(|field| field.as_ref()))
@@ -226,6 +227,59 @@ pub(crate) fn validity_leaves(
         }
     }
     Ok(borrowed)
+}
+
+fn refuse_collections_without_nested_ids(
+    field_ids: &[i32],
+    arrow_schema: &ArrowSchemaRef,
+) -> Result<()> {
+    let id_of = |field: &Field| {
+        field
+            .metadata()
+            .get(PARQUET_FIELD_ID_META_KEY)
+            .and_then(|id| i32::from_str(id).ok())
+    };
+    let mut pending: Vec<(&Field, String, usize)> = arrow_schema
+        .fields()
+        .iter()
+        .filter(|field| id_of(field).is_some_and(|id| field_ids.contains(&id)))
+        .map(|field| (field.as_ref(), field.name().clone(), 0))
+        .collect();
+    while let Some((field, path, depth)) = pending.pop() {
+        check_depth(depth)?;
+        let (collection, children): (Option<&str>, Vec<&Field>) = match field.data_type() {
+            DataType::Struct(children) => (None, children.iter().map(|c| c.as_ref()).collect()),
+            DataType::List(element)
+            | DataType::LargeList(element)
+            | DataType::FixedSizeList(element, _) => (Some("list"), vec![element.as_ref()]),
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(key_value) => {
+                    (Some("map"), key_value.iter().map(|c| c.as_ref()).collect())
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if let Some(collection) = collection
+            && children.iter().any(|child| {
+                id_of(child).is_none() && !child.metadata().contains_key(LEFT_UNSTAMPED_META_KEY)
+            })
+        {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "{collection} '{path}' has no field ids on its nested fields in a data file that carries field ids; the data file must carry a field id on every nested field"
+                ),
+            ));
+        }
+        pending.extend(
+            children
+                .into_iter()
+                .filter(|child| id_of(child).is_some())
+                .map(|child| (child, format!("{path}.{}", child.name()), depth + 1)),
+        );
+    }
+    Ok(())
 }
 
 fn type_holds_struct(field_type: &Type, depth: usize) -> Result<bool> {
