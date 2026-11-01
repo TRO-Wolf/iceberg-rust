@@ -412,7 +412,7 @@ async fn nested_rename_onto_a_dropped_sibling_name_takes_the_name_from_the_sibli
     let batch = scan(&table).await;
     assert_eq!(ids_of(&batch), vec![1]);
     assert_eq!(child_ints(&batch, "s", "x"), vec![Some(2)]);
-    let only_x: Vec<Option<i32>> = selected(&table, "s.x")
+    let only_x: Vec<Option<i32>> = selected(&table, "s")
         .await
         .iter()
         .flat_map(|batch| child_ints(batch, "s", "x"))
