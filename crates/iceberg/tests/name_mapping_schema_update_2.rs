@@ -22,17 +22,18 @@ use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StructArray, UInt32A
 use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
 use futures::TryStreamExt;
+use iceberg::expr::{Predicate, Reference};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, NestedField,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, NestedField,
     PrimitiveType, Schema, SortOrder, Struct, StructType, TableProperties, Type,
     UnboundPartitionSpec, create_name_mapping,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -122,6 +123,36 @@ fn write_idless(table: &Table, ids: &[i32], columns: Vec<(&str, ArrayRef)>) -> D
         fields.push(Field::new(name, array.data_type().clone(), true));
         arrays.push(array);
     }
+    write_parquet(table, ids.len(), fields, arrays)
+}
+
+fn with_id(field: Field, id: i32) -> Field {
+    field.with_metadata(HashMap::from([(
+        PARQUET_FIELD_ID_META_KEY.to_string(),
+        id.to_string(),
+    )]))
+}
+
+fn write_with_ids(table: &Table, ids: &[i32], columns: Vec<(&str, i32, ArrayRef)>) -> DataFile {
+    let mut fields = vec![with_id(Field::new("id", DataType::Int32, false), 1)];
+    let id_values: Vec<Option<i32>> = ids.iter().copied().map(Some).collect();
+    let mut arrays = vec![ints(&id_values)];
+    for (name, field_id, array) in columns {
+        fields.push(with_id(
+            Field::new(name, array.data_type().clone(), true),
+            field_id,
+        ));
+        arrays.push(array);
+    }
+    write_parquet(table, ids.len(), fields, arrays)
+}
+
+fn write_parquet(
+    table: &Table,
+    rows: usize,
+    fields: Vec<Field>,
+    arrays: Vec<ArrayRef>,
+) -> DataFile {
     let schema = Arc::new(ArrowSchema::new(fields));
     let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("build the id-less batch");
     let dir = format!("{}/data", table.metadata().location());
@@ -140,7 +171,7 @@ fn write_idless(table: &Table, ids: &[i32], columns: Vec<(&str, ArrayRef)>) -> D
         .file_format(DataFileFormat::Parquet)
         .partition(Struct::empty())
         .partition_spec_id(0)
-        .record_count(u64::try_from(ids.len()).expect("row count fits u64"))
+        .record_count(u64::try_from(rows).expect("row count fits u64"))
         .file_size_in_bytes(size)
         .build()
         .expect("build the data file")
@@ -234,6 +265,36 @@ async fn scan(table: &Table) -> RecordBatch {
         .expect("order the rows by id")
 }
 
+async fn scan_batches(
+    table: &Table,
+    columns: Option<&[&str]>,
+    filter: Option<Predicate>,
+) -> iceberg::Result<Vec<RecordBatch>> {
+    let mut builder = table.scan();
+    if let Some(columns) = columns {
+        builder = builder.select(columns.iter().copied());
+    }
+    if let Some(filter) = filter {
+        builder = builder.with_filter(filter);
+    }
+    builder.build()?.to_arrow().await?.try_collect().await
+}
+
+async fn ids_where(table: &Table, filter: Predicate) -> Vec<i32> {
+    let batches = scan_batches(table, None, Some(filter))
+        .await
+        .expect("scan with a filter");
+    let mut ids: Vec<i32> = batches.iter().flat_map(ids_of).collect();
+    ids.sort_unstable();
+    ids
+}
+
+async fn selected(table: &Table, column: &str) -> Vec<RecordBatch> {
+    scan_batches(table, Some(&[column]), None)
+        .await
+        .expect("scan one projected column")
+}
+
 fn ids_of(batch: &RecordBatch) -> Vec<i32> {
     batch
         .column_by_name("id")
@@ -292,6 +353,26 @@ async fn rename_onto_a_dropped_sibling_name_takes_the_name_from_the_sibling() {
         ])
     );
 
+    let batch = scan(&table).await;
+    assert_eq!(ids_of(&batch), vec![1]);
+    let x = batch.column_by_name("x").expect("x column present");
+    assert_eq!(int_values(x.as_ref()), vec![Some(2)]);
+    let only_x: Vec<Option<i32>> = selected(&table, "x")
+        .await
+        .iter()
+        .flat_map(|batch| int_values(batch.column_by_name("x").expect("x projected").as_ref()))
+        .collect();
+    assert_eq!(only_x, vec![Some(2)]);
+    let x_ref = || Reference::new("x");
+    assert_eq!(
+        ids_where(&table, x_ref().equal_to(Datum::int(2))).await,
+        vec![1]
+    );
+    assert_eq!(
+        ids_where(&table, x_ref().equal_to(Datum::int(1))).await,
+        Vec::<i32>::new()
+    );
+
     let second = write_idless(&table, &[2], vec![("x", ints(&[Some(9)]))]);
     let table = append(&catalog, &table, second).await;
     let batch = scan(&table).await;
@@ -326,6 +407,25 @@ async fn nested_rename_onto_a_dropped_sibling_name_takes_the_name_from_the_sibli
                 mapped(4, &["y", "x"], vec![]),
             ]),
         ])
+    );
+
+    let batch = scan(&table).await;
+    assert_eq!(ids_of(&batch), vec![1]);
+    assert_eq!(child_ints(&batch, "s", "x"), vec![Some(2)]);
+    let only_x: Vec<Option<i32>> = selected(&table, "s.x")
+        .await
+        .iter()
+        .flat_map(|batch| child_ints(batch, "s", "x"))
+        .collect();
+    assert_eq!(only_x, vec![Some(2)]);
+    let x_ref = || Reference::new("s.x");
+    assert_eq!(
+        ids_where(&table, x_ref().equal_to(Datum::int(2))).await,
+        vec![1]
+    );
+    assert_eq!(
+        ids_where(&table, x_ref().equal_to(Datum::int(1))).await,
+        Vec::<i32>::new()
     );
 
     let second = write_idless(&table, &[2], vec![(
@@ -369,4 +469,69 @@ async fn rename_onto_a_live_sibling_name_is_refused_and_the_mapping_is_untouched
     let reloaded = catalog.load_table(&ident).await.expect("reload the table");
     assert_eq!(reloaded.metadata().current_schema_id(), schema_id);
     assert_eq!(mapping_property(&reloaded), Some(before));
+}
+
+#[tokio::test]
+async fn three_file_columns_resolving_to_one_id_read_the_last() {
+    let tmp = TempDir::new().expect("temp dir");
+    let schema = schema_of(vec![
+        int_field(2, "a"),
+        int_field(3, "b"),
+        int_field(4, "c"),
+    ]);
+    let (catalog, table) = new_table(&tmp, schema).await;
+    let file = write_idless(&table, &[1], vec![
+        ("a", ints(&[Some(1)])),
+        ("b", ints(&[Some(2)])),
+        ("c", ints(&[Some(3)])),
+    ]);
+    let table = append(&catalog, &table, file).await;
+    let table = install_mapping(&catalog, &table).await;
+    let table = evolve_drop(&catalog, &table, "a").await;
+    let table = evolve_drop(&catalog, &table, "b").await;
+    let table = evolve_rename(&catalog, &table, "c", "a").await;
+    let batch = scan(&table).await;
+    let a = batch.column_by_name("a").expect("a column present");
+    assert_eq!(int_values(a.as_ref()), vec![Some(3)]);
+
+    let table = evolve_rename(&catalog, &table, "a", "b").await;
+    assert_eq!(
+        mapping_json(&table),
+        json!([
+            mapped(1, &["id"], vec![]),
+            mapped(2, &[], vec![]),
+            mapped(3, &[], vec![]),
+            mapped(4, &["c", "a", "b"], vec![]),
+        ])
+    );
+    let batch = scan(&table).await;
+    assert_eq!(ids_of(&batch), vec![1]);
+    let b = batch.column_by_name("b").expect("b column present");
+    assert_eq!(int_values(b.as_ref()), vec![Some(3)]);
+    assert_eq!(
+        ids_where(&table, Reference::new("b").equal_to(Datum::int(3))).await,
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn a_file_with_a_duplicate_embedded_id_still_refuses() {
+    let tmp = TempDir::new().expect("temp dir");
+    let schema = schema_of(vec![int_field(2, "x")]);
+    let (catalog, table) = new_table(&tmp, schema).await;
+    let file = write_with_ids(&table, &[1], vec![
+        ("x", 2, ints(&[Some(1)])),
+        ("y", 2, ints(&[Some(2)])),
+    ]);
+    let table = append(&catalog, &table, file).await;
+    let table = install_mapping(&catalog, &table).await;
+    let error = scan_batches(&table, None, None)
+        .await
+        .expect_err("a file whose own field ids repeat is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("Found duplicate 'field.id' 2. Field ids must be unique."),
+        "the refusal names the duplicate id: {error}"
+    );
 }
