@@ -33,6 +33,8 @@ use crate::{Error, ErrorKind, Result};
 
 pub(crate) const MAX_NESTED_PROJECTION_DEPTH: usize = 128;
 
+pub(crate) const LEFT_UNSTAMPED_META_KEY: &str = "iceberg.reader.left-unstamped";
+
 pub(crate) fn nested_projection_applies(source: &DataType, target: &DataType) -> bool {
     matches!(
         (source, target),
@@ -259,6 +261,17 @@ impl PlanNode {
             });
         }
         let all_unstamped = source_fields.iter().all(|f| field_id_of(f).is_none());
+        let left_by_reader = source_fields
+            .iter()
+            .all(|f| f.metadata().contains_key(LEFT_UNSTAMPED_META_KEY));
+        if all_unstamped && !left_by_reader {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "struct '{path}' has no field ids on its nested fields in a data file that carries field ids; the data file must carry a field id on every nested field"
+                ),
+            ));
+        }
         let mut source_by_id: HashMap<i32, usize> = HashMap::with_capacity(source_fields.len());
         let mut source_by_name: HashMap<&str, usize> = HashMap::new();
         for (pos, field) in source_fields.iter().enumerate() {

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-use crate::arrow::nested_projection::MAX_NESTED_PROJECTION_DEPTH;
+use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
 use crate::spec::{MappedField, NameMapping, NestedField, Schema, Type};
 use crate::{Error, ErrorKind, Result};
 
@@ -119,6 +119,12 @@ fn with_field_id(field: &Field, field_id: i32, data_type: DataType) -> Field {
         .with_metadata(metadata)
 }
 
+fn left_unstamped(field: &Field) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(LEFT_UNSTAMPED_META_KEY.to_string(), "true".to_string());
+    field.clone().with_metadata(metadata)
+}
+
 fn has_no_field_ids(arrow_schema: &ArrowSchema) -> bool {
     arrow_schema
         .fields()
@@ -155,7 +161,7 @@ pub(crate) fn apply_name_mapping_to_arrow_schema(
 fn stamp_mapped(field: &Field, mapped: Option<&MappedField>, depth: usize) -> Result<Field> {
     check_depth(depth)?;
     let Some((mapped, field_id)) = mapped.and_then(|m| m.field_id().map(|id| (m, id))) else {
-        return Ok(field.clone());
+        return Ok(left_unstamped(field));
     };
     let children = child_slots(field.data_type())
         .into_iter()
@@ -246,10 +252,10 @@ impl FallbackIds<'_> {
                             preclaimed,
                             depth + 1,
                         )?,
-                        None => child.clone(),
+                        None => left_unstamped(child),
                     }
                 }
-                None => child.clone(),
+                None => left_unstamped(child),
             };
             children.push(stamped);
         }
