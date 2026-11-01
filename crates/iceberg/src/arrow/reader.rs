@@ -493,6 +493,7 @@ impl ArrowReader {
                 apply_name_mapping_to_arrow_schema(
                     Arc::clone(arrow_metadata.schema()),
                     name_mapping,
+                    task.project_field_ids(),
                 )?
             } else {
                 add_fallback_field_ids_to_arrow_schema(

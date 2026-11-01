@@ -116,7 +116,8 @@ fn nested_name_mapping_stamps_struct_children_and_list_elements() {
             vec![],
         )])]),
     ]);
-    let stamped = apply_name_mapping_to_arrow_schema(file, &mapping).expect("apply the mapping");
+    let stamped =
+        apply_name_mapping_to_arrow_schema(file, &mapping, &[]).expect("apply the mapping");
     assert_eq!(id_of(field_at(&stamped, &["s"])), Some(2));
     assert_eq!(id_of(field_at(&stamped, &["s", "d"])), Some(3));
     assert_eq!(id_of(field_at(&stamped, &["s", "t"])), Some(4));
@@ -135,7 +136,8 @@ fn nested_name_mapping_leaves_an_unmapped_child_without_an_id() {
         mapped(1, "id", vec![]),
         mapped(2, "s", vec![mapped(3, "d", vec![])]),
     ]);
-    let stamped = apply_name_mapping_to_arrow_schema(file, &mapping).expect("apply the mapping");
+    let stamped =
+        apply_name_mapping_to_arrow_schema(file, &mapping, &[]).expect("apply the mapping");
     assert_eq!(id_of(field_at(&stamped, &["s", "d"])), Some(3));
     assert_eq!(id_of(field_at(&stamped, &["s", "unmapped"])), None);
 }
@@ -330,7 +332,8 @@ fn stamped_field_id_map_indexes_stamped_leaves_at_every_depth() {
         mapped(2, "b", vec![]),
         mapped(3, "s", vec![mapped(4, "d", vec![])]),
     ]);
-    let stamped = apply_name_mapping_to_arrow_schema(file, &mapping).expect("apply the mapping");
+    let stamped =
+        apply_name_mapping_to_arrow_schema(file, &mapping, &[]).expect("apply the mapping");
     let map = stamped_field_id_map(&stamped);
     assert_eq!(map.get(&2), Some(&0));
     assert_eq!(map.get(&4), Some(&2));

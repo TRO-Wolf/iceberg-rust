@@ -148,6 +148,7 @@ pub(crate) fn file_has_field_ids(arrow_schema: &ArrowSchema) -> bool {
 pub(crate) fn apply_name_mapping_to_arrow_schema(
     arrow_schema: ArrowSchemaRef,
     name_mapping: &NameMapping,
+    projected_field_ids: &[i32],
 ) -> Result<ArrowSchemaRef> {
     let fields = arrow_schema
         .fields()
@@ -157,7 +158,7 @@ pub(crate) fn apply_name_mapping_to_arrow_schema(
                 .fields()
                 .iter()
                 .find(|mapped| mapped.names().iter().any(|name| name == field.name()));
-            stamp_mapped(field, mapped, field.name(), 0)
+            stamp_mapped(field, mapped, field.name(), 0, projected_field_ids, false)
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(ArrowSchema::new_with_metadata(
@@ -171,6 +172,8 @@ fn stamp_mapped(
     mapped: Option<&MappedField>,
     path: &str,
     depth: usize,
+    projected_field_ids: &[i32],
+    projected: bool,
 ) -> Result<Field> {
     check_depth(depth)?;
     let Some((mapped, field_id)) = mapped.and_then(|m| m.field_id().map(|id| (m, id))) else {
@@ -179,6 +182,7 @@ fn stamp_mapped(
             _ => left_unstamped(field),
         });
     };
+    let projected = projected || projected_field_ids.contains(&field_id);
     let children = child_slots(field.data_type())
         .into_iter()
         .map(|(child, slot)| {
@@ -194,6 +198,7 @@ fn stamp_mapped(
                 Slot::Key | Slot::Value => Some("map"),
             };
             if let Some(kind) = kind
+                && projected
                 && child_mapping.and_then(MappedField::field_id).is_none()
             {
                 return Err(Error::new(
@@ -203,7 +208,14 @@ fn stamp_mapped(
                     ),
                 ));
             }
-            stamp_mapped(child, child_mapping, &format!("{path}.{name}"), depth + 1)
+            stamp_mapped(
+                child,
+                child_mapping,
+                &format!("{path}.{name}"),
+                depth + 1,
+                projected_field_ids,
+                projected,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     let data_type = with_children(field.data_type(), children);
