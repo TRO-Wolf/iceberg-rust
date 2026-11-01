@@ -23,22 +23,31 @@
 `fix/idless-struct-child-remap-1`. Commits: `51f39a29` (item 1, fix),
 `8a66aa7c` (item 2, pins), `bc6a2e67` (item 3, this ledger's first records
 commit), `cc213112` (fix round 1, F4 pruning), `9c4d43a9` (fix round 1, F1 to
-F3 and ruling 7), `85687ce0` (fix round 1, pins), and the fix-round records
-commit that adds this text.
+F3 and ruling 7), `85687ce0` (fix round 1, pins), `b47fdda1` and `b16def80` (fix round 1 records),
+`9f928be2` (fix round 2, the gated NULL fill), `2f0c16f6` (fix round 2, the
+incomplete list or map mapping), `e0bfed03` (fix round 2, pins), and the
+fix-round 2 records commit that adds this text.
 
-**Model:** builder Claude Opus 5.5 (`claude-opus-5-5`), round 0 and fix round
-1. Records clerk Claude Haiku 5.5 (`claude-haiku-5-5`), round 0 and fix round 1.
+**Model:** builder Claude Opus 5.5 (`claude-opus-5-5`), round 0, fix round 1 and fix round 2.
+Records clerk Claude Haiku 5.5 (`claude-haiku-5-5`), round 0, fix round 1 and fix
+round 2.
 
 **Outcome in one line.** An id-less Parquet file gets field ids at every depth.
 A nested child takes the id of the child with its name in the matched parent,
 and nothing nested is stamped by a counter or by position. A dropped or added
 struct child never reads a neighbour's value, an absent or unmapped child reads
 NULL per row, and pruning on an id-less file uses the ids the reader stamped.
-At `85687ce0` the 18 pins of `struct_idless_child.rs`, the 29 pins of
-`struct_idless_child_2.rs`, the 13 `struct_empty_child` pins and the 10 unit
-pins are green. Verifier round 1 (Opus 5.5) FAILED `8a66aa7c` with F1 to F4,
+At `e0bfed03` the 18 pins of `struct_idless_child.rs`, the 29 pins of
+`struct_idless_child_2.rs`, the 14 pins of `struct_idless_child_3.rs`, the 13
+`struct_empty_child` pins and the 10 unit pins are green, with three unit pins
+from fix round 2. Verifier round 1 (Opus 5.5) FAILED `8a66aa7c` with F1 to F4,
 and the Muse MAX critic PASSED it with three findings; all of them are fixed in
-fix round 1. The round-2 verdicts are not yet recorded, so S-17 stays OPEN.
+fix round 1. Verifier round 2 on `85687ce0` FAILED from both verifiers (Opus 5.5
+and Muse MAX). Fix round 2 gates the NULL fill of an unstamped struct on a file
+that carries no field ids, and refuses a list or map that the mapping names
+without its entries. The one open limitation of round 2 is a re-added child on
+the no-mapping route (S-26). The round-3 verdicts on `e0bfed03` are not yet
+recorded, so S-17 stays OPEN.
 
 ## The fault at `14a93602`
 
@@ -113,9 +122,11 @@ round 1 section is the current state.
 ## Pins
 
 Integration pins: `crates/iceberg/tests/struct_idless_child.rs` (18) and
-`crates/iceberg/tests/struct_idless_child_2.rs` (29, fix round 1). Unit pins:
-`crates/iceberg/src/arrow/field_id_stamping_tests.rs` (10 at head; 7 at round
-0).
+`crates/iceberg/tests/struct_idless_child_2.rs` (29, fix round 1), and
+`crates/iceberg/tests/struct_idless_child_3.rs` (14, fix round 2; 6 red at
+`b16def80`). Unit pins:
+`crates/iceberg/src/arrow/field_id_stamping_tests.rs` (10 at head; 7 at round 0). The fix round 2 pins are listed in the Fix round 2
+section.
 
 Red run on `14a93602` (`cargo test -p iceberg --test struct_idless_child`,
 exit 101): 5 passed, 13 failed. Green run on `8a66aa7c`: 18 passed.
@@ -150,7 +161,7 @@ head are listed in the Fix round 1 section.
 | Id | Claim | Verdict | Pins and evidence |
 |---|---|---|---|
 | S-1 | The fault reproduces red on `14a93602`: 13 of the 18 integration pins fail there. The other 5 pass there as no-regression pins | PROVEN | Red run on `14a93602` (see Pins) |
-| S-2 | Mapping route: each struct child, list element, map key and map value of an id-less file takes its id from the name mapping at every depth. An unmapped node and its subtree take no id. Fix round 1 keeps the round-0 mapping-route answers, except the partial mapping (F3), which now reads NULL (S-19) | PROVEN | The `_mapping` pins of shapes (i), (ii), (f) and (g); units `nested_name_mapping_stamps_struct_children_and_list_elements` and `nested_name_mapping_leaves_an_unmapped_child_without_an_id` |
+| S-2 | Mapping route: each struct child, list element, map key and map value of an id-less file takes its id from the name mapping at every depth. An unmapped node and its subtree take no id. Fix round 1 keeps the round-0 mapping-route answers, except the partial mapping (F3), which now reads NULL (S-19). Fix round 2 refuses a list or map that the mapping names without its entries (S-25) | PROVEN | The `_mapping` pins of shapes (i), (ii), (f) and (g); units `nested_name_mapping_stamps_struct_children_and_list_elements` and `nested_name_mapping_leaves_an_unmapped_child_without_an_id` |
 | S-3 | Fallback route, rewritten by fix round 1 (ruling 1). A top-level field takes the table field at its position with its name, else `position + 1` unless that id is claimed. A nested child takes the id of the child with its name in its matched parent's type, at any position and at every depth. A list element, map key and map value take the table's element, key and value ids when the parent matched. A nested child whose name matches nothing takes no id, and neither does its subtree. Nothing nested is stamped from a counter or by position. A claimed id is never reused | PROVEN | The `_fallback` pins of shapes (i), (ii), (f) and (g); the pins of S-18; units `fallback_stamps_a_nested_child_by_name_at_any_position`, `fallback_leaves_an_unmatched_nested_child_and_its_subtree_without_an_id`, `fallback_never_stamps_a_nested_child_from_a_counter`, `fallback_top_level_counter_field_stamps_its_children_by_name`, `fallback_matches_map_key_and_value_and_their_children_by_name`, `fallback_matches_a_list_element_structurally` and `fallback_keeps_the_top_level_counter_and_name_match` |
 | S-4 | Shape (i): a dropped child's value never reads under a new child. The new child reads NULL per row. Validity comes from the file | PROVEN | The two-leaf pins, both routes |
 | S-5 | Shape (ii), and the batch of an unchanged struct (e'): the batch column has the schema field's type, with the nested field-id metadata, and `concat_batches` succeeds. The `matches_schema` pins and the batch pins stay green at `85687ce0` after the round-0 passthrough was removed | PROVEN | The one-leaf `matches_schema` pins; the `idless_struct_batches_carry_the_schema_type_and_concatenate` pins, both routes, red on the base because the passed-through column lacked the nested field-id metadata |
@@ -163,18 +174,21 @@ head are listed in the Fix round 1 section.
 | S-12 | Java note, restated: Java's `ParquetSchemaUtil.addFallbackIds` stamps top-level ordinals only, and its fallback read builder reads nested structs by position. This is the builder's recollection and stands unverified. The measured fact is that Spark always reads an id-less file through the mapping `add_files` installs, and the fork's fallback rule is by name with no counter (fix round 1), so the counter-order question no longer changes any fork answer | OPEN | Not checked against the Java source. No Java checkout was used |
 | S-13 | Pruning: on an id-less file, row-group and page-index pruning map field ids to Parquet columns through the ids the reader stamped on the Arrow schema (the mapping or the fallback rule), at every depth. A column with no stamped id has no entry, so a filter on it keeps every row group. Before fix round 1 the map was positional (`build_fallback_field_id_map`), which read the wrong column's statistics when a mapping or the fallback rule gave other ids (F4) | PROVEN | Fix round 1 (`cc213112`). Integration pins `idless_row_group_pruning_uses_the_mapped_ids` and `idless_row_group_pruning_uses_the_fallback_ids_after_a_leading_drop`, both red at `bc6a2e67`; unit `stamped_field_id_map_indexes_stamped_leaves_at_every_depth` |
 | S-14 | File moves and ceiling: both stamping functions and their tests move out of `reader.rs` (9546 to 9442 lines at round 0, 9433 at head). The `reader.rs` ceiling in `scripts/check_rust_file_size.py` lowers at each commit and is never raised. `build_fallback_field_id_map` moved to the test-only `page_prune_fixture.rs` | PROVEN | `git diff --stat 14a93602..85687ce0`. `make check-rust-file-size` exit 0 (builder, fix round 1) |
-| S-15 | Neighbours unchanged: the 13 `struct_empty_child` pins, the `interop_name_mapping` binary, and the full `iceberg` and `iceberg-datafusion` suites pass with no failure, at round 0 and at `85687ce0` | PROVEN | Builder gate runs (see Gates) |
+| S-15 | Neighbours unchanged: the 13 `struct_empty_child` pins, the `interop_name_mapping` binary, and the full `iceberg` and `iceberg-datafusion` suites pass with no failure, at round 0, at `85687ce0` and at `e0bfed03` (fix round 2 gates) | PROVEN | Builder gate runs (see Gates) |
 | S-16 | NULL-free parity: an id-less file with no NULL struct row reads Spark's NULL-free answers in S-11, shapes (ii) and (iii), on both routes | PROVEN | Fix round 1 (`85687ce0`), ruling 4: `idless_null_free_struct_dropped_child_new_child_reads_null_fallback` and `_mapping` (shape ii); `idless_null_free_struct_added_child_reads_file_child_and_null_fallback` and `_mapping` (shape iii). All four green at head |
-| S-17 | Verification: the union of the PASS verdicts of an Opus 5.5 verifier and a Muse MAX critic on the current head is recorded | OPEN | The round-1 verdicts (Opus 5.5 FAIL; Muse MAX PASS with findings) are in the Verifier round 1 section. Round-2 verdicts on `85687ce0` are not yet recorded. The closures of the parent ledger's S-11 and S-16 depend on this clause |
+| S-17 | Verification: the union of the PASS verdicts of an Opus 5.5 verifier and a Muse MAX critic on the current head is recorded | OPEN | The round-1 verdicts (Opus 5.5 FAIL; Muse MAX PASS with findings) are in the Verifier round 1 section, and the round-2 verdicts on `85687ce0` (Opus 5.5 FAIL; Muse MAX FAIL) are in the Verifier round 2 section. The round-3 verdicts on `e0bfed03` (an Opus 5.5 re-verifier and a Muse MAX critic) are not yet recorded, so no union of PASS exists yet. The closures of the parent ledger's S-11 and S-16 depend on this clause |
 | S-18 | Fallback route, by name (ruling 1), F1 and F2 shapes, both routes. A rename, a double rename, a move, reordered file children, a dropped child beside an added one, an extra file child then an added child, a list element's children and a two-deep struct with a rename each read the table's child by name, and a child with no history reads NULL, never a neighbour's value | PROVEN | Fallback pins, red at `bc6a2e67` unless noted: `idless_renamed_child_after_a_nested_sibling_reads_null_fallback` (green at `bc6a2e67` by design: round 1 already read NULL); `idless_two_renamed_children_never_read_a_neighbour_fallback`; `idless_moved_child_reads_by_name_fallback`; `idless_file_children_in_another_order_read_by_name_fallback`; `idless_dropped_child_never_lends_its_value_to_a_sibling_fallback`; `idless_extra_file_child_never_reads_under_an_added_child_fallback`; `idless_list_element_children_read_by_name_fallback`; `idless_struct_two_deep_reads_by_name_and_a_rename_reads_null_fallback`. Mapping-route no-regression pins, green at `bc6a2e67` and at head: `idless_renamed_child_after_a_nested_sibling_keeps_its_value_mapping`, `idless_two_renamed_children_keep_their_values_mapping`, `idless_moved_child_reads_by_name_mapping`, `idless_file_children_in_another_order_read_by_name_mapping`, `idless_dropped_child_never_lends_its_value_to_a_sibling_mapping`, `idless_extra_file_child_never_reads_under_an_added_child_mapping`, `idless_list_element_children_read_by_name_mapping`, `idless_struct_two_deep_reads_by_name_and_a_rename_keeps_its_value_mapping`. Source: `struct_idless_child_2.rs` |
 | S-19 | Unmapped child (ruling 2, F3): on an id-less file, a child of a mapped struct that the mapping or the name leaves unstamped reads NULL per row, on both routes, and is never refused and never projected. Where the file has no embedded ids at all, an unmapped child is never a refusal | PROVEN | Red at `bc6a2e67`: `idless_partial_nested_mapping_reads_the_unmapped_child_as_null` (the F3 shape: mapping `s -> [d]`, file `s<d = 10, e = 20>`, answer `{d: 10, e: NULL}`); `idless_file_children_with_no_matching_name_read_null_mapping` and `idless_file_children_with_no_matching_name_read_null_fallback`. Renamed no-mapping pins, green at head: `idless_struct_without_child_mapping_reads_its_unmapped_child_as_null` and `idless_struct_without_child_mapping_and_an_added_child_reads_null` (`struct_idless_child.rs`) |
 | S-20 | Top-level positional misread, OPEN and not fixed by this unit. On the fallback route, a table `(x, a, b)`, no drop, and an id-less file `(a, b)` with rows `a = [1, 2]`, `b = [40, 30]` read `x = [1, 2]` (a's values), `a = [40, 30]` (b's values) and `b = [NULL, NULL]`. The top-level rule (name and position, else `position + 1`) is unchanged by this unit and pre-existing at `14a93602`. The Muse MAX critic's out-of-scope note, identical on base and head: a top-level reorder on the fallback route fails with a `Struct -> Int32` cast error. Spark never reaches this shape because `add_files` installs a mapping; RePark's `add_files` installs one too, so the shape needs a table registered from foreign metadata with no mapping | OPEN | Measured once at `85687ce0` by the builder (scratch test, since deleted). Carded as F-IDLESS-TOPLEVEL-POSITIONAL-1, to be filed on the RePark side by the RP-64 records round, not fixed here |
 | S-21 | Ruling 7 (the Muse MAX critic's F2, folded): on an id-less file, a nested leaf whose file type cannot be promoted to the table type refuses `DataInvalid` naming the field path and both types, in both directions and on both routes, instead of collapsing the struct's validity to `[f, f]`. A top-level incompatible type keeps its old behaviour (the column is excluded and reads NULL) | PROVEN | Red at `bc6a2e67` (the scan read batches where it must refuse): `idless_nested_int_under_a_string_child_refuses_fallback` and `_mapping`; `idless_nested_string_under_an_int_child_refuses_fallback` and `_mapping`. Green at head. The refusal is raised in `get_arrow_projection_mask_with_field_ids` (`reader.rs`) |
-| S-22 | A name mapping whose list or map entry lacks its `element`, `key` or `value` child now reads that list or map as NULL where round 1 read its values. Judged spec-consistent (an unmapped field is not projected) | OPEN | Builder's question, pending the round-2 verifier. No pin is named in the builder's notes |
-| S-23 | An incompatible nested type on a file WITH embedded field ids (table `s<d: string>`, file `s<d: int>` with embedded ids `1, 2, 3`, values `[1, NULL]`) still collapses the struct validity to `[false, false]` with a NULL `StringArray` child at `85687ce0`. The item-7 refusal is gated on `missing_field_ids`, so this case is outside this unit's scope and the reader behaves as at round 0 | OPEN | Measured at `85687ce0`. A candidate card, a follow-up to the card of S-20 or to a new unit |
+| S-22 | A name mapping whose list or map entry lacks its `element`, `key` or `value` child now reads that list or map as NULL where round 1 read its values. Judged spec-consistent (an unmapped field is not projected) | REJECTED | Verifier round 2 V2-F3 (S2): the list or map reads NULL for present values, and ruling 3 of round 2 refuses instead, so the claim is withdrawn. S-25 (PROVEN) replaces it and closes this question by citation |
+| S-23 | An incompatible nested type on a file WITH embedded field ids (table `s<d: string>`, file `s<d: int>` with embedded ids `1, 2, 3`, values `[1, NULL]`) still collapses the struct validity to `[false, false]` with a NULL `StringArray` child at `85687ce0`. The item-7 refusal is gated on `missing_field_ids`, so this case is outside this unit's scope and the reader behaves as at round 0 | OPEN | Measured at `85687ce0`; both round-2 verifiers confirm it is pre-existing at `14a93602` (Q4). A candidate card, a follow-up to the card of S-20 or to a new unit |
+| S-24 | Fix round 2, ruling 1: on an id-less file, the NULL fill for a source struct whose children all lack ids applies only when every child carries the stamping pass's in-memory mark. A file that carries ids on some fields and none on a nested struct's children refuses `DataInvalid`, naming the struct path and that the data file must carry a field id on every nested field, on every shape: same names, swapped, extra child. Never a silent NULL for a present value, never a positional read | PROVEN | Fix round 2 (`9f928be2`). Red at `b16def80`: `top_level_ids_only_file_with_same_named_children_refuses`, `top_level_ids_only_file_with_swapped_children_refuses` and `top_level_ids_only_file_with_an_extra_child_refuses` (`struct_idless_child_3.rs`), and the unit `unstamped_children_of_a_file_with_ids_refuse_without_a_name_mapping_hint`. Green at both: the no-regression pins `idless_file_with_same_named_children_reads_its_values_fallback` and `_mapping`, `idless_file_with_swapped_children_reads_by_name_fallback` and `_mapping`, `idless_file_with_an_extra_child_ignores_it_fallback` and `_mapping`; the units `children_the_reader_left_unstamped_fill_null` and `mixed_ids_refusal_hint_asks_for_ids_and_never_for_a_name_mapping` (the V2-N1 hint pin). A file with ids at every depth is unchanged: `struct_empty_child` 13 green at head `e0bfed03` |
+| S-25 | Fix round 2, ruling 3: a name mapping that names a list without an `element` entry carrying a field id, or a map without `key` and `value` entries carrying field ids, refuses `DataInvalid`, naming the list or map path and the missing entry. An entry without a field id counts as missing. A list or map the mapping does not name, and a list or map whose mapping carries its entries, is unchanged. Never a NULL column for present values, never a positional read | PROVEN | Fix round 2 (`2f0c16f6`), closes S-22 by citation. Red at `b16def80`: `mapping_naming_a_list_without_its_element_entry_refuses` (`l` reads `[null, null]`), `mapping_naming_a_map_without_its_key_and_value_entries_refuses` (`m` reads `[null, null]`) and `mapping_naming_a_map_with_its_key_entry_only_refuses` (`DataInvalid: Map field must have exactly 2 fields`), all in `struct_idless_child_3.rs`. Green at both: `fully_mapped_list_and_map_read_their_values` and `list_of_structs_mapping_naming_the_element_and_one_child_reads_null_for_the_rest`. Head `e0bfed03` |
+| S-26 | Fallback route with no mapping, ruling-inherent: a child dropped and then re-added by name reads its old value. Table `(id, s<a, b>)`, id-less file `{a: 1, b: 2}`, `drop s.b` then `add s.b` reads `{a: 1, b: 2}`. The base did the same, and so does the top-level rule (`drop c`, `add c` reads `c = 5`). The mapping route reads NULL, which is correct | OPEN | Verifier round 2 V2-F1 (S1 under the round-2 rule, pre-existing, fallback route only). A by-name rule without schema history cannot tell a re-added field from the original, so this is a limitation of the no-mapping route and is not fixed here. It joins the top-level card, S-20 (F-IDLESS-TOPLEVEL-POSITIONAL-1) |
+| S-27 | Fix round 2 also clears four base bugs that the round-2 verifier found as side effects of the fix: (1) a fabricated value for a REQUIRED child the file lacks; (2) rows lost by pruning on `c IS NULL`; (3) rows lost with row selection on a nested promoted filter; (4) rows lost by pruning on a partially stamped file | PROVEN | Opus 5.5 verifier round 2 measurement, copied and not re-measured by the clerk. The builder's notes list the four without re-measuring them, and no pin of this unit names them |
 
-VERDICT (2026-11-01, fix round 1 records): 17 PROVEN, 5 OPEN (S-12, S-17,
-S-20, S-22, S-23), 1 REJECTED (S-10), of 23 clauses. S-17 stays OPEN.
+VERDICT (2026-11-01, fix round 2 records): 20 PROVEN, 5 OPEN (S-12, S-17, S-20, S-23, S-26), 2 REJECTED (S-10, S-22), of 27 clauses. S-17 stays OPEN.
 
 ## Spark 4.1.2 measurement (2026-11-01, S-11)
 
@@ -482,6 +496,171 @@ test since deleted.
 - **S-17** stays OPEN.
 - **S-18** to **S-23** new.
 
+## Verifier round 2 (on `85687ce0`): FAIL from both verifiers
+
+An Opus 5.5 re-verifier and a Muse MAX critic each read fix round 1 on
+`85687ce0`, and both returned FAIL. The orchestrator reproduced Q1 and V2-F3 at
+`85687ce0`. The findings below are copied as the orchestrator recorded them for
+fix round 2.
+
+Opus 5.5 round-2 verifier:
+
+- **V2-F2 (S1, the same shape as the Muse critic's Q1).** A Parquet file that
+  carries `PARQUET:field_id` on its top-level fields (`id = 1`, `s = 2`) and none
+  on the nested children, table `s<d, e>`, one row `(1, {d: 10, e: 20})`: the head
+  reads `validity [true]`, `d = [None]`, `e = [None]`, a silent NULL for two present
+  values; the base `bc6a2e67` refused `DataInvalid: struct 's' has no field ids and
+  children differ`. The critic measured three shapes: same-named children (`d, e`),
+  swapped (`s<b = 10, a = 20>` under `s<a, b>`), and an extra child (`s<d = 1, x = 99>`
+  under `s<d>`; the base read `d = 1`). Cause: the NULL fill of ruling 2 in
+  `nested_projection::build_struct` is universal, and on a file that has ids an
+  unstamped nested source struct means a partially stamped file, not an unmapped one.
+- **V2-F3 (S2, mapping route).** A name mapping that names a list but has no
+  `element` entry, or a map with no `key` and `value` entries: `l: list<int>` reads
+  `[NULL, NULL]` with validity `[f, f]` where the base and round 1 read
+  `[[1, 2], [3]]`; a map whose mapping has no fields reads NULL; a map mapping that
+  names `key` only fails with `DataInvalid: Map field must have exactly 2 fields`.
+  Cause: `unmapped_group_leaf_indices` was deleted, so an unmapped element or
+  key/value leaf is no longer decoded and the whole column collapses.
+- **V2-F1 (S1 under the round-2 rule, ruling-inherent, pre-existing, fallback route
+  only).** Table `(id, s<a, b>)`, id-less file `{a: 1, b: 2}`, `drop s.b` then
+  `add s.b`: the fallback route reads `{a: 1, b: 2}`, because the re-added field takes
+  the old value by name. The base did the same, and so does the top-level rule
+  (`drop c`, `add c` reads `c = 5`). The mapping route reads NULL, correctly.
+- **V2-N1 (S3).** The mixed-ids refusal in `build_struct` never fires end to end: a
+  file with ids on `s.d` only reads `{d: 10, e: NULL}` on head and base, which is
+  spec-consistent. No pin asserts the new hint text.
+- **V2-N2.** An orchestrator scratch file in the tree. No finding.
+
+Muse MAX critic, round 2:
+
+- **Q1 (S1)** is V2-F2: the three shapes, reproduced twice by the critic.
+- **Q4** is an incompatible nested type on a file with embedded ids, pre-existing at
+  `14a93602` and confirmed (S-23).
+- **Q5** is V2-F3. The critic judged the NULL answer spec-consistent; ruling 3
+  overrules that judgement.
+
+Four base bugs that the fix also clears, measured by the Opus 5.5 verifier and
+copied (S-27), not re-measured here: a fabricated value for a REQUIRED child the
+file lacks; rows lost by pruning on `c IS NULL`; rows lost with row selection on a
+nested promoted filter; rows lost by pruning on a partially stamped file.
+
+Rulings for fix round 2:
+
+1. **Gate the fill.** The NULL fill for a source struct whose children all lack ids
+   applies only when the file carried no field ids at all. A file that carries ids
+   on some fields and none on a nested struct's children refuses `DataInvalid`,
+   naming the struct path, on every shape. Never a silent NULL for a present value,
+   never a positional read. The flag travels from the reader inside the stamped
+   schema, so `reader.rs` stays at or under 9433 lines and no ceiling is raised.
+2. **Pins red first at `b16def80`**, in a sibling file `struct_idless_child_3.rs`,
+   because adding them to `struct_idless_child_2.rs` (766 lines) would have taken it
+   past 1000. The three top-level-ids-only shapes refuse. The same three shapes on a
+   file with no ids keep their round-1 answers. A file with ids at every depth is
+   unchanged (`struct_empty_child.rs` green).
+3. **A list or map named by the mapping without its `element`, or `key` and `value`,
+   entries refuses**: `DataInvalid`, naming the list or map path and the missing
+   entry; never a NULL column for present values and never a positional read. A list
+   or map whose mapping carries the entries is unchanged, and so is a list of structs
+   whose mapping names the element but not all of its children (round-1 ruling 2).
+
+V2-F1 is not fixed. It is recorded as S-26, the limitation of the no-mapping route.
+
+## Fix round 2 (`e0bfed03`, on `b16def80`)
+
+Commits:
+
+- `9f928be2` fix(arrow): fix 2 the NULL fill for an unstamped source struct applies only to a file without field ids (Q1)
+- `2f0c16f6` fix(arrow): fix 2 a list or map the mapping names without its element, key or value entry refuses (V2-F3)
+- `e0bfed03` test(arrow): fix 2 pins: a file with top-level ids only refuses, an id-less file keeps its answers, an incomplete list or map mapping refuses, the hint text
+
+### Mechanism (ruling 1, `9f928be2`)
+
+- The stamping pass, which runs only on a file without field ids, on both routes,
+  tags each field it returns without an id with the in-memory Arrow metadata key
+  `iceberg.reader.left-unstamped` (const `LEFT_UNSTAMPED_META_KEY` in
+  `nested_projection.rs`). On the mapping route the tag is set by the early return of
+  `stamp_mapped`; on the fallback route, by the two `None` arms of
+  `FallbackIds::stamp_children`. The subtree under a tagged field is not tagged, and
+  the plan never descends into it.
+- `build_struct` fills NULL or `initial_default` only when every child of the source
+  struct carries the tag. Otherwise it refuses: `DataInvalid => struct 's' has no
+  field ids on its nested fields in a data file that carries field ids; the data file
+  must carry a field id on every nested field`. A struct with no source children
+  still fills, so `struct_empty_child.rs` is unchanged.
+- The refusal is the default for any reader that runs no stamping pass: Parquet with
+  embedded ids, and also Avro and ORC. An Avro or ORC struct whose children all lack
+  ids now refuses where fix round 1 filled NULL. The orchestrator accepted this
+  stricter, loud result.
+- The tag never reaches a file. It survives `ArrowReaderMetadata::try_new` and the
+  INT96 visitor, which copies field metadata, and it never reaches the output,
+  because target fields come from the table schema and a tagged source never equals a
+  target type.
+- The mixed stamped and unstamped refusal and its hint are unchanged.
+- Why a tag and not a parameter: `reader.rs` was at its ceiling (9433),
+  `record_batch_transformer.rs` at 999 of 1000, and `generate_batch_transform` already
+  takes seven parameters, the clippy limit. The Avro, ORC and Parquet `_pos` paths
+  share `build_scan_task_transformer`, so a bool would have needed lines in both full
+  files. `reader.rs` and `record_batch_transformer.rs` are untouched, and no ceiling
+  moved.
+
+### Mechanism (ruling 3, `2f0c16f6`)
+
+- `stamp_mapped` carries the field path. When a mapped list's `element` slot, or a
+  mapped map's `key` or `value` slot, has no mapping entry with a field id, the scan
+  refuses:
+  - `DataInvalid => the name mapping names list 'l' but has no 'element' entry with a field id for it`
+  - `DataInvalid => the name mapping names map 'm' but has no 'key' entry with a field id for it` (or `'value'`)
+- The first missing slot is the one reported, so a map with no entries names `'key'`.
+  An entry without a field id counts as missing.
+- A list or map the mapping does not name keeps its old behaviour, and so does one
+  whose mapping carries its entries.
+
+### Pins (`e0bfed03`)
+
+Red run at `b16def80`, `cargo test -p iceberg --test struct_idless_child_3`, exit
+101: 8 passed, 6 failed. What the red pins read at `b16def80`:
+
+| Pin | Read or outcome at `b16def80` |
+|---|---|
+| `top_level_ids_only_file_with_same_named_children_refuses` | struct valid, `d = null`, `e = null` |
+| `top_level_ids_only_file_with_swapped_children_refuses` | struct valid, `a = null`, `b = null` |
+| `top_level_ids_only_file_with_an_extra_child_refuses` | struct valid, `d = null` |
+| `mapping_naming_a_list_without_its_element_entry_refuses` | `l` = `[null, null]` |
+| `mapping_naming_a_map_without_its_key_and_value_entries_refuses` | `m` = `[null, null]` |
+| `mapping_naming_a_map_with_its_key_entry_only_refuses` | `DataInvalid => Map field must have exactly 2 fields` |
+
+Green at both `b16def80` and head, as no-regression pins (8): `fully_mapped_list_and_map_read_their_values`,
+`idless_file_with_same_named_children_reads_its_values_fallback` and `_mapping`,
+`idless_file_with_swapped_children_reads_by_name_fallback` and `_mapping`,
+`idless_file_with_an_extra_child_ignores_it_fallback` and `_mapping`, and
+`list_of_structs_mapping_naming_the_element_and_one_child_reads_null_for_the_rest`.
+
+Unit pins, in `nested_projection_evo_pin_tests.rs`. Red run at `b16def80`,
+`cargo test -p iceberg --lib -- mixed_ids_refusal_hint_asks_for_ids unstamped_children_of_a_file_with_ids children_the_reader_left_unstamped`,
+exit 101: 2 passed, 1 failed. The failure is
+`unstamped_children_of_a_file_with_ids_refuse_without_a_name_mapping_hint`.
+`mixed_ids_refusal_hint_asks_for_ids_and_never_for_a_name_mapping` (V2-N1, the hint,
+which fix round 1 had already changed) and `children_the_reader_left_unstamped_fill_null`
+(the fill on a tagged child, which goes through `add_fallback_field_ids_to_arrow_schema`
+and needs no new name) are green by design.
+
+Green run at `e0bfed03`: `struct_idless_child_3` 14 ok, and the three unit pins ok.
+
+### Ledger clauses changed by fix round 2
+
+- **S-2** gains the list and map refusal of S-25; still PROVEN.
+- **S-15** recounted at `e0bfed03`; still PROVEN.
+- **S-17** stays OPEN. The round-2 verdicts are recorded in this ledger; the
+  round-3 verdicts on `e0bfed03` are not yet.
+- **S-22** REJECTED. Ruling 3 refuses the NULL column the clause described, and S-25
+  closes the question by citation.
+- **S-23** gains the note that both round-2 verifiers confirm Q4 as pre-existing.
+  Still OPEN.
+- **S-24** to **S-27** new: the gated fill and the partially stamped refusal
+  (PROVEN), the incomplete list or map mapping refusal (PROVEN), the re-added child
+  on the no-mapping route (OPEN), and the four cleared base bugs (PROVEN, copied).
+
 ## Gates
 
 Round-0 builder runs, every command exit 0 (at `8a66aa7c`):
@@ -526,20 +705,41 @@ Records gates for this commit (clerk), every command exit 0:
 `make check-agent-artifacts` (11 + 4 needles clean); `make check-matrix-anchors`
 (88 GAP_MATRIX rows anchored, IDs unique). The staged diff touches only markdown.
 
+Fix round 2 builder runs, at `e0bfed03`. The clerk ran no cargo; the rows are
+copied from the builder's notes, and every cargo command ran under the flock,
+environment and `systemd-run` wrapper of the brief:
+
+| Command | Exit | Counts |
+|---|---|---|
+| `cargo test -p iceberg --test struct_idless_child --test struct_idless_child_2 --test struct_idless_child_3 --test struct_empty_child` | 0 | 18 + 29 + 14 + 13 passed, 0 failed |
+| `cargo test -p iceberg --no-fail-fast` | 0 | 74 result lines, 5092 passed, 0 failed, 21 ignored |
+| `cargo test -p iceberg-datafusion --no-fail-fast` | 0 | 43 result lines, 802 passed, 0 failed, 15 ignored |
+| `cargo clippy -p iceberg -p iceberg-datafusion --all-targets -- -D warnings` | 0 | clean |
+| `cargo fmt --all -- --check` | 0 | none |
+| `make check-rust-file-size` | 0 | 710 files clean (89 legacy ceilings); `reader.rs` 9433, `record_batch_transformer.rs` 999 |
+| `BASE_REF=14a93602 make check-comment-blocks` | 0 | no added block over 6 lines |
+| `make check-agent-artifacts` | 0 | clean (11 + 4 needles) |
+
+Comment gate per commit (added `//` or `/*` lines in the `.rs` diff): `9f928be2` 0,
+`2f0c16f6` 0, `e0bfed03` 16 (the licence header of the new file).
+
+Records gates for this commit (clerk), every command exit 0: `BASE_REF=14a93602 make check-comment-blocks` (no added block over 6 lines); `make check-agent-artifacts` (11 + 4 needles clean); `make check-matrix-anchors` (88 GAP_MATRIX rows anchored, IDs unique). The staged diff touches only markdown.
+
 ## Verification
 
-OPEN (S-17). Round 1 is FAIL (Opus 5.5) and PASS-with-findings (Muse MAX
-critic), both on `8a66aa7c`; every finding is fixed in fix round 1. Round 2 on
-`85687ce0`: an Opus 5.5 re-verifier and a Muse MAX critic. Their verdicts are
-not yet recorded, and the union of their PASS is what S-17 needs.
+OPEN (S-17). Round 1 is FAIL (Opus 5.5) and PASS-with-findings (Muse MAX critic),
+both on `8a66aa7c`; every finding is fixed in fix round 1. Round 2 on `85687ce0` is
+FAIL from both verifiers; every finding is fixed in fix round 2 except V2-F1 (OPEN,
+S-26) and Q4 (pre-existing, S-23). Round 3 on `e0bfed03` is an Opus 5.5 re-verifier
+and a Muse MAX critic, run as these records are written. Their verdicts are not yet
+recorded, and the union of their PASS is what S-17 needs.
 
 ## Open items
 
-1. S-12: check the Java note against the Java source, if the Java note matters
-   for the closure.
-2. S-17: the union of the round-2 PASS verdicts is needed before the closures of
-   the parent ledger's S-11 and S-16 in its errata stand.
-3. S-20: F-IDLESS-TOPLEVEL-POSITIONAL-1, to be filed on the RePark side by the
-   RP-64 records round.
-4. S-22: the list and map entry child reads NULL. The round-2 verifier decides.
-5. S-23: the embedded-ids item-7 collapse. A candidate card or a unit of its own.
+1. S-12: check the Java note against the Java source, if the Java note matters for
+   the closure.
+2. S-17: the union of the round-3 PASS verdicts on `e0bfed03` is needed before the
+   closures of the parent ledger's S-11 and S-16 in its errata stand.
+3. S-20 and S-26: F-IDLESS-TOPLEVEL-POSITIONAL-1, and the re-added child on the
+   no-mapping route, both to be filed on the RePark side by the RP-64 records round.
+4. S-23: the embedded-ids item-7 collapse. A candidate card or a unit of its own.
