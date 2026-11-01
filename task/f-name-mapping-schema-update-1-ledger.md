@@ -21,7 +21,7 @@
 
 **Date:** 2026-11-01. **Base:** fork `main` `ee592dcf` (the `#379` squash). **Branch:**
 `fix/name-mapping-schema-update-1`, not pushed. Commits: `dfa0776f` (pins, red on the base),
-`6e8593ee` (fix, green at head), and the records commit that adds this text.
+`6e8593ee` (fix, green at head), `64303b60` (the round-0 records commit), and the fix round 1 commits `c632b74e` (pins, red), `99429b8f` (pins, red), `2883861f` (the nested pin's projection), `bfce73b0` (the fix, green at head), and the fix round 1 records commit that adds this text. Fix round 1 starts at `64303b60`.
 
 **Model:** builder Claude Opus 5.5 (`claude-opus-5-5`), round 0. Records clerk Claude Haiku 5.5
 (`claude-haiku-5-5`). The verifiers have not run on `6e8593ee` at the time of this text.
@@ -106,14 +106,17 @@ was restored and checked with `cmp`.
 | S-14 | Gates at `6e8593ee` pass: fmt; clippy with no warnings; `cargo test -p iceberg` (5124 passed, 0 failed); `cargo test -p iceberg-datafusion` (802 passed, 0 failed); the file-size ratchet (`update_schema.rs` lowered from 3595 to 3551, no ceiling raised); the `#379` suites unchanged and green | PROVEN | Builder runs (see Gates). The clerk ran no cargo |
 | S-15 | Spark parity on the measured shapes: the fork's answers equal Spark 4.1.2's on the rename (`(2, {v: 2})`), the nested add (`k` reads 22), the top-level add (`y = 7` reads 7) and the drop then re-add (`(1, {a: 1, b: 2}, 5)`) | PROVEN | Spark side: the orchestrator's measurement and the RP-64 verifier's Spark answer, copied. Fork side: pins (a), (b), (c) and (d), and mapping JSON (a), (b) and (d) of the builder's notes. The clerk did not re-run Spark |
 | S-16 | `#379` S-26 consequence: on the mapping route, a child dropped and re-added by name reads its old value under the re-added field (`{a: 1, b: 2}`), which is Spark's answer, where `#379` S-26 said NULL. The no-mapping route is unchanged (S-9) | PROVEN | Pin (d), green at head. Spark's answer `[(1, {a: 1, b: 2}, 5)]` from the RP-64 verifier, 2026-11-01, copied. The `#379` ledger carries an errata paragraph under its title |
-| S-17 | The port follows Java's `MappingUtil.update` (rename, add with the name move, delete, no-op changes, no property, unparsable property). The clerk did not check these rules against the Java source; the builder's reading of Java is in its notes | OPEN | The Java source was not checked in this unit, as with `#379` S-12 |
+| S-17 | The port follows Java's `MappingUtil.update` (rename, add with the name move, delete, no-op changes, no property, unparsable property). The clerk did not check these rules against the Java source; the builder's reading of Java is in its notes | OPEN | The Java source was not checked in this unit, as with `#379` S-12. Fix round 1's verifier read the class strings of the Iceberg 1.11.0 Spark runtime jar, which confirm `updateAssignments` and `removeReassignedNames` in `MappingUtil$UpdateMapping`; no JVM was run and no Java source was read |
 | S-18 | An add whose parent has no mapped field in the mapping adds nothing, as in Java's visitor, which visits mapped fields only. A partial mapping stays partial | OPEN | Not pinned |
-| S-19 | A rename onto a name that a dropped sibling's mapped field still holds is ambiguous: the new name is added and the dropped sibling keeps it; the reader takes the first match, as in Java | OPEN | Not pinned |
+| S-19 | A rename onto a name that a dropped sibling's mapped field still holds is ambiguous: the new name is added and the dropped sibling keeps it; the reader takes the first match, as in Java | REJECTED | Rejected as written: the Java claim was wrong. Java 1.11.0 removes the name from the dropped sibling when a renamed field takes it (the verifier's F-1, from the jar's class strings), and the fork's mapping now does the same, so the ambiguity is removed, not kept. Pins (n) and (o) and clause S-23 replace this clause |
 | S-20 | Names keep their order with the new one appended; existing duplicates are not removed, where Java keeps a Set | OPEN | Not pinned |
 | S-21 | RePark's own `ALTER TABLE` reaches this through the fork's action, so RePark's answers change only when RePark repins (RP-64 fix round) | OPEN | Not measured in this unit; the repin is the RP-64 fix round's work |
 | S-22 | Verification: the union of the PASS verdicts of an Opus 5.5 verifier and a Muse MAX critic on `6e8593ee` is recorded | OPEN | Not yet run at build time; recorded here so that the closure can cite it |
+| S-23 | Fix round 1, rename: a rename takes its new name from the sibling mapped field that held it. The update drops that name from every sibling under the same parent, so the mapping matches Spark's: after DROP x and RENAME y TO x the mapping is `{2: []}, {3: [y, x]}` (Spark's is `{3: [x, y]}`; the order of names carries no meaning), and the old file's x reads the renamed field, not the dropped one. The nested case is the same | PROVEN | Pins (n) `rename_onto_a_dropped_sibling_name_takes_the_name_from_the_sibling` and (o) `nested_rename_onto_a_dropped_sibling_name_takes_the_name_from_the_sibling`, red at `64303b60` and green at `bfce73b0`; unit pin `rename_takes_its_new_name_from_the_sibling_that_holds_it`, red then green. Spark 4.1.2's mapping and reads are the orchestrator's measurement of 2026-11-01, copied. Documented divergence (a fact, no card): Java's `removeReassignedNames` removes only the last of several reassigned names on one sibling in one commit; the port removes every reassigned name |
+| S-24 | Fix round 1, control: a rename onto a name that a live sibling holds is refused with the schema build's `multiple fields for name x`, and the mapping and the schema id are unchanged | PROVEN | Pin (p) `rename_onto_a_live_sibling_name_is_refused_and_the_mapping_is_untouched`, green on both (control); the reloaded table keeps its schema id and the property byte-for-byte |
+| S-25 | Fix round 1, reader: on the mapping route, when two or more file columns resolve to one mapped id, the last in file order keeps the id and the earlier ones are neither stamped nor read, at every depth. Spark 4.1.2 with Iceberg 1.11.0 reads the later column (measured 2026-11-01, copied from the orchestrator); a file whose own embedded ids repeat still refuses | PROVEN | Pins (n), (o) and (q) `three_file_columns_resolving_to_one_id_read_the_last`, red at `64303b60` and green at `bfce73b0`; unit pins `name_mapping_stamps_only_the_last_top_level_column_resolving_to_one_id` and `name_mapping_stamps_only_the_last_struct_child_resolving_to_one_id`, red then green; `name_mapping_stamps_a_single_match_unchanged`, green on both; control (r) `a_file_with_a_duplicate_embedded_id_still_refuses`, green on both. The Java mechanism (a readers-by-id map that keeps the last reader) is the builder's reading and is not checked against source |
 
-VERDICT (2026-11-01, at build, before verification): 15 PROVEN, 7 OPEN (S-8, S-17 to S-22), 0 REJECTED, of 22 clauses.
+VERDICT (2026-11-01, after fix round 1, before round 2): 18 PROVEN, 6 OPEN (S-8, S-17, S-18, S-20, S-21, S-22), 1 REJECTED (S-19), of 25 clauses.
 
 ## Gates
 
@@ -138,10 +141,12 @@ Records gates for this commit (clerk), every command exit 0: `BASE_REF=ee592dcf 
 OPEN (S-22). An Opus 5.5 verifier and a Muse MAX critic have not yet run on `6e8593ee`. When both report
 PASS on the same head, S-22 becomes PROVEN by citation, as S-17 of `#379` did.
 
+Fix round 1 (on `64303b60`, 2026-11-01): the Opus 5.5 verifier reported FAIL with one S1 finding (F-1): a rename onto a name that a dropped sibling's mapped field still holds left the new id-less file reading NULL. The Muse MAX critic reported PASS with zero findings, and it did not reach that shape. The fix is `bfce73b0`; the builder's gates there were fmt and workspace clippy exit 0, `cargo test -p iceberg` 5134 passed, 0 failed, 21 ignored, `cargo test -p iceberg-datafusion` 802 passed, 15 ignored, and the file-size script exit 0. Round 2 is owed on `bfce73b0`; S-22 stays OPEN until then.
+
 ## Open items
 
 1. S-17: check the port against Java's `MappingUtil.update` in the Java source, if the closure should cite the source and not the builder's reading.
 2. S-8: a pin for the default change, or a scope line saying it is out of this unit.
-3. S-18 to S-20: OPEN and not pinned; each needs a pin or a stated scope before it closes.
+3. S-18 and S-20: OPEN and not pinned; each needs a pin or a stated scope before it closes.
 4. S-21: RePark's answers change only when RePark repins (the RP-64 fix round).
 5. S-22: the verifier union, as above.
