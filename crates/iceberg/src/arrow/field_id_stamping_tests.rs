@@ -422,3 +422,72 @@ fn a_field_id_at_any_depth_means_the_file_has_ids() {
     let none = file_schema(vec![file_int("x"), file_struct("s", vec![file_int("d")])]);
     assert!(!file_has_field_ids(&none));
 }
+
+fn mapped_names(id: i32, names: &[&str], fields: Vec<MappedField>) -> MappedField {
+    MappedField::new(
+        Some(id),
+        names.iter().map(|name| name.to_string()).collect(),
+        fields,
+    )
+}
+
+#[test]
+fn name_mapping_stamps_only_the_last_top_level_column_resolving_to_one_id() {
+    let file = file_schema(vec![
+        Field::new("id", DataType::Int32, false),
+        file_int("x"),
+        file_int("y"),
+    ]);
+    let mapping = NameMapping::new(vec![
+        mapped(1, "id", vec![]),
+        mapped_names(2, &[], vec![]),
+        mapped_names(3, &["y", "x"], vec![]),
+    ]);
+    let stamped =
+        apply_name_mapping_to_arrow_schema(file, &mapping, &[]).expect("apply the mapping");
+    assert_eq!(id_of(field_at(&stamped, &["id"])), Some(1));
+    assert_eq!(id_of(field_at(&stamped, &["x"])), None);
+    assert_eq!(id_of(field_at(&stamped, &["y"])), Some(3));
+    assert_eq!(stamped_field_id_map(&stamped).get(&3), Some(&2));
+}
+
+#[test]
+fn name_mapping_stamps_only_the_last_struct_child_resolving_to_one_id() {
+    let file = file_schema(vec![
+        Field::new("id", DataType::Int32, false),
+        file_struct("s", vec![file_int("x"), file_int("y"), file_int("z")]),
+    ]);
+    let mapping = NameMapping::new(vec![
+        mapped(1, "id", vec![]),
+        mapped(2, "s", vec![
+            mapped_names(3, &[], vec![]),
+            mapped_names(4, &["y", "x"], vec![]),
+            mapped(5, "z", vec![]),
+        ]),
+    ]);
+    let stamped =
+        apply_name_mapping_to_arrow_schema(file, &mapping, &[]).expect("apply the mapping");
+    assert_eq!(id_of(field_at(&stamped, &["s"])), Some(2));
+    assert_eq!(id_of(field_at(&stamped, &["s", "x"])), None);
+    assert_eq!(id_of(field_at(&stamped, &["s", "y"])), Some(4));
+    assert_eq!(id_of(field_at(&stamped, &["s", "z"])), Some(5));
+}
+
+#[test]
+fn name_mapping_stamps_a_single_match_unchanged() {
+    let file = file_schema(vec![
+        Field::new("id", DataType::Int32, false),
+        file_int("y"),
+        file_struct("s", vec![file_int("x")]),
+    ]);
+    let mapping = NameMapping::new(vec![
+        mapped(1, "id", vec![]),
+        mapped_names(3, &["y", "x"], vec![]),
+        mapped(2, "s", vec![mapped_names(4, &["y", "x"], vec![])]),
+    ]);
+    let stamped =
+        apply_name_mapping_to_arrow_schema(file, &mapping, &[]).expect("apply the mapping");
+    assert_eq!(id_of(field_at(&stamped, &["y"])), Some(3));
+    assert_eq!(id_of(field_at(&stamped, &["s"])), Some(2));
+    assert_eq!(id_of(field_at(&stamped, &["s", "x"])), Some(4));
+}

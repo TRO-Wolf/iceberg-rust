@@ -19,6 +19,8 @@
 
 # F-IDLESS-STRUCT-CHILD-REMAP-1 — an id-less Parquet file gets field ids at every depth, and a struct child that was dropped or added reads by the table schema
 
+**Errata (2026-11-01).** S-26's mapping-route sentence ("The mapping route reads NULL, which is correct") is superseded by F-NAME-MAPPING-SCHEMA-UPDATE-1 (branch `fix/name-mapping-schema-update-1`, ledger `task/f-name-mapping-schema-update-1-ledger.md`). A schema update now rewrites `schema.name-mapping.default` as Java's `SchemaUpdate.commit` does, so a child dropped and re-added by name moves to the new field id on the mapping route and reads its old value under the re-added field (`{a: 1, b: 2}`). That is Spark 4.1.2's answer (`[(1, {a: 1, b: 2}, 5)]`), not NULL. The no-mapping route and the rest of S-26 stand.
+
 **Date:** 2026-11-01. **Base:** fork `main` `14a93602`. **Branch:**
 `fix/idless-struct-child-remap-1`. Commits: `51f39a29` (item 1, fix),
 `8a66aa7c` (item 2, pins), `bc6a2e67` (item 3, this ledger's first records

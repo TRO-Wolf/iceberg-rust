@@ -22,6 +22,7 @@ mod create;
 use std::sync::Arc;
 
 pub use create::create_name_mapping;
+pub(crate) use create::nested_mapping;
 use serde::{Deserialize, Serialize};
 use serde_with::{DefaultOnNull, serde_as};
 

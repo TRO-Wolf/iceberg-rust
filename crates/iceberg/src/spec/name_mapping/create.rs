@@ -45,7 +45,7 @@ fn mapped_struct_fields(
     Ok(mapped)
 }
 
-fn nested_mapping(field_type: &Type, depth: usize) -> Result<Vec<MappedField>> {
+pub(crate) fn nested_mapping(field_type: &Type, depth: usize) -> Result<Vec<MappedField>> {
     check_depth(depth)?;
     match field_type {
         Type::Struct(struct_type) => mapped_struct_fields(struct_type.fields(), depth),

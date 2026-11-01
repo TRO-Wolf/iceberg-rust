@@ -107,6 +107,7 @@ mod update_partition_spec;
 mod update_partition_statistics;
 mod update_properties;
 mod update_schema;
+mod update_schema_mapping;
 mod update_statistics;
 mod upgrade_format_version;
 use std::collections::HashMap;
@@ -124,7 +125,6 @@ use crate::transaction::update_location::UpdateLocationAction;
 use crate::transaction::update_partition_spec::UpdatePartitionSpecAction;
 use crate::transaction::update_partition_statistics::UpdatePartitionStatisticsAction;
 use crate::transaction::update_properties::UpdatePropertiesAction;
-use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
@@ -345,8 +345,8 @@ impl Transaction {
     }
     /// Creates an update-schema action (schema evolution: add/rename/update/delete/move columns,
     /// identifier fields, union-by-name).
-    pub fn update_schema(&self) -> UpdateSchemaAction {
-        UpdateSchemaAction::new()
+    pub fn update_schema(&self) -> update_schema::UpdateSchemaAction {
+        update_schema::UpdateSchemaAction::new()
     }
     /// Set the location of table
     pub fn update_location(&self) -> UpdateLocationAction {
