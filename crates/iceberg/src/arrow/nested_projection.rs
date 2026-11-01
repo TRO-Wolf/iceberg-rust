@@ -259,13 +259,15 @@ impl PlanNode {
             });
         }
         if !source_fields.is_empty() && source_fields.iter().all(|f| field_id_of(f).is_none()) {
-            let source_type = DataType::Struct(source_fields.clone());
-            let target_type = DataType::Struct(target_fields.clone());
-            return Ok(if source_type.equals_datatype(&target_type) {
-                PlanNode::Passthrough
-            } else {
-                PlanNode::Cast { target_type }
-            });
+            if same_struct_shape(source_fields, target_fields, depth)? {
+                return Ok(PlanNode::Passthrough);
+            }
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "struct '{path}' in the data file has no field ids and its children differ from the table schema; set a name mapping (schema.name-mapping.default) to resolve it"
+                ),
+            ));
         }
         let mut source_by_id: HashMap<i32, usize> = HashMap::with_capacity(source_fields.len());
         let mut source_by_name: HashMap<&str, usize> = HashMap::new();
@@ -677,6 +679,57 @@ fn map_key_value_fields(entries_field: &Field) -> Result<(FieldRef, FieldRef)> {
         )
     })?;
     Ok((key.clone(), value.clone()))
+}
+
+fn same_struct_shape(source: &Fields, target: &Fields, depth: usize) -> Result<bool> {
+    if source.len() != target.len() {
+        return Ok(false);
+    }
+    for (source_field, target_field) in source.iter().zip(target.iter()) {
+        if source_field.name() != target_field.name()
+            || !same_field_shape(source_field, target_field, depth + 1)?
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn same_field_shape(source: &Field, target: &Field, depth: usize) -> Result<bool> {
+    if depth > MAX_NESTED_PROJECTION_DEPTH {
+        return Err(Error::new(
+            ErrorKind::DataInvalid,
+            format!("nested schema projection exceeds depth {MAX_NESTED_PROJECTION_DEPTH}"),
+        ));
+    }
+    if source.is_nullable() != target.is_nullable() {
+        return Ok(false);
+    }
+    match (source.data_type(), target.data_type()) {
+        (DataType::Struct(source_fields), DataType::Struct(target_fields)) => {
+            same_struct_shape(source_fields, target_fields, depth)
+        }
+        (DataType::List(source_element), DataType::List(target_element))
+        | (DataType::LargeList(source_element), DataType::LargeList(target_element)) => {
+            same_field_shape(source_element, target_element, depth + 1)
+        }
+        (
+            DataType::FixedSizeList(source_element, source_size),
+            DataType::FixedSizeList(target_element, target_size),
+        ) => Ok(source_size == target_size
+            && same_field_shape(source_element, target_element, depth + 1)?),
+        (
+            DataType::Map(source_entries, source_sorted),
+            DataType::Map(target_entries, target_sorted),
+        ) => {
+            let (source_key, source_value) = map_key_value_fields(source_entries)?;
+            let (target_key, target_value) = map_key_value_fields(target_entries)?;
+            Ok(source_sorted == target_sorted
+                && same_field_shape(&source_key, &target_key, depth + 1)?
+                && same_field_shape(&source_value, &target_value, depth + 1)?)
+        }
+        (source_type, target_type) => Ok(source_type == target_type),
+    }
 }
 
 fn field_id_of(field: &Field) -> Option<i32> {

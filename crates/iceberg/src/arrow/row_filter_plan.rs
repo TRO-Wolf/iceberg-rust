@@ -197,7 +197,7 @@ pub(crate) fn unmapped_group_leaf_indices(
     iceberg_schema_of_task: &Schema,
     parquet_schema: &SchemaDescriptor,
     arrow_schema: &ArrowSchemaRef,
-) -> Vec<usize> {
+) -> Result<Vec<usize>> {
     let mut top_level_ids = HashSet::new();
     for leaf_id in leaf_field_ids {
         if let Some(top_id) = top_level_ancestor_id(iceberg_schema_of_task, *leaf_id) {
@@ -226,12 +226,88 @@ pub(crate) fn unmapped_group_leaf_indices(
                 .get(PARQUET_FIELD_ID_META_KEY)
                 .and_then(|id| i32::from_str(id).ok());
             if stamped.is_some_and(|id| top_level_ids.contains(&id)) {
-                indices.extend(leaf_idx..leaf_idx + count);
+                let mut unstamped = Vec::new();
+                let mut next_leaf = leaf_idx;
+                collect_unstamped_leaves(arrow_field, false, 0, &mut next_leaf, &mut unstamped)?;
+                if next_leaf == leaf_idx + count {
+                    indices.extend(unstamped);
+                } else {
+                    indices.extend(leaf_idx..leaf_idx + count);
+                }
             }
         }
         leaf_idx += count;
     }
-    indices
+    Ok(indices)
+}
+
+fn collect_unstamped_leaves(
+    field: &Field,
+    inherited: bool,
+    depth: usize,
+    next_leaf: &mut usize,
+    unstamped: &mut Vec<usize>,
+) -> Result<()> {
+    check_depth(depth)?;
+    let field_unstamped = inherited || field.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none();
+    collect_unstamped_type(
+        field.data_type(),
+        field_unstamped,
+        depth,
+        next_leaf,
+        unstamped,
+    )
+}
+
+fn collect_unstamped_type(
+    data_type: &DataType,
+    inherited: bool,
+    depth: usize,
+    next_leaf: &mut usize,
+    unstamped: &mut Vec<usize>,
+) -> Result<()> {
+    check_depth(depth)?;
+    match data_type {
+        DataType::Dictionary(_, value) => {
+            collect_unstamped_type(value, inherited, depth + 1, next_leaf, unstamped)
+        }
+        DataType::RunEndEncoded(_, value) => collect_unstamped_type(
+            value.data_type(),
+            inherited,
+            depth + 1,
+            next_leaf,
+            unstamped,
+        ),
+        DataType::Struct(children) => {
+            for child in children {
+                collect_unstamped_leaves(child, inherited, depth + 1, next_leaf, unstamped)?;
+            }
+            Ok(())
+        }
+        DataType::Union(children, _) => {
+            for (_, child) in children.iter() {
+                collect_unstamped_leaves(child, inherited, depth + 1, next_leaf, unstamped)?;
+            }
+            Ok(())
+        }
+        DataType::List(child) | DataType::LargeList(child) | DataType::FixedSizeList(child, _) => {
+            collect_unstamped_leaves(child, inherited, depth + 1, next_leaf, unstamped)
+        }
+        DataType::Map(entries, _) => collect_unstamped_type(
+            entries.data_type(),
+            inherited,
+            depth + 1,
+            next_leaf,
+            unstamped,
+        ),
+        _ => {
+            if inherited {
+                unstamped.push(*next_leaf);
+            }
+            *next_leaf += 1;
+            Ok(())
+        }
+    }
 }
 
 pub(crate) fn validity_leaves(
