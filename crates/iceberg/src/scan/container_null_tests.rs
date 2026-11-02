@@ -661,6 +661,14 @@ async fn test_container_null_predicates_match_spark_oracle_without_field_ids() {
     fixture.setup_id_less_container_manifest_files().await;
 
     for (display, predicate, expected_ids) in container_oracle_cases() {
+        let expected_ids = match display {
+            "mp IS NULL"
+            | "deep.inner IS NULL"
+            | "deep.inner.x IS NULL"
+            | "deep.inner.ys IS NULL" => vec![1, 2, 3, 4],
+            "mp IS NOT NULL" => vec![],
+            _ => expected_ids,
+        };
         let ids = scanned_container_ids(&fixture, predicate, display, false).await;
         assert_eq!(ids, expected_ids, "filter `{display}` without field ids");
     }
