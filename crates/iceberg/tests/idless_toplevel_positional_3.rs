@@ -486,3 +486,85 @@ async fn a_non_utf8_string_column_read_as_binary_keeps_its_raw_bytes_no_mapping(
 async fn a_non_utf8_string_column_read_as_binary_keeps_its_raw_bytes_mapping() {
     non_utf8_string_read_as_binary(true).await;
 }
+
+async fn four_strings_read_as_binary(tmp: &TempDir, mapped: bool) -> Table {
+    let schema = schema_of(vec![
+        field(1, "k", PrimitiveType::Int),
+        field(2, "v", PrimitiveType::Binary),
+    ]);
+    let columns = vec![
+        (
+            "k",
+            Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)])) as ArrayRef,
+        ),
+        (
+            "v",
+            Arc::new(StringArray::from(vec![
+                Some("abc"),
+                Some("xyz"),
+                None,
+                Some("\u{e9}a"),
+            ])) as ArrayRef,
+        ),
+    ];
+    table_with_file(tmp, schema, |table| write_idless(table, columns), mapped).await
+}
+
+async fn a_string_column_read_as_binary_answers_a_prefix(mapped: bool) {
+    let tmp = TempDir::new().expect("temp dir");
+    let table = four_strings_read_as_binary(&tmp, mapped).await;
+    let prefix = Reference::new("v").starts_with(Datum::binary(b"a".to_vec()));
+    assert_eq!(filtered_ks(&table, prefix).await, vec![1]);
+}
+
+#[tokio::test]
+async fn a_string_column_read_as_binary_answers_a_prefix_no_mapping() {
+    a_string_column_read_as_binary_answers_a_prefix(false).await;
+}
+
+#[tokio::test]
+async fn a_string_column_read_as_binary_answers_a_prefix_mapping() {
+    a_string_column_read_as_binary_answers_a_prefix(true).await;
+}
+
+async fn utf8_bytes_read_as_string(tmp: &TempDir, mapped: bool) -> Table {
+    let schema = schema_of(vec![
+        field(1, "k", PrimitiveType::Int),
+        field(2, "v", PrimitiveType::String),
+    ]);
+    let bytes: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+        Some([0xC3, 0xA9, 0x61].as_ref()),
+        Some(b"abc".as_ref()),
+        None,
+    ]));
+    table_with_file(
+        tmp,
+        schema,
+        |table| write_idless(table, three_rows(bytes)),
+        mapped,
+    )
+    .await
+}
+
+async fn a_binary_column_read_as_string_answers_a_negated_prefix(mapped: bool) -> Vec<i32> {
+    let tmp = TempDir::new().expect("temp dir");
+    let table = utf8_bytes_read_as_string(&tmp, mapped).await;
+    let negated = Reference::new("v").not_starts_with(Datum::string("a"));
+    filtered_ks(&table, negated).await
+}
+
+#[tokio::test]
+async fn a_binary_column_read_as_string_answers_a_negated_prefix_no_mapping() {
+    assert_eq!(
+        a_binary_column_read_as_string_answers_a_negated_prefix(false).await,
+        vec![1]
+    );
+}
+
+#[tokio::test]
+async fn a_binary_column_read_as_string_answers_a_negated_prefix_mapping() {
+    assert_eq!(
+        a_binary_column_read_as_string_answers_a_negated_prefix(true).await,
+        vec![1, 3]
+    );
+}
