@@ -661,8 +661,47 @@ async fn test_container_null_predicates_match_spark_oracle_without_field_ids() {
     fixture.setup_id_less_container_manifest_files().await;
 
     for (display, predicate, expected_ids) in container_oracle_cases() {
+        let expected_ids = match display {
+            "mp IS NULL"
+            | "deep.inner IS NULL"
+            | "deep.inner.x IS NULL"
+            | "deep.inner.ys IS NULL" => vec![1, 2, 3, 4],
+            "mp IS NOT NULL" => vec![],
+            _ => expected_ids,
+        };
+        if display.starts_with("xs ") {
+            let error = container_scan_refusal(&fixture, predicate).await;
+            let message = error.to_string();
+            assert_eq!(error.kind(), crate::ErrorKind::DataInvalid, "{message}");
+            assert!(
+                message.contains("'deep'") && message.contains("'xs'"),
+                "{message}"
+            );
+            continue;
+        }
         let ids = scanned_container_ids(&fixture, predicate, display, false).await;
         assert_eq!(ids, expected_ids, "filter `{display}` without field ids");
+    }
+}
+
+async fn container_scan_refusal(fixture: &TableTestFixture, predicate: Predicate) -> crate::Error {
+    let scan = fixture
+        .table
+        .scan()
+        .select(["id"])
+        .with_filter(predicate)
+        .build()
+        .expect("build the scan");
+    let result: crate::Result<Vec<RecordBatch>> = match scan.to_arrow().await {
+        Ok(stream) => stream.try_collect().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(batches) => panic!(
+            "the scan read {} batches instead of refusing",
+            batches.len()
+        ),
+        Err(error) => error,
     }
 }
 

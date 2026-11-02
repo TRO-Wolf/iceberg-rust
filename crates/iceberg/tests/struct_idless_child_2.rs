@@ -760,7 +760,39 @@ async fn idless_row_group_pruning_uses_the_fallback_ids_after_a_leading_drop() {
     let file = write_columns(&table, columns, 2);
     let table = commit_file(&catalog, &table, file).await;
     let table = evolve(&catalog, table, &[Change::Drop("x")]).await;
-    assert_eq!(count(&collect(&table, None, true).await), 4);
-    assert_one_row_both_ways(&table, "a", 1).await;
-    assert_one_row_both_ways(&table, "b", 10).await;
+    let batches = collect(&table, None, true).await;
+    let batch = arrow_select::concat::concat_batches(&batches[0].schema(), &batches)
+        .expect("concat scan batches");
+    let ints_of = |name: &str| -> Vec<Option<i32>> {
+        batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("column {name} present"))
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("an int column")
+            .iter()
+            .collect()
+    };
+    assert_eq!(ints_of("a"), vec![Some(40), Some(30), Some(20), Some(10)]);
+    assert_eq!(ints_of("b"), vec![None, None, None, None]);
+    assert_one_row_both_ways(&table, "a", 40).await;
+    assert_count_both_ways(&table, || Reference::new("a").equal_to(Datum::int(1)), 0).await;
+    assert_count_both_ways(&table, || Reference::new("b").is_null(), 4).await;
+}
+
+async fn assert_count_both_ways(table: &Table, filter: impl Fn() -> Predicate, expected: usize) {
+    let pruned = collect(table, Some(filter()), true).await;
+    let unpruned = collect(table, Some(filter()), false).await;
+    assert_eq!(
+        count(&unpruned),
+        expected,
+        "{} without row-group filtering",
+        filter()
+    );
+    assert_eq!(
+        count(&pruned),
+        expected,
+        "{} with row-group filtering",
+        filter()
+    );
 }

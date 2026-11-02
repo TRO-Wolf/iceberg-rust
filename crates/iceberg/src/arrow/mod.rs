@@ -41,6 +41,7 @@ mod field_id_stamping;
 mod field_id_stamping_tests;
 
 mod footer_cache;
+mod idless_read;
 pub use footer_cache::{ParquetFooterCache, ParquetFooterCacheStats, TableFooterCache};
 mod int96;
 pub(crate) mod null_propagation;

@@ -18,11 +18,22 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
+use arrow_cast::{CastOptions, cast, cast_with_options};
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 
+use crate::arrow::arrow_type_to_type;
 use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
-use crate::spec::{MappedField, NameMapping, NestedField, Schema, Type};
+use crate::arrow::row_filter_plan::top_level_ancestor_id;
+use crate::expr::{BoundPredicate, PredicateOperator};
+use crate::scan::FileScanTask;
+use crate::spec::{
+    MappedField, NameMapping, NestedField, PrimitiveType, Schema, Type, is_promotion_allowed,
+};
 use crate::{Error, ErrorKind, Result};
 
 enum Slot {
@@ -336,9 +347,309 @@ impl FallbackIds<'_> {
     }
 }
 
+fn nested_kind(data_type: &DataType) -> Option<&'static str> {
+    match data_type {
+        DataType::Struct(_) => Some("struct"),
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => Some("list"),
+        DataType::Map(_, _) => Some("map"),
+        _ => None,
+    }
+}
+
+fn is_timestamp(primitive: &PrimitiveType) -> bool {
+    matches!(
+        primitive,
+        PrimitiveType::Timestamp
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::TimestamptzNs
+    )
+}
+
+pub(crate) fn idless_read_allowed(
+    physical_type: PhysicalType,
+    file_type: &PrimitiveType,
+    table_type: &PrimitiveType,
+) -> bool {
+    match (file_type, table_type) {
+        (PrimitiveType::String, PrimitiveType::Binary)
+        | (PrimitiveType::Binary, PrimitiveType::String) => true,
+        (
+            PrimitiveType::Decimal {
+                scale: file_scale, ..
+            },
+            PrimitiveType::Decimal {
+                scale: table_scale, ..
+            },
+        ) => file_scale == table_scale,
+        (PrimitiveType::Timestamp | PrimitiveType::TimestampNs, PrimitiveType::Long) => {
+            physical_type == PhysicalType::INT96
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn type_promotion_is_valid(
+    file_type: Option<&PrimitiveType>,
+    projected_type: Option<&PrimitiveType>,
+) -> bool {
+    match (file_type, projected_type) {
+        (Some(lhs), Some(rhs)) if lhs == rhs => true,
+        (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
+        (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
+        (
+            Some(PrimitiveType::Decimal {
+                precision: file_precision,
+                scale: file_scale,
+            }),
+            Some(PrimitiveType::Decimal {
+                precision: requested_precision,
+                scale: requested_scale,
+            }),
+        ) if requested_precision >= file_precision && file_scale == requested_scale => true,
+        (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn idless_leaf_read_allowed(
+    (task_schema, parquet_schema, leaf): (&Schema, &SchemaDescriptor, usize),
+    file_field: &NestedField,
+    table_field: &NestedField,
+) -> bool {
+    if task_schema
+        .as_struct()
+        .field_by_id(table_field.id)
+        .is_none()
+    {
+        return false;
+    }
+    match (
+        file_field.field_type.as_primitive_type(),
+        table_field.field_type.as_primitive_type(),
+    ) {
+        (Some(file_type), Some(table_type)) => idless_read_allowed(
+            parquet_schema.column(leaf).physical_type(),
+            file_type,
+            table_type,
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn promote_array(array: &dyn arrow_array::Array, target: &DataType) -> Result<ArrayRef> {
+    let loud = matches!(
+        (array.data_type(), target),
+        (DataType::Decimal128(..), DataType::Decimal128(..))
+            | (
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            )
+    );
+    let cast = match loud {
+        true => cast_with_options(array, target, &CastOptions {
+            safe: false,
+            ..CastOptions::default()
+        }),
+        false => cast(array, target),
+    };
+    cast.map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "cannot read a data file column of type {} as {target}",
+                array.data_type()
+            ),
+        )
+        .with_source(e)
+    })
+}
+
+fn positional_type_change(
+    file_type: &DataType,
+    table_type: &Type,
+    physical_type: Option<PhysicalType>,
+) -> Option<String> {
+    match (nested_kind(file_type), table_type) {
+        (Some(kind), Type::Primitive(_)) => Some(kind.to_string()),
+        (Some("struct"), Type::Struct(_))
+        | (Some("list"), Type::List(_))
+        | (Some("map"), Type::Map(_))
+        | (Some(_), Type::Variant)
+        | (None, Type::Variant) => None,
+        (Some(kind), _) => Some(kind.to_string()),
+        (None, Type::Primitive(table_primitive)) => {
+            let Ok(Type::Primitive(file_primitive)) = arrow_type_to_type(file_type) else {
+                return None;
+            };
+            let as_one = physical_type.is_some_and(|physical_type| {
+                idless_read_allowed(physical_type, &file_primitive, table_primitive)
+            });
+            let readable = as_one
+                || is_promotion_allowed(&Type::Primitive(file_primitive.clone()), table_primitive)
+                || matches!(
+                    (&file_primitive, table_primitive),
+                    (PrimitiveType::Fixed(16), PrimitiveType::Uuid)
+                )
+                || (is_timestamp(&file_primitive) && is_timestamp(table_primitive));
+            (!readable).then(|| file_primitive.to_string())
+        }
+        (None, _) => Some(
+            arrow_type_to_type(file_type)
+                .map(|file_type| file_type.to_string())
+                .unwrap_or_else(|_| file_type.to_string()),
+        ),
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PositionalGuard {
+    pub(crate) read_ids: Vec<i32>,
+    pub(crate) filters: Vec<(i32, PredicateOperator)>,
+    pub(crate) physical_types: Vec<Option<PhysicalType>>,
+}
+
+fn collect_filters(predicate: &BoundPredicate, filters: &mut Vec<(i32, PredicateOperator)>) {
+    match predicate {
+        BoundPredicate::AlwaysTrue | BoundPredicate::AlwaysFalse => {}
+        BoundPredicate::And(expression) | BoundPredicate::Or(expression) => {
+            for input in expression.inputs() {
+                collect_filters(input, filters);
+            }
+        }
+        BoundPredicate::Not(expression) => {
+            for input in expression.inputs() {
+                collect_filters(input, filters);
+            }
+        }
+        BoundPredicate::Unary(expression) => {
+            filters.push((expression.term().field().id, expression.op()));
+        }
+        BoundPredicate::Binary(expression) => {
+            filters.push((expression.term().field().id, expression.op()));
+        }
+        BoundPredicate::Set(expression) => {
+            filters.push((expression.term().field().id, expression.op()));
+        }
+    }
+}
+
+fn answered_across_string_and_binary(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::IsNull
+            | PredicateOperator::NotNull
+            | PredicateOperator::NotEq
+            | PredicateOperator::StartsWith
+            | PredicateOperator::NotStartsWith
+    )
+}
+
+fn refuse_filter_across_string_and_binary(
+    position: usize,
+    field: &Field,
+    table_field: &NestedField,
+    ops: &[PredicateOperator],
+) -> Result<()> {
+    let (Ok(Type::Primitive(file_type)), Type::Primitive(table_type)) = (
+        arrow_type_to_type(field.data_type()),
+        table_field.field_type.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let across = matches!(
+        (&file_type, table_type),
+        (PrimitiveType::String, PrimitiveType::Binary)
+            | (PrimitiveType::Binary, PrimitiveType::String)
+    );
+    let Some(op) = ops
+        .iter()
+        .find(|op| across && !answered_across_string_and_binary(**op))
+    else {
+        return Ok(());
+    };
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "data file column '{}' at position {position} has type {file_type} and cannot be filtered with `{op}` as table field '{}' (id {}) of type {table_type}: the data file has no field ids and the table has no name mapping, so its columns are read by position",
+            field.name(),
+            table_field.name,
+            table_field.id,
+        ),
+    ))
+}
+
+pub(crate) fn positional_guard(
+    task: &FileScanTask,
+    parquet_metadata: &ParquetMetaData,
+) -> Result<PositionalGuard> {
+    let mut filters = Vec::new();
+    if let Some(predicate) = task.predicate.as_deref() {
+        collect_filters(predicate, &mut filters);
+    }
+    for delete in task.deletes.iter() {
+        filters.extend(
+            delete
+                .equality_ids
+                .iter()
+                .flatten()
+                .map(|id| (*id, PredicateOperator::Eq)),
+        );
+    }
+    let physical_types = parquet_metadata
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|field| field.is_primitive().then(|| field.get_physical_type()))
+        .collect();
+    Ok(PositionalGuard {
+        read_ids: task.project_field_ids().to_vec(),
+        filters,
+        physical_types,
+    })
+}
+
+fn refuse_positional_type_change(
+    position: usize,
+    field: &Field,
+    table_field: &NestedField,
+    table_schema: &Schema,
+    guard: &PositionalGuard,
+) -> Result<()> {
+    let lands = |id: &i32| top_level_ancestor_id(table_schema, *id) == Some(table_field.id);
+    let ops: Vec<PredicateOperator> = guard
+        .filters
+        .iter()
+        .filter(|(id, _)| lands(id))
+        .map(|(_, op)| *op)
+        .collect();
+    if ops.is_empty() && !guard.read_ids.iter().any(lands) {
+        return Ok(());
+    }
+    let physical_type = guard.physical_types.get(position).copied().flatten();
+    let Some(file_type) =
+        positional_type_change(field.data_type(), &table_field.field_type, physical_type)
+    else {
+        return refuse_filter_across_string_and_binary(position, field, table_field, &ops);
+    };
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "data file column '{}' at position {position} has type {file_type} and cannot be read as table field '{}' (id {}) of type {}: the data file has no field ids and the table has no name mapping, so its columns are read by position",
+            field.name(),
+            table_field.name,
+            table_field.id,
+            table_field.field_type,
+        ),
+    ))
+}
+
 pub(crate) fn add_fallback_field_ids_to_arrow_schema(
     arrow_schema: &ArrowSchemaRef,
     table_schema: &Schema,
+    guard: &PositionalGuard,
 ) -> Result<ArrowSchemaRef> {
     let too_many = || {
         Error::new(
@@ -346,18 +657,23 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
             "file schema has too many top-level fields for fallback field ids",
         )
     };
-    let table_top_level_fields = table_schema.as_struct().fields();
-    let matches: Vec<Option<&NestedField>> = arrow_schema
-        .fields()
+    let positional_ids = (1..=arrow_schema.fields().len())
+        .map(|id| i32::try_from(id).map_err(|_| too_many()))
+        .collect::<Result<Vec<_>>>()?;
+    let matches: Vec<Option<&NestedField>> = positional_ids
         .iter()
-        .enumerate()
-        .map(|(pos, field)| {
-            table_top_level_fields
-                .get(pos)
-                .filter(|table_field| field.name() == table_field.name.as_str())
+        .map(|id| {
+            table_schema
+                .as_struct()
+                .field_by_id(*id)
                 .map(|table_field| table_field.as_ref())
         })
         .collect();
+    for (pos, (field, table_field)) in arrow_schema.fields().iter().zip(&matches).enumerate() {
+        if let Some(table_field) = table_field {
+            refuse_positional_type_change(pos, field, table_field, table_schema, guard)?;
+        }
+    }
     let mut claimed = HashSet::new();
     for (field, table_field) in arrow_schema.fields().iter().zip(&matches) {
         if let Some(table_field) = table_field {
@@ -369,18 +685,18 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
         claimed,
     };
     let mut fields = Vec::with_capacity(arrow_schema.fields().len());
-    for (pos, (field, table_field)) in arrow_schema.fields().iter().zip(&matches).enumerate() {
+    for ((field, table_field), field_id) in arrow_schema
+        .fields()
+        .iter()
+        .zip(&matches)
+        .zip(positional_ids)
+    {
         let stamped = match table_field {
             Some(table_field) => {
                 ids.stamp_children(field, table_field.id, Some(table_field), true, 0)?
             }
-            None => {
-                let counter = i32::try_from(pos + 1).map_err(|_| too_many())?;
-                match ids.claim(counter) {
-                    Some(field_id) => ids.stamp_children(field, field_id, None, false, 0)?,
-                    None => field.as_ref().clone(),
-                }
-            }
+            None if table_schema.field_by_id(field_id).is_some() => field.as_ref().clone(),
+            None => ids.stamp_children(field, field_id, None, false, 0)?,
         };
         fields.push(stamped);
     }

@@ -845,6 +845,7 @@ fn children_the_reader_left_unstamped_fill_null() {
     let stamped = crate::arrow::field_id_stamping::add_fallback_field_ids_to_arrow_schema(
         &file_schema,
         &table_schema,
+        &crate::arrow::field_id_stamping::PositionalGuard::default(),
     )
     .unwrap();
     let source = stamped.field(1).data_type().clone();

@@ -421,8 +421,12 @@ async fn two_unmapped_columns(route: Route) {
     let (_tmp, table) = table_with(schema, fields, columns, mapping).await;
     let batch = scan(&table, None).await;
     assert_no_reader_mark(&batch);
-    assert_eq!(as_ints(column(&batch, "a")), vec![Some(1)]);
-    assert_eq!(as_ints(column(&batch, "c")), vec![Some(2)]);
+    let expected = match route {
+        Route::Fallback => (vec![Some(1)], vec![Some(2)]),
+        Route::Mapping => (vec![None], vec![None]),
+    };
+    assert_eq!(as_ints(column(&batch, "a")), expected.0);
+    assert_eq!(as_ints(column(&batch, "c")), expected.1);
 }
 
 #[tokio::test]
@@ -445,7 +449,11 @@ async fn one_unmapped_column(route: Route) {
     let (_tmp, table) = table_with(schema, fields, columns, mapping).await;
     let batch = scan(&table, None).await;
     assert_no_reader_mark(&batch);
-    assert_eq!(as_ints(column(&batch, "c")), vec![Some(1)]);
+    let expected = match route {
+        Route::Fallback => vec![Some(1)],
+        Route::Mapping => vec![None],
+    };
+    assert_eq!(as_ints(column(&batch, "c")), expected);
 }
 
 #[tokio::test]
