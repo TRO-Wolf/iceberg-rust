@@ -365,7 +365,12 @@ fn is_timestamp(primitive: &PrimitiveType) -> bool {
 fn positional_type_change(file_type: &DataType, table_type: &Type) -> Option<String> {
     match (nested_kind(file_type), table_type) {
         (Some(kind), Type::Primitive(_)) => Some(kind.to_string()),
-        (Some(_), _) | (None, Type::Variant) => None,
+        (Some("struct"), Type::Struct(_))
+        | (Some("list"), Type::List(_))
+        | (Some("map"), Type::Map(_))
+        | (Some(_), Type::Variant)
+        | (None, Type::Variant) => None,
+        (Some(kind), _) => Some(kind.to_string()),
         (None, Type::Primitive(table_primitive)) => {
             let Ok(Type::Primitive(file_primitive)) = arrow_type_to_type(file_type) else {
                 return None;
@@ -393,6 +398,9 @@ pub(crate) fn guarded_field_ids(task: &FileScanTask) -> Result<Vec<i32>> {
         let mut collector = CollectFieldIdVisitor::default();
         visit(&mut collector, predicate)?;
         field_ids.extend(collector.field_ids());
+    }
+    for delete in task.deletes.iter() {
+        field_ids.extend(delete.equality_ids.iter().flatten().copied());
     }
     Ok(field_ids)
 }
