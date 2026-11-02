@@ -186,6 +186,15 @@ fn fallback_keeps_the_top_level_counter_and_name_match() {
 }
 
 #[test]
+fn fallback_stamps_position_plus_one_where_name_and_position_match_another_id() {
+    let file = file_schema(vec![file_int("a"), file_int("b")]);
+    let schema = table(vec![int_field(5, "a"), int_field(6, "b")]);
+    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema).expect("stamp ids");
+    assert_eq!(id_of(field_at(&stamped, &["a"])), Some(1));
+    assert_eq!(id_of(field_at(&stamped, &["b"])), Some(2));
+}
+
+#[test]
 fn fallback_stamps_a_nested_child_by_name_at_any_position() {
     let file = file_schema(vec![
         Field::new("id", DataType::Int32, false),
