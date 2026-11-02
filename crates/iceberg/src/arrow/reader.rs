@@ -487,7 +487,6 @@ impl ArrowReader {
         // | 2 | a name mapping exists | `applyNameMapping()` then `pruneColumns()` |
         // | 3 | neither | `addFallbackIds()` then `pruneColumnsFallback()` |
         let arrow_metadata = if missing_field_ids {
-            // The file has no field ids, so assign them before the read.
             let arrow_schema = if let Some(name_mapping) = &task.name_mapping {
                 // Branch 2: Java `ParquetSchemaUtil.applyNameMapping()`.
                 apply_name_mapping_to_arrow_schema(
@@ -499,6 +498,7 @@ impl ArrowReader {
                 add_fallback_field_ids_to_arrow_schema(
                     arrow_metadata.schema(),
                     task.schema.as_ref(),
+                    task.project_field_ids(),
                 )?
             };
 

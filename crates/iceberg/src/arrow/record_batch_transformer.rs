@@ -574,11 +574,7 @@ impl RecordBatchTransformer {
             // projected order. The fast paths relabel or pass columns through BY POSITION, which
             // hands back the wrong column under a field's name. Force the `Modify` path, which
             // sources each output column by field id.
-            if let (Some(source_id), Some(target_id)) = (
-                Self::field_id_of(source_field),
-                Self::field_id_of(target_field),
-            ) && source_id != target_id
-            {
+            if Self::field_id_of(source_field) != Self::field_id_of(target_field) {
                 return SchemaComparison::Different;
             }
 

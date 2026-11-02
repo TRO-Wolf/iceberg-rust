@@ -21,8 +21,12 @@ use std::sync::Arc;
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use crate::arrow::arrow_type_to_type;
 use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
-use crate::spec::{MappedField, NameMapping, NestedField, Schema, Type};
+use crate::arrow::row_filter_plan::top_level_ancestor_id;
+use crate::spec::{
+    MappedField, NameMapping, NestedField, PrimitiveType, Schema, Type, is_promotion_allowed,
+};
 use crate::{Error, ErrorKind, Result};
 
 enum Slot {
@@ -336,9 +340,82 @@ impl FallbackIds<'_> {
     }
 }
 
+fn nested_kind(data_type: &DataType) -> Option<&'static str> {
+    match data_type {
+        DataType::Struct(_) => Some("struct"),
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => Some("list"),
+        DataType::Map(_, _) => Some("map"),
+        _ => None,
+    }
+}
+
+fn is_timestamp(primitive: &PrimitiveType) -> bool {
+    matches!(
+        primitive,
+        PrimitiveType::Timestamp
+            | PrimitiveType::Timestamptz
+            | PrimitiveType::TimestampNs
+            | PrimitiveType::TimestamptzNs
+    )
+}
+
+fn positional_type_change(file_type: &DataType, table_type: &Type) -> Option<String> {
+    match (nested_kind(file_type), table_type) {
+        (Some(kind), Type::Primitive(_)) => Some(kind.to_string()),
+        (Some(_), _) | (None, Type::Variant) => None,
+        (None, Type::Primitive(table_primitive)) => {
+            let Ok(Type::Primitive(file_primitive)) = arrow_type_to_type(file_type) else {
+                return None;
+            };
+            let readable =
+                is_promotion_allowed(&Type::Primitive(file_primitive.clone()), table_primitive)
+                    || matches!(
+                        (&file_primitive, table_primitive),
+                        (PrimitiveType::Fixed(16), PrimitiveType::Uuid)
+                    )
+                    || (is_timestamp(&file_primitive) && is_timestamp(table_primitive));
+            (!readable).then(|| file_primitive.to_string())
+        }
+        (None, _) => Some(
+            arrow_type_to_type(file_type)
+                .map(|file_type| file_type.to_string())
+                .unwrap_or_else(|_| file_type.to_string()),
+        ),
+    }
+}
+
+fn refuse_positional_type_change(
+    position: usize,
+    field: &Field,
+    table_field: &NestedField,
+    table_schema: &Schema,
+    projected_field_ids: &[i32],
+) -> Result<()> {
+    let projected = projected_field_ids
+        .iter()
+        .any(|id| top_level_ancestor_id(table_schema, *id) == Some(table_field.id));
+    if !projected {
+        return Ok(());
+    }
+    let Some(file_type) = positional_type_change(field.data_type(), &table_field.field_type) else {
+        return Ok(());
+    };
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "data file column '{}' at position {position} has type {file_type} and cannot be read as table field '{}' (id {}) of type {}: the data file has no field ids and the table has no name mapping, so its columns are read by position",
+            field.name(),
+            table_field.name,
+            table_field.id,
+            table_field.field_type,
+        ),
+    ))
+}
+
 pub(crate) fn add_fallback_field_ids_to_arrow_schema(
     arrow_schema: &ArrowSchemaRef,
     table_schema: &Schema,
+    projected_field_ids: &[i32],
 ) -> Result<ArrowSchemaRef> {
     let too_many = || {
         Error::new(
@@ -346,18 +423,29 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
             "file schema has too many top-level fields for fallback field ids",
         )
     };
-    let table_top_level_fields = table_schema.as_struct().fields();
-    let matches: Vec<Option<&NestedField>> = arrow_schema
-        .fields()
+    let positional_ids = (1..=arrow_schema.fields().len())
+        .map(|id| i32::try_from(id).map_err(|_| too_many()))
+        .collect::<Result<Vec<_>>>()?;
+    let matches: Vec<Option<&NestedField>> = positional_ids
         .iter()
-        .enumerate()
-        .map(|(pos, field)| {
-            table_top_level_fields
-                .get(pos)
-                .filter(|table_field| field.name() == table_field.name.as_str())
+        .map(|id| {
+            table_schema
+                .as_struct()
+                .field_by_id(*id)
                 .map(|table_field| table_field.as_ref())
         })
         .collect();
+    for (pos, (field, table_field)) in arrow_schema.fields().iter().zip(&matches).enumerate() {
+        if let Some(table_field) = table_field {
+            refuse_positional_type_change(
+                pos,
+                field,
+                table_field,
+                table_schema,
+                projected_field_ids,
+            )?;
+        }
+    }
     let mut claimed = HashSet::new();
     for (field, table_field) in arrow_schema.fields().iter().zip(&matches) {
         if let Some(table_field) = table_field {
@@ -369,18 +457,18 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
         claimed,
     };
     let mut fields = Vec::with_capacity(arrow_schema.fields().len());
-    for (pos, (field, table_field)) in arrow_schema.fields().iter().zip(&matches).enumerate() {
+    for ((field, table_field), field_id) in arrow_schema
+        .fields()
+        .iter()
+        .zip(&matches)
+        .zip(positional_ids)
+    {
         let stamped = match table_field {
             Some(table_field) => {
                 ids.stamp_children(field, table_field.id, Some(table_field), true, 0)?
             }
-            None => {
-                let counter = i32::try_from(pos + 1).map_err(|_| too_many())?;
-                match ids.claim(counter) {
-                    Some(field_id) => ids.stamp_children(field, field_id, None, false, 0)?,
-                    None => field.as_ref().clone(),
-                }
-            }
+            None if table_schema.field_by_id(field_id).is_some() => field.as_ref().clone(),
+            None => ids.stamp_children(field, field_id, None, false, 0)?,
         };
         fields.push(stamped);
     }
