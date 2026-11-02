@@ -48,7 +48,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::equality_delete_set::{EqDeleteKeySet, eq_delete_key_fields_projected};
 use crate::arrow::field_id_stamping::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema, file_has_field_ids,
-    stamped_field_id_map,
+    guarded_field_ids, stamped_field_id_map,
 };
 use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
@@ -498,7 +498,7 @@ impl ArrowReader {
                 add_fallback_field_ids_to_arrow_schema(
                     arrow_metadata.schema(),
                     task.schema.as_ref(),
-                    task.project_field_ids(),
+                    &guarded_field_ids(&task)?,
                 )?
             };
 

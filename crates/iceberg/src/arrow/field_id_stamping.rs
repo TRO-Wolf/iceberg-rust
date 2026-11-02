@@ -23,7 +23,10 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::arrow_type_to_type;
 use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
+use crate::arrow::reader::CollectFieldIdVisitor;
 use crate::arrow::row_filter_plan::top_level_ancestor_id;
+use crate::expr::visitors::bound_predicate_visitor::visit;
+use crate::scan::FileScanTask;
 use crate::spec::{
     MappedField, NameMapping, NestedField, PrimitiveType, Schema, Type, is_promotion_allowed,
 };
@@ -384,17 +387,27 @@ fn positional_type_change(file_type: &DataType, table_type: &Type) -> Option<Str
     }
 }
 
+pub(crate) fn guarded_field_ids(task: &FileScanTask) -> Result<Vec<i32>> {
+    let mut field_ids = task.project_field_ids().to_vec();
+    if let Some(predicate) = task.predicate.as_deref() {
+        let mut collector = CollectFieldIdVisitor::default();
+        visit(&mut collector, predicate)?;
+        field_ids.extend(collector.field_ids());
+    }
+    Ok(field_ids)
+}
+
 fn refuse_positional_type_change(
     position: usize,
     field: &Field,
     table_field: &NestedField,
     table_schema: &Schema,
-    projected_field_ids: &[i32],
+    guarded_field_ids: &[i32],
 ) -> Result<()> {
-    let projected = projected_field_ids
+    let guarded = guarded_field_ids
         .iter()
         .any(|id| top_level_ancestor_id(table_schema, *id) == Some(table_field.id));
-    if !projected {
+    if !guarded {
         return Ok(());
     }
     let Some(file_type) = positional_type_change(field.data_type(), &table_field.field_type) else {
@@ -415,7 +428,7 @@ fn refuse_positional_type_change(
 pub(crate) fn add_fallback_field_ids_to_arrow_schema(
     arrow_schema: &ArrowSchemaRef,
     table_schema: &Schema,
-    projected_field_ids: &[i32],
+    guarded_field_ids: &[i32],
 ) -> Result<ArrowSchemaRef> {
     let too_many = || {
         Error::new(
@@ -442,7 +455,7 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
                 field,
                 table_field,
                 table_schema,
-                projected_field_ids,
+                guarded_field_ids,
             )?;
         }
     }
