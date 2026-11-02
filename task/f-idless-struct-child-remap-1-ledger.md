@@ -21,6 +21,8 @@
 
 **Errata (2026-11-01).** S-26's mapping-route sentence ("The mapping route reads NULL, which is correct") is superseded by F-NAME-MAPPING-SCHEMA-UPDATE-1 (branch `fix/name-mapping-schema-update-1`, ledger `task/f-name-mapping-schema-update-1-ledger.md`). A schema update now rewrites `schema.name-mapping.default` as Java's `SchemaUpdate.commit` does, so a child dropped and re-added by name moves to the new field id on the mapping route and reads its old value under the re-added field (`{a: 1, b: 2}`). That is Spark 4.1.2's answer (`[(1, {a: 1, b: 2}, 5)]`), not NULL. The no-mapping route and the rest of S-26 stand.
 
+**Errata (2026-11-02).** S-20's top-level shapes and the top-level half of S-26 are closed by F-IDLESS-TOPLEVEL-POSITIONAL-1 (branch `fix/idless-toplevel-positional-1`, ledger `task/f-idless-toplevel-positional-1-ledger.md`). On the no-mapping route a top-level positional read into another type or another nesting kind now refuses with `DataInvalid`, where the base cast it silently, and an unmapped top-level column under a partial mapping reads NULL, where the base read it by position. A dropped and re-added top-level name reads NULL, Spark's answer (`[(1, None)]`), where the base read the old value. A same-type positional read keeps Java's positional answer and is pinned as a control. The nested half of S-26 stands as the ruled divergence: a child dropped and re-added by name under a struct, on the no-mapping route, reads its old value.
+
 **Date:** 2026-11-01. **Base:** fork `main` `14a93602`. **Branch:**
 `fix/idless-struct-child-remap-1`. Commits: `51f39a29` (item 1, fix),
 `8a66aa7c` (item 2, pins), `bc6a2e67` (item 3, this ledger's first records
