@@ -22,8 +22,8 @@ use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as 
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::field_id_stamping::{
-    add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema, file_has_field_ids,
-    stamped_field_id_map,
+    PositionalGuard, add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
+    file_has_field_ids, stamped_field_id_map,
 };
 use crate::spec::{
     ListType, MapType, MappedField, NameMapping, NestedField, PrimitiveType, Schema, StructType,
@@ -168,7 +168,9 @@ fn fallback_matches_a_list_element_structurally() {
             }),
         ),
     ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["l", "item"])), Some(6));
     assert_eq!(id_of(field_at(&stamped, &["l", "item", "d"])), Some(8));
 }
@@ -180,7 +182,9 @@ fn fallback_keeps_the_top_level_counter_and_name_match() {
         Field::new("renamed", DataType::Int32, true),
     ]);
     let schema = table(vec![int_field(1, "a"), int_field(2, "b")]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["a"])), Some(1));
     assert_eq!(id_of(field_at(&stamped, &["renamed"])), Some(2));
 }
@@ -189,7 +193,9 @@ fn fallback_keeps_the_top_level_counter_and_name_match() {
 fn fallback_stamps_position_plus_one_where_name_and_position_match_another_id() {
     let file = file_schema(vec![file_int("a"), file_int("b")]);
     let schema = table(vec![int_field(5, "a"), int_field(6, "b")]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["a"])), Some(1));
     assert_eq!(id_of(field_at(&stamped, &["b"])), Some(2));
 }
@@ -208,7 +214,9 @@ fn fallback_stamps_a_nested_child_by_name_at_any_position() {
             struct_of(vec![int_field(7, "d"), int_field(9, "e")]),
         ),
     ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["id"])), Some(1));
     assert_eq!(id_of(field_at(&stamped, &["s"])), Some(2));
     assert_eq!(id_of(field_at(&stamped, &["s", "d"])), Some(7));
@@ -236,7 +244,9 @@ fn fallback_leaves_an_unmatched_nested_child_and_its_subtree_without_an_id() {
             )]),
         ),
     ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["s", "t"])), Some(3));
     assert_eq!(id_of(field_at(&stamped, &["s", "t", "d"])), None);
     assert_eq!(id_of(field_at(&stamped, &["s", "x"])), None);
@@ -255,7 +265,9 @@ fn fallback_never_stamps_a_nested_child_from_a_counter() {
         NestedField::optional(2, "s", struct_of(vec![int_field(4, "a")])),
         NestedField::optional(3, "t", struct_of(vec![int_field(5, "b")])),
     ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["s", "x"])), None);
     assert_eq!(id_of(field_at(&stamped, &["s", "y"])), None);
     assert_eq!(id_of(field_at(&stamped, &["t", "b"])), Some(5));
@@ -275,7 +287,9 @@ fn fallback_top_level_counter_field_stamps_its_children_by_name() {
             struct_of(vec![int_field(3, "d"), int_field(4, "e")]),
         ),
     ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     assert_eq!(id_of(field_at(&stamped, &["renamed"])), Some(2));
     assert_eq!(id_of(field_at(&stamped, &["renamed", "d"])), Some(3));
     assert_eq!(id_of(field_at(&stamped, &["renamed", "e"])), Some(4));
@@ -313,7 +327,9 @@ fn fallback_matches_map_key_and_value_and_their_children_by_name() {
             }),
         ),
     ]);
-    let stamped = add_fallback_field_ids_to_arrow_schema(&file, &schema, &[]).expect("stamp ids");
+    let stamped =
+        add_fallback_field_ids_to_arrow_schema(&file, &schema, &PositionalGuard::default())
+            .expect("stamp ids");
     let DataType::Map(entries, _) = field_at(&stamped, &["m"]).data_type() else {
         panic!("m is a map");
     };
@@ -352,7 +368,7 @@ fn stamped_field_id_map_indexes_stamped_leaves_at_every_depth() {
     let fallback = add_fallback_field_ids_to_arrow_schema(
         &file_schema(vec![file_int("a"), file_int("b")]),
         &table(vec![int_field(2, "a"), int_field(3, "b")]),
-        &[],
+        &PositionalGuard::default(),
     )
     .expect("stamp ids");
     let map = stamped_field_id_map(&fallback);
@@ -389,8 +405,12 @@ fn stamping_never_overwrites_an_embedded_nested_id() {
             struct_of(vec![int_field(3, "e"), int_field(4, "d")]),
         ),
     ]);
-    let fallback = add_fallback_field_ids_to_arrow_schema(&embedded_ids_file(), &schema, &[])
-        .expect("stamp ids");
+    let fallback = add_fallback_field_ids_to_arrow_schema(
+        &embedded_ids_file(),
+        &schema,
+        &PositionalGuard::default(),
+    )
+    .expect("stamp ids");
     let mapping = NameMapping::new(vec![
         mapped(1, "x", vec![]),
         mapped(2, "s", vec![mapped(3, "e", vec![]), mapped(4, "d", vec![])]),

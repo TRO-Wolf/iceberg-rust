@@ -48,7 +48,7 @@ use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::equality_delete_set::{EqDeleteKeySet, eq_delete_key_fields_projected};
 use crate::arrow::field_id_stamping::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema, file_has_field_ids,
-    guarded_field_ids, stamped_field_id_map,
+    idless_leaf_read_allowed, positional_guard, stamped_field_id_map, type_promotion_is_valid,
 };
 use crate::arrow::footer_cache::TableFooterCache;
 use crate::arrow::int96::coerce_int96_timestamps;
@@ -498,7 +498,7 @@ impl ArrowReader {
                 add_fallback_field_ids_to_arrow_schema(
                     arrow_metadata.schema(),
                     task.schema.as_ref(),
-                    &guarded_field_ids(&task)?,
+                    &positional_guard(&task, arrow_metadata.metadata())?,
                 )?
             };
 
@@ -1278,30 +1278,6 @@ impl ArrowReader {
         arrow_schema: &ArrowSchemaRef,
         missing_field_ids: bool,
     ) -> Result<ProjectionMask> {
-        fn type_promotion_is_valid(
-            file_type: Option<&PrimitiveType>,
-            projected_type: Option<&PrimitiveType>,
-        ) -> bool {
-            match (file_type, projected_type) {
-                (Some(lhs), Some(rhs)) if lhs == rhs => true,
-                (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
-                (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
-                (
-                    Some(PrimitiveType::Decimal {
-                        precision: file_precision,
-                        scale: file_scale,
-                    }),
-                    Some(PrimitiveType::Decimal {
-                        precision: requested_precision,
-                        scale: requested_scale,
-                    }),
-                ) if requested_precision >= file_precision && file_scale == requested_scale => true,
-                // Uuid will be store as Fixed(16) in parquet file, so the read back type will be Fixed(16).
-                (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
-                _ => false,
-            }
-        }
-
         if field_ids.is_empty() {
             return Ok(ProjectionMask::leaves(parquet_schema, []));
         }
@@ -1376,7 +1352,13 @@ impl ArrowReader {
             if !type_promotion_is_valid(
                 parquet_iceberg_field.field_type.as_primitive_type(),
                 iceberg_field.field_type.as_primitive_type(),
-            ) {
+            ) && !(missing_field_ids
+                && idless_leaf_read_allowed(
+                    (iceberg_schema_of_task, parquet_schema, idx),
+                    parquet_iceberg_field,
+                    &iceberg_field,
+                ))
+            {
                 if missing_field_ids
                     && incompatible.is_none()
                     && top_level_ancestor_id(iceberg_schema_of_task, field_id) != Some(field_id)

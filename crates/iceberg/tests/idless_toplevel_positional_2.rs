@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, ListArray, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, BinaryArray, Decimal128Array, Int32Array, Int64Array, LargeBinaryArray,
+    ListArray, RecordBatch, StringArray, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_schema::{Field, Fields, Schema as ArrowSchema};
@@ -468,7 +468,7 @@ async fn a_positional_string_column_landing_on_a_binary_field_reads_its_bytes() 
         .column_by_name("v")
         .expect("v present")
         .as_any()
-        .downcast_ref::<BinaryArray>()
+        .downcast_ref::<LargeBinaryArray>()
         .expect("v reads as binary");
     assert_eq!(v.value(0), b"abc");
     assert_eq!(

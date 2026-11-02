@@ -19,12 +19,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array as ArrowArray, Int64Array, RecordBatch, RecordBatchOptions};
-use arrow_cast::cast;
 use arrow_schema::{
     DataType, Field, FieldRef, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef, SchemaRef,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
+use crate::arrow::field_id_stamping::promote_array;
 use crate::arrow::nested_projection::{
     NestedProjectionPlan, create_constant_column, nested_projection_applies,
 };
@@ -860,7 +860,7 @@ impl RecordBatchTransformer {
                     ColumnSource::Promote {
                         target_type,
                         source_index,
-                    } => cast(&*columns[*source_index], target_type)?,
+                    } => promote_array(&*columns[*source_index], target_type)?,
 
                     ColumnSource::NestedProject(plan, source_index) => {
                         plan.apply(columns[*source_index].clone())?

@@ -18,8 +18,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow_array::ArrayRef;
+use arrow_cast::{CastOptions, cast, cast_with_options};
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 
 use crate::arrow::arrow_type_to_type;
 use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
@@ -362,7 +367,111 @@ fn is_timestamp(primitive: &PrimitiveType) -> bool {
     )
 }
 
-fn positional_type_change(file_type: &DataType, table_type: &Type) -> Option<String> {
+pub(crate) fn idless_read_allowed(
+    physical_type: PhysicalType,
+    file_type: &PrimitiveType,
+    table_type: &PrimitiveType,
+) -> bool {
+    match (file_type, table_type) {
+        (PrimitiveType::String, PrimitiveType::Binary)
+        | (PrimitiveType::Binary, PrimitiveType::String) => true,
+        (
+            PrimitiveType::Decimal {
+                scale: file_scale, ..
+            },
+            PrimitiveType::Decimal {
+                scale: table_scale, ..
+            },
+        ) => file_scale == table_scale,
+        (PrimitiveType::Timestamp | PrimitiveType::TimestampNs, PrimitiveType::Long) => {
+            physical_type == PhysicalType::INT96
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn type_promotion_is_valid(
+    file_type: Option<&PrimitiveType>,
+    projected_type: Option<&PrimitiveType>,
+) -> bool {
+    match (file_type, projected_type) {
+        (Some(lhs), Some(rhs)) if lhs == rhs => true,
+        (Some(PrimitiveType::Int), Some(PrimitiveType::Long)) => true,
+        (Some(PrimitiveType::Float), Some(PrimitiveType::Double)) => true,
+        (
+            Some(PrimitiveType::Decimal {
+                precision: file_precision,
+                scale: file_scale,
+            }),
+            Some(PrimitiveType::Decimal {
+                precision: requested_precision,
+                scale: requested_scale,
+            }),
+        ) if requested_precision >= file_precision && file_scale == requested_scale => true,
+        (Some(PrimitiveType::Fixed(16)), Some(PrimitiveType::Uuid)) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn idless_leaf_read_allowed(
+    (task_schema, parquet_schema, leaf): (&Schema, &SchemaDescriptor, usize),
+    file_field: &NestedField,
+    table_field: &NestedField,
+) -> bool {
+    if task_schema
+        .as_struct()
+        .field_by_id(table_field.id)
+        .is_none()
+    {
+        return false;
+    }
+    match (
+        file_field.field_type.as_primitive_type(),
+        table_field.field_type.as_primitive_type(),
+    ) {
+        (Some(file_type), Some(table_type)) => idless_read_allowed(
+            parquet_schema.column(leaf).physical_type(),
+            file_type,
+            table_type,
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) fn promote_array(array: &dyn arrow_array::Array, target: &DataType) -> Result<ArrayRef> {
+    let loud = matches!(
+        (array.data_type(), target),
+        (DataType::Decimal128(..), DataType::Decimal128(..))
+            | (
+                DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            )
+    );
+    let cast = match loud {
+        true => cast_with_options(array, target, &CastOptions {
+            safe: false,
+            ..CastOptions::default()
+        }),
+        false => cast(array, target),
+    };
+    cast.map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "cannot read a data file column of type {} as {target}",
+                array.data_type()
+            ),
+        )
+        .with_source(e)
+    })
+}
+
+fn positional_type_change(
+    file_type: &DataType,
+    table_type: &Type,
+    physical_type: Option<PhysicalType>,
+    filtered: bool,
+) -> Option<String> {
     match (nested_kind(file_type), table_type) {
         (Some(kind), Type::Primitive(_)) => Some(kind.to_string()),
         (Some("struct"), Type::Struct(_))
@@ -375,13 +484,16 @@ fn positional_type_change(file_type: &DataType, table_type: &Type) -> Option<Str
             let Ok(Type::Primitive(file_primitive)) = arrow_type_to_type(file_type) else {
                 return None;
             };
-            let readable =
-                is_promotion_allowed(&Type::Primitive(file_primitive.clone()), table_primitive)
-                    || matches!(
-                        (&file_primitive, table_primitive),
-                        (PrimitiveType::Fixed(16), PrimitiveType::Uuid)
-                    )
-                    || (is_timestamp(&file_primitive) && is_timestamp(table_primitive));
+            let as_one = physical_type.is_some_and(|physical_type| {
+                idless_read_allowed(physical_type, &file_primitive, table_primitive)
+            }) && !(filtered && file_primitive == PrimitiveType::Binary);
+            let readable = as_one
+                || is_promotion_allowed(&Type::Primitive(file_primitive.clone()), table_primitive)
+                || matches!(
+                    (&file_primitive, table_primitive),
+                    (PrimitiveType::Fixed(16), PrimitiveType::Uuid)
+                )
+                || (is_timestamp(&file_primitive) && is_timestamp(table_primitive));
             (!readable).then(|| file_primitive.to_string())
         }
         (None, _) => Some(
@@ -392,17 +504,39 @@ fn positional_type_change(file_type: &DataType, table_type: &Type) -> Option<Str
     }
 }
 
-pub(crate) fn guarded_field_ids(task: &FileScanTask) -> Result<Vec<i32>> {
-    let mut field_ids = task.project_field_ids().to_vec();
+#[derive(Default)]
+pub(crate) struct PositionalGuard {
+    pub(crate) read_ids: Vec<i32>,
+    pub(crate) filter_ids: Vec<i32>,
+    pub(crate) physical_types: Vec<Option<PhysicalType>>,
+}
+
+pub(crate) fn positional_guard(
+    task: &FileScanTask,
+    parquet_metadata: &ParquetMetaData,
+) -> Result<PositionalGuard> {
+    let mut filter_ids = Vec::new();
     if let Some(predicate) = task.predicate.as_deref() {
         let mut collector = CollectFieldIdVisitor::default();
         visit(&mut collector, predicate)?;
-        field_ids.extend(collector.field_ids());
+        filter_ids.extend(collector.field_ids());
     }
     for delete in task.deletes.iter() {
-        field_ids.extend(delete.equality_ids.iter().flatten().copied());
+        filter_ids.extend(delete.equality_ids.iter().flatten().copied());
     }
-    Ok(field_ids)
+    let physical_types = parquet_metadata
+        .file_metadata()
+        .schema_descr()
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|field| field.is_primitive().then(|| field.get_physical_type()))
+        .collect();
+    Ok(PositionalGuard {
+        read_ids: task.project_field_ids().to_vec(),
+        filter_ids,
+        physical_types,
+    })
 }
 
 fn refuse_positional_type_change(
@@ -410,15 +544,23 @@ fn refuse_positional_type_change(
     field: &Field,
     table_field: &NestedField,
     table_schema: &Schema,
-    guarded_field_ids: &[i32],
+    guard: &PositionalGuard,
 ) -> Result<()> {
-    let guarded = guarded_field_ids
-        .iter()
-        .any(|id| top_level_ancestor_id(table_schema, *id) == Some(table_field.id));
-    if !guarded {
+    let lands = |ids: &[i32]| {
+        ids.iter()
+            .any(|id| top_level_ancestor_id(table_schema, *id) == Some(table_field.id))
+    };
+    let filtered = lands(&guard.filter_ids);
+    if !filtered && !lands(&guard.read_ids) {
         return Ok(());
     }
-    let Some(file_type) = positional_type_change(field.data_type(), &table_field.field_type) else {
+    let physical_type = guard.physical_types.get(position).copied().flatten();
+    let Some(file_type) = positional_type_change(
+        field.data_type(),
+        &table_field.field_type,
+        physical_type,
+        filtered,
+    ) else {
         return Ok(());
     };
     Err(Error::new(
@@ -436,7 +578,7 @@ fn refuse_positional_type_change(
 pub(crate) fn add_fallback_field_ids_to_arrow_schema(
     arrow_schema: &ArrowSchemaRef,
     table_schema: &Schema,
-    guarded_field_ids: &[i32],
+    guard: &PositionalGuard,
 ) -> Result<ArrowSchemaRef> {
     let too_many = || {
         Error::new(
@@ -458,13 +600,7 @@ pub(crate) fn add_fallback_field_ids_to_arrow_schema(
         .collect();
     for (pos, (field, table_field)) in arrow_schema.fields().iter().zip(&matches).enumerate() {
         if let Some(table_field) = table_field {
-            refuse_positional_type_change(
-                pos,
-                field,
-                table_field,
-                table_schema,
-                guarded_field_ids,
-            )?;
+            refuse_positional_type_change(pos, field, table_field, table_schema, guard)?;
         }
     }
     let mut claimed = HashSet::new();
