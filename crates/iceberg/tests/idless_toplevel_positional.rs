@@ -18,19 +18,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow_array::builder::{Int32Builder, MapBuilder, StringBuilder};
+use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+    Array, ArrayRef, Date32Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray,
+    StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_cast::display::array_value_to_string;
 use arrow_schema::{Field, Fields, Schema as ArrowSchema};
 use futures::TryStreamExt;
+use iceberg::expr::{Predicate, Reference};
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, NestedField,
-    PrimitiveType, Schema, SortOrder, Struct, StructType, TableProperties, Type,
-    UnboundPartitionSpec, create_name_mapping,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, FormatVersion, ListType,
+    MapType, NestedField, PrimitiveType, Schema, SortOrder, Struct, StructType, TableProperties,
+    Type, UnboundPartitionSpec, create_name_mapping,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -584,4 +588,196 @@ async fn a_re_added_nested_child_keeps_its_old_value_on_the_no_mapping_route_con
     let batch = scan(&table, None).await;
     assert_eq!(struct_ints(&batch, "s", "a"), vec![Some(1)]);
     assert_eq!(struct_ints(&batch, "s", "b"), vec![Some(2)]);
+}
+
+async fn count_result(
+    table: &Table,
+    columns: &[&str],
+    filter: Option<Predicate>,
+) -> iceberg::Result<usize> {
+    let mut builder = table.scan().select(columns.iter().copied());
+    if let Some(filter) = filter {
+        builder = builder.with_filter(filter);
+    }
+    let batches = builder
+        .build()?
+        .to_arrow()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(batches.iter().map(RecordBatch::num_rows).sum())
+}
+
+async fn assert_count_refuses(
+    table: &Table,
+    columns: &[&str],
+    filter: Predicate,
+    needles: &[&str],
+) {
+    let shown = filter.to_string();
+    let error = match count_result(table, columns, Some(filter)).await {
+        Ok(rows) => {
+            panic!("the scan of {columns:?} where {shown} read {rows} rows instead of refusing")
+        }
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert_eq!(error.kind(), ErrorKind::DataInvalid, "{message}");
+    for needle in needles {
+        assert!(message.contains(needle), "missing {needle:?} in {message}");
+    }
+}
+
+async fn int_string_swap_table(tmp: &TempDir) -> Table {
+    let batch = idless_batch(vec![
+        ("b", strings(&[Some("p"), Some("q")])),
+        ("a", ints(&[Some(1), Some(2)])),
+    ]);
+    let (_catalog, table) = table_with(tmp, int_string_table(), batch).await;
+    table
+}
+
+#[tokio::test]
+async fn a_filtered_projection_over_a_type_changing_positional_read_refuses() {
+    let tmp = TempDir::new().expect("temp dir");
+    let table = int_string_swap_table(&tmp).await;
+    let filter = Reference::new("a").equal_to(Datum::int(1));
+    assert_count_refuses(&table, &["b"], filter, &["'a'", "id 1"]).await;
+}
+
+#[tokio::test]
+async fn a_count_filtered_on_a_type_changing_positional_column_refuses() {
+    let tmp = TempDir::new().expect("temp dir");
+    let table = int_string_swap_table(&tmp).await;
+    let on_a = Reference::new("a").equal_to(Datum::int(1));
+    assert_count_refuses(&table, &[], on_a, &["'b'", "position 0", "'a'", "id 1"]).await;
+    let on_b = Reference::new("b").equal_to(Datum::string("p"));
+    assert_count_refuses(&table, &[], on_b, &["'a'", "position 1", "'b'", "id 2"]).await;
+}
+
+#[tokio::test]
+async fn an_unfiltered_count_over_a_type_changing_positional_read_reads_every_row() {
+    let tmp = TempDir::new().expect("temp dir");
+    let table = int_string_swap_table(&tmp).await;
+    let rows = count_result(&table, &[], None)
+        .await
+        .expect("the count reads");
+    assert_eq!(rows, 2);
+}
+
+#[tokio::test]
+async fn a_filter_on_a_same_type_positional_column_reads_control() {
+    let tmp = TempDir::new().expect("temp dir");
+    let schema = schema_of(vec![int_field(1, "a"), int_field(2, "b")]);
+    let batch = idless_batch(vec![
+        ("a", ints(&[Some(1), Some(2)])),
+        ("b", ints(&[Some(40), Some(30)])),
+    ]);
+    let (_catalog, table) = table_with(&tmp, schema, batch).await;
+    let on_a = || Reference::new("a").equal_to(Datum::int(1));
+    let rows = count_result(&table, &[], Some(on_a()))
+        .await
+        .expect("the count reads");
+    assert_eq!(rows, 1);
+    let batches = table
+        .scan()
+        .select(["b"])
+        .with_filter(Reference::new("a").equal_to(Datum::int(2)))
+        .build()
+        .expect("build scan")
+        .to_arrow()
+        .await
+        .expect("scan to arrow")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("collect scan batches");
+    let values: Vec<Option<String>> = batches
+        .iter()
+        .flat_map(|batch| (0..batch.num_rows()).map(|row| cell(batch.column(0).as_ref(), row)))
+        .collect();
+    assert_eq!(values, vec![Some("30".to_string())]);
+}
+
+async fn extra_column_on_a_nested_id(extra: ArrayRef) {
+    let tmp = TempDir::new().expect("temp dir");
+    let schema = schema_of(vec![
+        int_field(1, "x"),
+        NestedField::optional(
+            2,
+            "s",
+            struct_type(vec![int_field(3, "a"), int_field(4, "b")]),
+        ),
+    ]);
+    let batch = idless_batch(vec![
+        ("x", ints(&[Some(1), Some(2)])),
+        (
+            "s",
+            plain_struct(vec![
+                ("a", ints(&[Some(5), Some(6)])),
+                ("b", ints(&[Some(7), Some(8)])),
+            ]),
+        ),
+        ("extra", extra),
+    ]);
+    let (_catalog, table) = table_with(&tmp, schema, batch).await;
+    assert_eq!(field_id(&table, "s.a"), 3);
+    let batch = scan(&table, None).await;
+    assert_eq!(column_names(&batch), vec!["x".to_string(), "s".to_string()]);
+    assert_eq!(rows(&batch)[0][0], Some("1".to_string()));
+    assert_eq!(struct_ints(&batch, "s", "a"), vec![Some(5), Some(6)]);
+    assert_eq!(struct_ints(&batch, "s", "b"), vec![Some(7), Some(8)]);
+    let on_extra = Reference::new("s.a").equal_to(Datum::int(77));
+    let rows = count_result(&table, &["x"], Some(on_extra))
+        .await
+        .expect("the filtered scan reads");
+    assert_eq!(rows, 0);
+}
+
+#[tokio::test]
+async fn an_int_column_whose_position_is_a_nested_id_is_never_read() {
+    extra_column_on_a_nested_id(ints(&[Some(77), Some(77)])).await;
+}
+
+#[tokio::test]
+async fn a_string_column_whose_position_is_a_nested_id_is_never_read() {
+    extra_column_on_a_nested_id(strings(&[Some("77"), Some("77")])).await;
+}
+
+#[tokio::test]
+async fn lists_and_maps_read_on_the_no_mapping_route_control() {
+    let tmp = TempDir::new().expect("temp dir");
+    let schema = schema_of(vec![
+        int_field(1, "id"),
+        NestedField::optional(
+            2,
+            "xs",
+            Type::List(ListType::new(
+                NestedField::list_element(4, Type::Primitive(PrimitiveType::Int), false).into(),
+            )),
+        ),
+        NestedField::optional(
+            3,
+            "mp",
+            Type::Map(MapType::new(
+                NestedField::map_key_element(5, Type::Primitive(PrimitiveType::String)).into(),
+                NestedField::map_value_element(6, Type::Primitive(PrimitiveType::Int), false)
+                    .into(),
+            )),
+        ),
+    ]);
+    let xs: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+        Some(vec![Some(1), Some(2)]),
+    ]));
+    let mut mp = MapBuilder::new(None, StringBuilder::new(), Int32Builder::new());
+    mp.keys().append_value("k");
+    mp.values().append_value(1);
+    mp.append(true).expect("append the map entry");
+    let mp: ArrayRef = Arc::new(mp.finish());
+    let batch = idless_batch(vec![("id", ints(&[Some(1)])), ("xs", xs), ("mp", mp)]);
+    let (_catalog, table) = table_with(&tmp, schema, batch).await;
+    let batch = scan(&table, None).await;
+    assert_eq!(
+        rows(&batch),
+        expected(&[&[Some("1"), Some("[1, 2]"), Some("{k: 1}")]])
+    );
 }
