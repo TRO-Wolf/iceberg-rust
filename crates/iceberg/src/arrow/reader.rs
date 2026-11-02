@@ -1349,15 +1349,15 @@ impl ArrowReader {
                 return false;
             };
 
-            if !type_promotion_is_valid(
+            if !(type_promotion_is_valid(
                 parquet_iceberg_field.field_type.as_primitive_type(),
                 iceberg_field.field_type.as_primitive_type(),
-            ) && !(missing_field_ids
+            ) || (missing_field_ids
                 && idless_leaf_read_allowed(
                     (iceberg_schema_of_task, parquet_schema, idx),
                     parquet_iceberg_field,
                     &iceberg_field,
-                ))
+                )))
             {
                 if missing_field_ids
                     && incompatible.is_none()
