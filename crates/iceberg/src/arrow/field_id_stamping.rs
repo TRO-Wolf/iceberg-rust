@@ -534,18 +534,15 @@ fn collect_filters(predicate: &BoundPredicate, filters: &mut Vec<(i32, Predicate
     }
 }
 
-fn answered_across_string_and_binary(
-    file_type: &PrimitiveType,
-    table_type: &PrimitiveType,
-    op: PredicateOperator,
-) -> bool {
-    match op {
-        PredicateOperator::IsNull | PredicateOperator::NotNull | PredicateOperator::NotEq => true,
-        PredicateOperator::StartsWith => {
-            *file_type == PrimitiveType::Binary && *table_type == PrimitiveType::String
-        }
-        _ => false,
-    }
+fn answered_across_string_and_binary(op: PredicateOperator) -> bool {
+    matches!(
+        op,
+        PredicateOperator::IsNull
+            | PredicateOperator::NotNull
+            | PredicateOperator::NotEq
+            | PredicateOperator::StartsWith
+            | PredicateOperator::NotStartsWith
+    )
 }
 
 fn refuse_filter_across_string_and_binary(
@@ -567,7 +564,7 @@ fn refuse_filter_across_string_and_binary(
     );
     let Some(op) = ops
         .iter()
-        .find(|op| across && !answered_across_string_and_binary(&file_type, table_type, **op))
+        .find(|op| across && !answered_across_string_and_binary(**op))
     else {
         return Ok(());
     };
