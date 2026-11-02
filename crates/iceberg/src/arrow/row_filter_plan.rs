@@ -27,6 +27,7 @@ use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder,
 use parquet::basic::{ConvertedType, LogicalType};
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
+use crate::arrow::idless_read::filter_reads_a_converted_column;
 use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
 use crate::arrow::record_batch_predicate::evaluate_predicate_to_mask;
 use crate::expr::BoundPredicate;
@@ -107,7 +108,14 @@ pub(crate) fn plan_row_filter(
                     && top_level_ancestor_id(table_schema, *field_id)
                         .is_some_and(|top_id| stamped.contains_key(&top_id))
             });
-            if present_but_unmapped {
+            if present_but_unmapped
+                || filter_reads_a_converted_column(
+                    table_schema,
+                    parquet_schema,
+                    stamped_arrow_schema,
+                    iceberg_field_ids,
+                )
+            {
                 return Ok(RowFilterPlan::Residual);
             }
             stamped

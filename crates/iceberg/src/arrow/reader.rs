@@ -51,6 +51,7 @@ use crate::arrow::field_id_stamping::{
     idless_leaf_read_allowed, positional_guard, stamped_field_id_map, type_promotion_is_valid,
 };
 use crate::arrow::footer_cache::TableFooterCache;
+use crate::arrow::idless_read::idless_read_options;
 use crate::arrow::int96::coerce_int96_timestamps;
 use crate::arrow::open_parquet::{effective_row_selection, page_index_policy};
 use crate::arrow::orc_reader::read_orc_data_file;
@@ -502,16 +503,15 @@ impl ArrowReader {
                 )?
             };
 
-            let options = ArrowReaderOptions::new().with_schema(arrow_schema);
-            ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(
-                |e| {
-                    Error::new(
-                        ErrorKind::Unexpected,
-                        "Failed to create ArrowReaderMetadata with field ID schema",
-                    )
-                    .with_source(e)
-                },
-            )?
+            let (metadata, options) =
+                idless_read_options(arrow_metadata.metadata(), arrow_schema, &task.schema)?;
+            ArrowReaderMetadata::try_new(metadata, options).map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    "Failed to create ArrowReaderMetadata with field ID schema",
+                )
+                .with_source(e)
+            })?
         } else {
             // Branch 1: the file carries field ids.
             arrow_metadata

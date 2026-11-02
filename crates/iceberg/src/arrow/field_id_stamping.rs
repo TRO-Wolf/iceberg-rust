@@ -28,9 +28,8 @@ use parquet::schema::types::SchemaDescriptor;
 
 use crate::arrow::arrow_type_to_type;
 use crate::arrow::nested_projection::{LEFT_UNSTAMPED_META_KEY, MAX_NESTED_PROJECTION_DEPTH};
-use crate::arrow::reader::CollectFieldIdVisitor;
 use crate::arrow::row_filter_plan::top_level_ancestor_id;
-use crate::expr::visitors::bound_predicate_visitor::visit;
+use crate::expr::{BoundPredicate, PredicateOperator};
 use crate::scan::FileScanTask;
 use crate::spec::{
     MappedField, NameMapping, NestedField, PrimitiveType, Schema, Type, is_promotion_allowed,
@@ -470,7 +469,6 @@ fn positional_type_change(
     file_type: &DataType,
     table_type: &Type,
     physical_type: Option<PhysicalType>,
-    filtered: bool,
 ) -> Option<String> {
     match (nested_kind(file_type), table_type) {
         (Some(kind), Type::Primitive(_)) => Some(kind.to_string()),
@@ -486,7 +484,7 @@ fn positional_type_change(
             };
             let as_one = physical_type.is_some_and(|physical_type| {
                 idless_read_allowed(physical_type, &file_primitive, table_primitive)
-            }) && !(filtered && file_primitive == PrimitiveType::Binary);
+            });
             let readable = as_one
                 || is_promotion_allowed(&Type::Primitive(file_primitive.clone()), table_primitive)
                 || matches!(
@@ -507,22 +505,99 @@ fn positional_type_change(
 #[derive(Default)]
 pub(crate) struct PositionalGuard {
     pub(crate) read_ids: Vec<i32>,
-    pub(crate) filter_ids: Vec<i32>,
+    pub(crate) filters: Vec<(i32, PredicateOperator)>,
     pub(crate) physical_types: Vec<Option<PhysicalType>>,
+}
+
+fn collect_filters(predicate: &BoundPredicate, filters: &mut Vec<(i32, PredicateOperator)>) {
+    match predicate {
+        BoundPredicate::AlwaysTrue | BoundPredicate::AlwaysFalse => {}
+        BoundPredicate::And(expression) | BoundPredicate::Or(expression) => {
+            for input in expression.inputs() {
+                collect_filters(input, filters);
+            }
+        }
+        BoundPredicate::Not(expression) => {
+            for input in expression.inputs() {
+                collect_filters(input, filters);
+            }
+        }
+        BoundPredicate::Unary(expression) => {
+            filters.push((expression.term().field().id, expression.op()));
+        }
+        BoundPredicate::Binary(expression) => {
+            filters.push((expression.term().field().id, expression.op()));
+        }
+        BoundPredicate::Set(expression) => {
+            filters.push((expression.term().field().id, expression.op()));
+        }
+    }
+}
+
+fn answered_across_string_and_binary(
+    file_type: &PrimitiveType,
+    table_type: &PrimitiveType,
+    op: PredicateOperator,
+) -> bool {
+    match op {
+        PredicateOperator::IsNull | PredicateOperator::NotNull | PredicateOperator::NotEq => true,
+        PredicateOperator::StartsWith => {
+            *file_type == PrimitiveType::Binary && *table_type == PrimitiveType::String
+        }
+        _ => false,
+    }
+}
+
+fn refuse_filter_across_string_and_binary(
+    position: usize,
+    field: &Field,
+    table_field: &NestedField,
+    ops: &[PredicateOperator],
+) -> Result<()> {
+    let (Ok(Type::Primitive(file_type)), Type::Primitive(table_type)) = (
+        arrow_type_to_type(field.data_type()),
+        table_field.field_type.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let across = matches!(
+        (&file_type, table_type),
+        (PrimitiveType::String, PrimitiveType::Binary)
+            | (PrimitiveType::Binary, PrimitiveType::String)
+    );
+    let Some(op) = ops
+        .iter()
+        .find(|op| across && !answered_across_string_and_binary(&file_type, table_type, **op))
+    else {
+        return Ok(());
+    };
+    Err(Error::new(
+        ErrorKind::DataInvalid,
+        format!(
+            "data file column '{}' at position {position} has type {file_type} and cannot be filtered with `{op}` as table field '{}' (id {}) of type {table_type}: the data file has no field ids and the table has no name mapping, so its columns are read by position",
+            field.name(),
+            table_field.name,
+            table_field.id,
+        ),
+    ))
 }
 
 pub(crate) fn positional_guard(
     task: &FileScanTask,
     parquet_metadata: &ParquetMetaData,
 ) -> Result<PositionalGuard> {
-    let mut filter_ids = Vec::new();
+    let mut filters = Vec::new();
     if let Some(predicate) = task.predicate.as_deref() {
-        let mut collector = CollectFieldIdVisitor::default();
-        visit(&mut collector, predicate)?;
-        filter_ids.extend(collector.field_ids());
+        collect_filters(predicate, &mut filters);
     }
     for delete in task.deletes.iter() {
-        filter_ids.extend(delete.equality_ids.iter().flatten().copied());
+        filters.extend(
+            delete
+                .equality_ids
+                .iter()
+                .flatten()
+                .map(|id| (*id, PredicateOperator::Eq)),
+        );
     }
     let physical_types = parquet_metadata
         .file_metadata()
@@ -534,7 +609,7 @@ pub(crate) fn positional_guard(
         .collect();
     Ok(PositionalGuard {
         read_ids: task.project_field_ids().to_vec(),
-        filter_ids,
+        filters,
         physical_types,
     })
 }
@@ -546,22 +621,21 @@ fn refuse_positional_type_change(
     table_schema: &Schema,
     guard: &PositionalGuard,
 ) -> Result<()> {
-    let lands = |ids: &[i32]| {
-        ids.iter()
-            .any(|id| top_level_ancestor_id(table_schema, *id) == Some(table_field.id))
-    };
-    let filtered = lands(&guard.filter_ids);
-    if !filtered && !lands(&guard.read_ids) {
+    let lands = |id: &i32| top_level_ancestor_id(table_schema, *id) == Some(table_field.id);
+    let ops: Vec<PredicateOperator> = guard
+        .filters
+        .iter()
+        .filter(|(id, _)| lands(id))
+        .map(|(_, op)| *op)
+        .collect();
+    if ops.is_empty() && !guard.read_ids.iter().any(lands) {
         return Ok(());
     }
     let physical_type = guard.physical_types.get(position).copied().flatten();
-    let Some(file_type) = positional_type_change(
-        field.data_type(),
-        &table_field.field_type,
-        physical_type,
-        filtered,
-    ) else {
-        return Ok(());
+    let Some(file_type) =
+        positional_type_change(field.data_type(), &table_field.field_type, physical_type)
+    else {
+        return refuse_filter_across_string_and_binary(position, field, table_field, &ops);
     };
     Err(Error::new(
         ErrorKind::DataInvalid,
