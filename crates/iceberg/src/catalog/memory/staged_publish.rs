@@ -20,7 +20,6 @@ use futures::lock::Mutex;
 use super::catalog::MemoryCatalog;
 use super::metadata_naming::MetadataNaming;
 use super::namespace_state::NamespaceState;
-use crate::io::FileIO;
 use crate::table::Table;
 use crate::{Catalog, Error, ErrorKind, Result};
 
@@ -80,8 +79,8 @@ async fn publish_create_hadoop(
 }
 
 pub(crate) async fn publish_replace(
+    catalog: &MemoryCatalog,
     naming: MetadataNaming,
-    file_io: &FileIO,
     tables: &Mutex<NamespaceState>,
     table: Table,
     expected_base_metadata_location: Option<String>,
@@ -102,8 +101,16 @@ pub(crate) async fn publish_replace(
         .with_retryable(true));
     }
     let updated = state.commit_table_update(table)?;
+    let published_location = updated.metadata_location_result()?.to_string();
     naming
-        .advance_version_hint(file_io, updated.metadata_location_result()?)
+        .advance_version_hint(&catalog.file_io, &published_location)
+        .await;
+    drop(state);
+    if stored != published_location {
+        catalog.cache_invalidate(&stored).await;
+    }
+    catalog
+        .cache_put(&published_location, updated.metadata_ref(), None)
         .await;
     Ok(updated)
 }

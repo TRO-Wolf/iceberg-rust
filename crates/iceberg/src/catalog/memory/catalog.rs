@@ -140,7 +140,7 @@ pub struct MemoryCatalog {
     pub(crate) cache_scope: CacheScope,
     pub(crate) shared_object_cache: Option<Arc<ObjectCache>>,
     pub(crate) shared_footer_cache: Option<Arc<ParquetFooterCache>>,
-    metadata_naming: MetadataNaming,
+    pub(crate) metadata_naming: MetadataNaming,
 }
 
 impl MemoryCatalog {
@@ -456,7 +456,7 @@ impl Catalog for MemoryCatalog {
         if self.metadata_naming != MetadataNaming::Hadoop {
             drop(root_namespace_state);
         }
-        self.cache_invalidate(&metadata_location).await;
+        self.cache_invalidate_dropped(&metadata_location).await;
         self.metadata_naming
             .drop_metadata(&self.file_io, &metadata_location)
             .await
@@ -534,8 +534,8 @@ impl Catalog for MemoryCatalog {
         expected_base_metadata_location: Option<String>,
     ) -> Result<Table> {
         super::staged_publish::publish_replace(
+            self,
             self.metadata_naming,
-            &self.file_io,
             &self.root_namespace_state,
             table,
             expected_base_metadata_location,
