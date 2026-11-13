@@ -16,12 +16,15 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_derive::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{Datum, ManifestEntry, Schema, Struct};
-use crate::spec::{FormatVersion, Literal, RawLiteral, StructType, Type};
+use crate::spec::{
+    FormatVersion, Literal, PrimitiveLiteral, PrimitiveType, RawLiteral, StructType, Type,
+};
 use crate::{Error, ErrorKind, metadata_columns};
 
 #[derive(Serialize, Deserialize)]
@@ -234,6 +237,116 @@ impl DataFileSerde {
     }
 }
 
+#[derive(Deserialize)]
+struct PartitionProbe {
+    #[serde(default)]
+    partition: Option<HashMap<String, serde_json::Value>>,
+}
+
+fn non_finite_text(literal: &Literal) -> Option<&'static str> {
+    let value = match literal {
+        Literal::Primitive(PrimitiveLiteral::Float(value)) => f64::from(value.0),
+        Literal::Primitive(PrimitiveLiteral::Double(value)) => value.0,
+        _ => return None,
+    };
+    if value.is_nan() {
+        Some("NaN")
+    } else if value.is_infinite() && value.is_sign_positive() {
+        Some("Infinity")
+    } else if value.is_infinite() {
+        Some("-Infinity")
+    } else {
+        None
+    }
+}
+
+fn non_finite_literal(text: &str, field_type: &Type) -> Option<Literal> {
+    match (field_type, text) {
+        (Type::Primitive(PrimitiveType::Float), "NaN") => Some(Literal::float(f32::NAN)),
+        (Type::Primitive(PrimitiveType::Float), "Infinity") => Some(Literal::float(f32::INFINITY)),
+        (Type::Primitive(PrimitiveType::Float), "-Infinity") => {
+            Some(Literal::float(f32::NEG_INFINITY))
+        }
+        (Type::Primitive(PrimitiveType::Double), "NaN") => Some(Literal::double(f64::NAN)),
+        (Type::Primitive(PrimitiveType::Double), "Infinity") => {
+            Some(Literal::double(f64::INFINITY))
+        }
+        (Type::Primitive(PrimitiveType::Double), "-Infinity") => {
+            Some(Literal::double(f64::NEG_INFINITY))
+        }
+        _ => None,
+    }
+}
+
+impl DataFileSerde {
+    pub(super) fn for_json(
+        mut data_file: super::DataFile,
+        partition_type: &StructType,
+        format_version: FormatVersion,
+    ) -> Result<Self, Error> {
+        data_file.partition = Struct::from_iter(data_file.partition.into_iter().map(|slot| {
+            match slot.as_ref().and_then(non_finite_text) {
+                Some(text) => Some(Literal::string(text)),
+                None => slot,
+            }
+        }));
+        Self::try_from(data_file, partition_type, format_version)
+    }
+
+    pub(super) fn try_into_from_json(
+        self,
+        json: &str,
+        partition_spec_id: i32,
+        partition_type: &StructType,
+        schema: &Schema,
+    ) -> Result<super::DataFile, Error> {
+        let probe = serde_json::from_str::<PartitionProbe>(json).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Failed to deserialize JSON to DataFile!".to_string(),
+            )
+            .with_source(e)
+        })?;
+        let carries_text = |name: &str, field_type: &Type| {
+            probe
+                .partition
+                .as_ref()
+                .and_then(|partition| partition.get(name))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|text| non_finite_literal(text, field_type))
+                .is_some()
+        };
+        let read_type = StructType::new(
+            partition_type
+                .fields()
+                .iter()
+                .map(|field| {
+                    if !carries_text(&field.name, &field.field_type) {
+                        return Arc::clone(field);
+                    }
+                    let mut text_field = field.as_ref().clone();
+                    text_field.field_type = Box::new(Type::Primitive(PrimitiveType::String));
+                    Arc::new(text_field)
+                })
+                .collect(),
+        );
+        let mut data_file = self.try_into(partition_spec_id, &read_type, schema)?;
+        data_file.partition = Struct::from_iter(
+            data_file
+                .partition
+                .into_iter()
+                .zip(partition_type.fields())
+                .map(|(slot, field)| match &slot {
+                    Some(Literal::Primitive(PrimitiveLiteral::String(text))) => {
+                        non_finite_literal(text, &field.field_type).or(slot)
+                    }
+                    _ => slot,
+                }),
+        );
+        Ok(data_file)
+    }
+}
+
 #[serde_as]
 #[derive(Serialize, Deserialize)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -325,11 +438,14 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
+    use serde_json::{Value, json};
+
     use crate::spec::manifest::_serde::{I64Entry, parse_i64_entry};
+    use crate::spec::manifest::{deserialize_data_file_from_json, serialize_data_file_to_json};
     use crate::spec::{
-        DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, NestedField,
-        PrimitiveType, Schema, Struct, StructType, Type, read_data_files_from_avro,
-        write_data_files_to_avro,
+        DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal, NestedField,
+        PrimitiveLiteral, PrimitiveType, Schema, Struct, StructType, Type,
+        read_data_files_from_avro, write_data_files_to_avro,
     };
 
     #[test]
@@ -625,5 +741,142 @@ mod tests {
             Some(&Datum::long(pos_value)),
             "_pos should be parsed as long with correct value"
         );
+    }
+
+    fn float_partition_type() -> StructType {
+        StructType::new(vec![
+            Arc::new(NestedField::optional(
+                1000,
+                "k",
+                Type::Primitive(PrimitiveType::Int),
+            )),
+            Arc::new(NestedField::optional(
+                1001,
+                "f",
+                Type::Primitive(PrimitiveType::Float),
+            )),
+            Arc::new(NestedField::optional(
+                1002,
+                "d",
+                Type::Primitive(PrimitiveType::Double),
+            )),
+        ])
+    }
+
+    fn partitioned_file(partition: Struct) -> DataFile {
+        DataFile {
+            partition,
+            ..data_files().remove(0)
+        }
+    }
+
+    fn json_round_trip(partition_type: &StructType, partition: Struct) -> (Value, Struct) {
+        let json = serialize_data_file_to_json(
+            partitioned_file(partition),
+            partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+        let back = deserialize_data_file_from_json(&json, 0, partition_type, &schema()).unwrap();
+        let value: Value = serde_json::from_str(&json).unwrap();
+        (value["partition"].clone(), back.partition)
+    }
+
+    fn is_nan_float(slot: Option<&Literal>) -> bool {
+        matches!(slot, Some(Literal::Primitive(PrimitiveLiteral::Float(v))) if v.0.is_nan())
+    }
+
+    fn is_nan_double(slot: Option<&Literal>) -> bool {
+        matches!(slot, Some(Literal::Primitive(PrimitiveLiteral::Double(v))) if v.0.is_nan())
+    }
+
+    #[test]
+    fn test_json_transport_keeps_nan_float_and_double_partition_values() {
+        let partition = Struct::from_iter([
+            Some(Literal::int(7)),
+            Some(Literal::float(f32::NAN)),
+            Some(Literal::double(f64::NAN)),
+        ]);
+        let (json, back) = json_round_trip(&float_partition_type(), partition);
+        assert_eq!(json, json!({"k": 7, "f": "NaN", "d": "NaN"}));
+        let slots: Vec<Option<&Literal>> = back.iter().collect();
+        assert_eq!(slots[0], Some(&Literal::int(7)));
+        assert!(is_nan_float(slots[1]));
+        assert!(is_nan_double(slots[2]));
+    }
+
+    #[test]
+    fn test_json_transport_keeps_infinite_partition_values() {
+        let partition = Struct::from_iter([
+            None,
+            Some(Literal::float(f32::INFINITY)),
+            Some(Literal::double(f64::NEG_INFINITY)),
+        ]);
+        let (json, back) = json_round_trip(&float_partition_type(), partition.clone());
+        assert_eq!(json, json!({"k": null, "f": "Infinity", "d": "-Infinity"}));
+        assert_eq!(back, partition);
+        let partition = Struct::from_iter([
+            Some(Literal::int(1)),
+            Some(Literal::float(f32::NEG_INFINITY)),
+            Some(Literal::double(f64::INFINITY)),
+        ]);
+        let (json, back) = json_round_trip(&float_partition_type(), partition.clone());
+        assert_eq!(json, json!({"k": 1, "f": "-Infinity", "d": "Infinity"}));
+        assert_eq!(back, partition);
+    }
+
+    #[test]
+    fn test_json_transport_keeps_finite_null_and_string_partition_values() {
+        let partition = Struct::from_iter([Some(Literal::int(7)), Some(Literal::float(1.5)), None]);
+        let (json, back) = json_round_trip(&float_partition_type(), partition.clone());
+        assert_eq!(json, json!({"k": 7, "f": 1.5, "d": null}));
+        assert_eq!(back, partition);
+        let string_type = StructType::new(vec![Arc::new(NestedField::optional(
+            1000,
+            "s",
+            Type::Primitive(PrimitiveType::String),
+        ))]);
+        let partition = Struct::from_iter([Some(Literal::string("NaN"))]);
+        let (json, back) = json_round_trip(&string_type, partition.clone());
+        assert_eq!(json, json!({"s": "NaN"}));
+        assert_eq!(back, partition);
+    }
+
+    #[test]
+    fn test_json_transport_reads_a_null_double_slot_as_null() {
+        let partition = Struct::from_iter([Some(Literal::int(7)), None, None]);
+        let (json, back) = json_round_trip(&float_partition_type(), partition.clone());
+        assert_eq!(json, json!({"k": 7, "f": null, "d": null}));
+        assert_eq!(back, partition);
+    }
+
+    #[test]
+    fn test_avro_manifest_keeps_nan_float_and_double_partition_values() {
+        let partition_type = float_partition_type();
+        let partition = Struct::from_iter([
+            Some(Literal::int(7)),
+            Some(Literal::float(f32::NAN)),
+            Some(Literal::double(f64::NAN)),
+        ]);
+        let mut buffer = Vec::new();
+        write_data_files_to_avro(
+            &mut buffer,
+            vec![partitioned_file(partition)],
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+        let back = read_data_files_from_avro(
+            &mut Cursor::new(buffer),
+            &schema(),
+            0,
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+        let slots: Vec<Option<&Literal>> = back[0].partition.iter().collect();
+        assert_eq!(slots[0], Some(&Literal::int(7)));
+        assert!(is_nan_float(slots[1]));
+        assert!(is_nan_double(slots[2]));
     }
 }

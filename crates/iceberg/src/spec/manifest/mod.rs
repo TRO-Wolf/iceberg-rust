@@ -117,7 +117,7 @@ pub fn serialize_data_file_to_json(
     partition_type: &super::StructType,
     format_version: FormatVersion,
 ) -> Result<String> {
-    let serde = _serde::DataFileSerde::try_from(data_file, partition_type, format_version)?;
+    let serde = _serde::DataFileSerde::for_json(data_file, partition_type, format_version)?;
     serde_json::to_string(&serde).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
@@ -142,7 +142,7 @@ pub fn deserialize_data_file_from_json(
         .with_source(e)
     })?;
 
-    serde.try_into(partition_spec_id, partition_type, schema)
+    serde.try_into_from_json(json, partition_spec_id, partition_type, schema)
 }
 
 #[cfg(test)]
