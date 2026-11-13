@@ -26,6 +26,7 @@ use super::{
     ParquetWriter, ParquetWriterBuilder, parquet_compression_from_properties,
 };
 use crate::arrow::FieldMatchMode;
+use crate::arrow::partition_value_calculator::canonical_nan_batch;
 use crate::io::OutputFile;
 use crate::spec::{DataFileBuilder, DataFileFormat, MetricsConfig, SchemaRef};
 use crate::writer::CurrentFileStatus;
@@ -156,6 +157,11 @@ impl CurrentFileStatus for AnyFileWriter {
 
 impl FileWriter for AnyFileWriter {
     async fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let canonical = match self {
+            Self::Avro(_) => None,
+            Self::Parquet(_) | Self::Orc(_) => canonical_nan_batch(batch)?,
+        };
+        let batch = canonical.as_ref().unwrap_or(batch);
         match self {
             Self::Parquet(writer) => writer.write(batch).await,
             Self::Avro(writer) => writer.write(batch).await,
