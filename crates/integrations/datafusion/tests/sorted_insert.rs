@@ -940,7 +940,7 @@ async fn seed_float_p_file(
 }
 
 #[tokio::test]
-async fn float_partition_signed_zero_stays_sorted_by_id() -> Result<()> {
+async fn float_partition_signed_zeros_write_two_partitions_sorted_by_id() -> Result<()> {
     let schema = float_p_schema();
     let order = SortOrder::builder()
         .with_sort_field(sort_field(
@@ -981,19 +981,14 @@ async fn float_partition_signed_zero_stays_sorted_by_id() -> Result<()> {
     run_sql(&cow_fixture, update).await?;
 
     for (label, fixture) in [("COW UPDATE", &cow_fixture), ("INSERT", &insert_fixture)] {
-        let files = live_files(fixture).await?;
-        assert_eq!(files.len(), 1, "{label}: one file in the merged partition");
-        let rows = read_long_column(&files[0].0, 0);
-        assert_eq!(
-            rows,
-            vec![1, 2, 3],
-            "{label}: signed-zero partition values are one partition, so id order decides"
-        );
-        assert_eq!(
-            files[0].1,
-            Some(default_order_id(fixture).await?),
-            "{label}: file stamps the default sort order id"
-        );
+        let order_id = Some(default_order_id(fixture).await?);
+        let mut rows = Vec::new();
+        for (path, id) in live_files(fixture).await? {
+            assert_eq!(id, order_id, "{label}: order id");
+            rows.push(read_long_column(&path, 0));
+        }
+        rows.sort();
+        assert_eq!(rows, [vec![1, 3], vec![2]], "{label}: two zero partitions");
     }
     Ok(())
 }

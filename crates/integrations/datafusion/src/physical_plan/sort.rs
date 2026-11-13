@@ -279,24 +279,12 @@ impl std::hash::Hash for CanonicalPartitionExpr {
 fn canonical_partition_child(child: &ArrayRef) -> ArrayRef {
     if let Some(floats) = child.as_any().downcast_ref::<Float32Array>() {
         return Arc::new(Float32Array::from_iter(floats.iter().map(|value| {
-            value.map(|float| {
-                if float.is_nan() {
-                    f32::NAN
-                } else {
-                    float + 0.0
-                }
-            })
+            value.map(|float| if float.is_nan() { f32::NAN } else { float })
         })));
     }
     if let Some(floats) = child.as_any().downcast_ref::<Float64Array>() {
         return Arc::new(Float64Array::from_iter(floats.iter().map(|value| {
-            value.map(|float| {
-                if float.is_nan() {
-                    f64::NAN
-                } else {
-                    float + 0.0
-                }
-            })
+            value.map(|float| if float.is_nan() { f64::NAN } else { float })
         })));
     }
     child.clone()
@@ -808,5 +796,45 @@ mod tests {
         assert_eq!(id_col.value(1), 2);
         assert_eq!(id_col.value(2), 4);
         assert_eq!(id_col.value(3), 1);
+    }
+
+    #[test]
+    fn partition_sort_key_keeps_signed_zeros_apart_and_folds_nan() {
+        let doubles: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(-0.0),
+            Some(0.0),
+            Some(-f64::NAN),
+            Some(1.5),
+            None,
+        ]));
+        let keyed = canonical_partition_child(&doubles);
+        let keyed = keyed.as_any().downcast_ref::<Float64Array>().unwrap();
+        let bits = keyed
+            .iter()
+            .map(|value| value.map(f64::to_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(bits, vec![
+            Some((-0.0f64).to_bits()),
+            Some(0.0f64.to_bits()),
+            Some(f64::NAN.to_bits()),
+            Some(1.5f64.to_bits()),
+            None,
+        ]);
+        let floats: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(-0.0),
+            Some(0.0),
+            Some(-f32::NAN),
+        ]));
+        let keyed = canonical_partition_child(&floats);
+        let keyed = keyed.as_any().downcast_ref::<Float32Array>().unwrap();
+        let bits = keyed
+            .iter()
+            .map(|value| value.map(f32::to_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(bits, vec![
+            Some((-0.0f32).to_bits()),
+            Some(0.0f32.to_bits()),
+            Some(f32::NAN.to_bits()),
+        ]);
     }
 }
