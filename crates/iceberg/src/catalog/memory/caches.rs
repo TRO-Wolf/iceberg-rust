@@ -91,4 +91,14 @@ impl MemoryCatalog {
             cache.invalidate(&self.cache_scope, metadata_location).await;
         }
     }
+
+    pub(crate) async fn cache_invalidate_dropped(&self, metadata_location: &str) {
+        let Some(cache) = self.table_metadata_cache.as_ref() else {
+            return;
+        };
+        cache.invalidate(&self.cache_scope, metadata_location).await;
+        for location in self.metadata_naming.chain_locations(metadata_location) {
+            cache.invalidate(&self.cache_scope, &location).await;
+        }
+    }
 }

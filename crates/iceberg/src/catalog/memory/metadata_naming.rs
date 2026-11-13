@@ -96,6 +96,18 @@ impl MetadataNaming {
         }
     }
 
+    pub(crate) fn chain_locations(self, metadata_location: &str) -> impl Iterator<Item = String> {
+        let chain = (self == Self::Hadoop)
+            .then(|| MetadataLocation::from_file_path(metadata_location).ok())
+            .flatten()
+            .and_then(|location| location.hadoop_version())
+            .zip(metadata_location.rsplit_once('/'))
+            .map(|(version, (dir, _))| (version, dir.to_string()));
+        chain.into_iter().flat_map(|(version, dir)| {
+            (1..=version).map(move |version| format!("{dir}/v{version}.metadata.json"))
+        })
+    }
+
     pub(crate) async fn drop_metadata(
         self,
         file_io: &FileIO,

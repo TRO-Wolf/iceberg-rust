@@ -22,6 +22,8 @@ mod caches;
 mod case_twin_tests;
 mod catalog;
 #[cfg(test)]
+mod hadoop_cache_invariant_tests;
+#[cfg(test)]
 mod hadoop_naming_tests;
 #[cfg(test)]
 mod hadoop_staged_tests;
