@@ -903,8 +903,33 @@ mod tests {
         ])
         .unwrap();
         let parts = splitter.split(&batch).unwrap();
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 3);
         let rows: usize = parts.iter().map(|(_, batch)| batch.num_rows()).sum();
         assert_eq!(rows, 4);
+        let mut layout = parts
+            .iter()
+            .map(|(key, part)| {
+                let Some(Literal::Primitive(PrimitiveLiteral::Double(value))) = &key.data()[0]
+                else {
+                    panic!("double partition value");
+                };
+                let stored = part
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .values()
+                    .iter()
+                    .map(|cell| cell.to_bits())
+                    .collect::<Vec<_>>();
+                (value.0.to_bits(), stored)
+            })
+            .collect::<Vec<_>>();
+        layout.sort();
+        assert_eq!(layout, vec![
+            (0.0f64.to_bits(), vec![0.0f64.to_bits(), 0.0f64.to_bits()]),
+            (1.0f64.to_bits(), vec![1.0f64.to_bits()]),
+            ((-0.0f64).to_bits(), vec![(-0.0f64).to_bits()]),
+        ]);
     }
 }
